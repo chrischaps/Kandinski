@@ -1,0 +1,18 @@
+# Render / capture output
+snapshots/
+renders/
+captures/
+render_*.png
+
+# Python cache
+__pycache__/
+
+# Claude Code local config
+.claude/
+
+# Saved game state (persist_* writes it while playing)
+save/
+logs/
+
+# Windows artifact
+nul
