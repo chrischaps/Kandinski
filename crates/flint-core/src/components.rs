@@ -1,0 +1,72 @@
+//! Engine component name constants.
+//!
+//! Use these instead of bare string literals so the compiler catches typos.
+
+// --- Spatial ---
+pub const TRANSFORM: &str = "transform";
+
+// --- Rendering ---
+pub const MATERIAL: &str = "material";
+/// Per-glTF-material base-colour overrides (`{ <material name> = [r,g,b(,a)] }`),
+/// honoured on the entity or any ancestor. See `SceneRenderer::ecs_material_override`.
+pub const MATERIAL_OVERRIDES: &str = "material_overrides";
+pub const MODEL: &str = "model";
+pub const BOUNDS: &str = "bounds";
+pub const SPRITE: &str = "sprite";
+pub const LIGHT: &str = "light";
+
+// --- Scripting & interaction ---
+pub const SCRIPT: &str = "script";
+pub const INTERACTABLE: &str = "interactable";
+pub const HEALTH: &str = "health";
+
+// --- Animation ---
+pub const ANIMATOR: &str = "animator";
+pub const SKELETON: &str = "skeleton";
+pub const SPRITE_ANIMATOR: &str = "sprite_animator";
+pub const IK_TWO_BONE: &str = "ik_two_bone";
+pub const LIVING_PROP: &str = "living_prop";
+pub const SHALLOW_WOOZE: &str = "shallow_wooze";
+
+// --- Physics ---
+pub const RIGIDBODY: &str = "rigidbody";
+pub const COLLIDER: &str = "collider";
+pub const JOINT: &str = "joint";
+pub const CHARACTER_CONTROLLER: &str = "character_controller";
+pub const PLAYER: &str = "player";
+
+// --- Audio ---
+pub const AUDIO_SOURCE: &str = "audio_source";
+pub const AUDIO_TRIGGER: &str = "audio_trigger";
+
+// --- Particles ---
+pub const PARTICLE_EMITTER: &str = "particle_emitter";
+pub const PARTICLE_EFFECT: &str = "particle_effect";
+
+// --- Terrain ---
+pub const TERRAIN: &str = "terrain";
+/// Compute grass on a game's own ground: a mask over a rectangle (ADR 0089).
+pub const GRASS_GROUND: &str = "grass_ground";
+
+// --- Ocean ---
+pub const OCEAN: &str = "ocean";
+pub const OCEAN_CONTACT: &str = "ocean_contact";
+/// Water on a mesh of its own: a lake at its level or a river down its path (ADR 0094).
+pub const WATER_BODY: &str = "water_body";
+
+// --- Skeletal probes ---
+pub const BONE_PROBE: &str = "bone_probe";
+
+// --- Procedural sky ---
+pub const SKY: &str = "sky";
+
+// --- Splines ---
+pub const SPLINE: &str = "spline";
+pub const SPLINE_DATA: &str = "spline_data";
+pub const SPLINE_MESH: &str = "spline_mesh";
+pub const SPLINE_CHUNK: &str = "spline_chunk";
+
+// --- UI ---
+pub const SCREEN_ANCHOR: &str = "screen_anchor";
+pub const UI_TEXT: &str = "ui_text";
+pub const UI_FILL: &str = "ui_fill";

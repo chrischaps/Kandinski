@@ -1,0 +1,845 @@
+//! Scene and asset loading helpers — terrain, audio, animation, model resolution,
+//! skeletal data registration, and PostProcessDef conversion.
+
+use flint_animation::node_clip::NodeClip;
+use flint_animation::skeletal_clip::SkeletalClip;
+use flint_animation::skeleton::Skeleton;
+use flint_animation::AnimationSystem;
+use flint_asset::{AssetCatalog, ContentStore};
+use flint_audio::decode::Need;
+use flint_audio::AudioSystem;
+use flint_core::components as comp;
+use flint_core::toml_util::{toml_f32, toml_f64, toml_vec3};
+use flint_core::vfs;
+use flint_core::EntityId;
+use flint_core::Vec3 as FlintVec3;
+use flint_ecs::FlintWorld;
+use flint_physics::PhysicsSystem;
+use flint_render::model_loader::{self, ModelLoadConfig};
+use flint_render::SceneRenderer;
+use flint_script::ScriptSystem;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+
+/// Convert a `PostProcessDef` (scene TOML) to a `PostProcessConfig` (renderer).
+/// Moved to flint-render so the viewer shares it; re-exported to keep the
+/// `flint_player::post_process_config_from_def` path (flint-cli uses it).
+pub use flint_render::post_process_config_from_def;
+
+/// Register the user-authored styles (`styles/*.shader.toml`, ADR 0112)
+/// a scene at `scene_path` can see, before its `[post_process]` is read:
+/// a table naming a style the registry doesn't know is dropped with a
+/// warning. Styles already registered are kept, so a scene change only
+/// adds (#275).
+pub fn load_user_styles(scene_path: &str) {
+    let scene_dir = Path::new(scene_path)
+        .parent()
+        .unwrap_or_else(|| Path::new("."));
+    for message in flint_render::stylize::custom::load_dir(scene_dir) {
+        tracing::warn!("{message}");
+    }
+}
+
+/// A scene's `[post_process]` as the player draws it: the look the scene
+/// names laid under its own keys (#356), then the `--look` named, if any,
+/// merged over the result as `flint render --look` does (#435). A `--look`
+/// that won't apply leaves the scene's own, with a warning (the player
+/// checked the name at startup). The result keeps the scene's authored
+/// keys, so a later `set_look` or F4 Look re-resolves from the scene.
+pub fn scene_post_process(
+    look: Option<&str>,
+    scene_path: &str,
+    pp: Option<flint_scene::PostProcessDef>,
+) -> Option<flint_scene::PostProcessDef> {
+    let pp = pp.map(|d| flint_render::look::resolve_scene(&d, scene_path));
+    let Some(name) = look else {
+        return pp;
+    };
+    match flint_render::look::find(name, scene_path).and_then(|l| l.apply(pp.as_ref())) {
+        Ok(mut def) => {
+            def.look = Some(name.to_string());
+            def.authored = pp.and_then(|p| p.authored);
+            Some(def)
+        }
+        Err(e) => {
+            tracing::warn!("--look {name}: {e}");
+            pp
+        }
+    }
+}
+
+/// Load terrain from world entities. Free function to avoid borrow conflicts.
+/// Info about loaded grass, returned from terrain loading for debug panel creation.
+/// The fields are only read by the `debug-hud` grass panel construction.
+#[cfg_attr(not(feature = "debug-hud"), allow(dead_code))]
+pub(super) struct LoadedGrassInfo {
+    pub config: flint_terrain::GrassConfig,
+    pub terrain_entity_name: String,
+    /// The component holding the `grass.*` fields: `terrain` or `grass_ground`.
+    pub component: &'static str,
+}
+
+pub(super) fn load_terrain_from_world_inner(
+    world: &FlintWorld,
+    scene_path: &str,
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    scene_renderer: &mut SceneRenderer,
+    physics: &mut PhysicsSystem,
+    terrain_out: &mut Option<(flint_terrain::Terrain, flint_terrain::TerrainConfig)>,
+    grass_info_out: &mut Option<LoadedGrassInfo>,
+) {
+    use flint_core::Transform;
+    use flint_terrain::{Heightmap, Terrain, TerrainConfig};
+
+    let scene_dir = Path::new(scene_path)
+        .parent()
+        .unwrap_or_else(|| Path::new("."));
+
+    for entity in world.all_entities() {
+        let terrain_comp = match world.get_component(entity.id, comp::TERRAIN) {
+            Some(c) => c,
+            None => continue,
+        };
+
+        let heightmap_rel = match terrain_comp.get("heightmap").and_then(|v| v.as_str()) {
+            Some(s) if !s.is_empty() => s.to_string(),
+            _ => {
+                tracing::warn!("Terrain entity '{}': missing heightmap path", entity.name);
+                continue;
+            }
+        };
+
+        // Resolve heightmap path (scene dir, then parent)
+        let hm_path = {
+            let p = scene_dir.join(&heightmap_rel);
+            if vfs::exists(&p) {
+                p
+            } else if let Some(parent) = scene_dir.parent() {
+                let pp = parent.join(&heightmap_rel);
+                if vfs::exists(&pp) {
+                    pp
+                } else {
+                    p
+                }
+            } else {
+                p
+            }
+        };
+
+        let heightmap = match Heightmap::from_png(&hm_path) {
+            Ok(hm) => hm,
+            Err(e) => {
+                tracing::warn!("Failed to load heightmap: {}", e);
+                continue;
+            }
+        };
+
+        let get_f32 = |key: &str, default: f32| -> f32 {
+            terrain_comp.get(key).and_then(toml_f32).unwrap_or(default)
+        };
+
+        let get_i32 = |key: &str, default: i32| -> i32 {
+            terrain_comp
+                .get(key)
+                .and_then(|v| v.as_integer())
+                .map(|i| i as i32)
+                .unwrap_or(default)
+        };
+
+        let get_str = |key: &str| -> String {
+            terrain_comp
+                .get(key)
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string()
+        };
+
+        let config = TerrainConfig {
+            heightmap_path: heightmap_rel,
+            width: get_f32("width", 256.0),
+            depth: get_f32("depth", 256.0),
+            height_scale: get_f32("height_scale", 50.0),
+            chunk_resolution: get_i32("chunk_resolution", 64) as u32,
+            texture_tile: get_f32("texture_tile", 16.0),
+            splat_map_path: get_str("splat_map"),
+            layer_textures: [
+                get_str("layer0_texture"),
+                get_str("layer1_texture"),
+                get_str("layer2_texture"),
+                get_str("layer3_texture"),
+            ],
+            metallic: get_f32("metallic", 0.0),
+            roughness: get_f32("roughness", 0.85),
+            grass: None,
+        };
+
+        let terrain = Terrain::generate(&heightmap, &config);
+
+        // Get entity transform
+        let transform = world
+            .get_component(entity.id, comp::TRANSFORM)
+            .and_then(|t| {
+                let pos = t.get("position").and_then(toml_vec3).unwrap_or([0.0; 3]);
+                Some(Transform {
+                    position: FlintVec3 {
+                        x: pos[0],
+                        y: pos[1],
+                        z: pos[2],
+                    },
+                    ..Default::default()
+                })
+            })
+            .unwrap_or_default();
+
+        // Upload to GPU
+        scene_renderer.load_terrain(
+            device,
+            queue,
+            &terrain.chunks,
+            &transform,
+            config.texture_tile,
+            config.metallic,
+            config.roughness,
+            &config.splat_map_path,
+            &config.layer_textures,
+            scene_dir,
+        );
+        // A style_mask on the terrain entity masks its chunks (#310)
+        scene_renderer.set_terrain_entity(Some(entity.id));
+
+        // Register physics collider
+        let (verts, tris) = terrain.trimesh_data();
+        let offset = [
+            transform.position.x,
+            transform.position.y,
+            transform.position.z,
+        ];
+        let offset_verts: Vec<[f32; 3]> = verts
+            .iter()
+            .map(|v| [v[0] + offset[0], v[1] + offset[1], v[2] + offset[2]])
+            .collect();
+        physics.register_static_trimesh(entity.id, offset_verts, tris, 0.8, 0.1);
+
+        // Load grass if enabled
+        let grass_config = flint_terrain::GrassConfig::from_component(terrain_comp, false);
+
+        if grass_config.enabled {
+            // Get raw heightmap data and splat map data for GPU upload
+            let hm_data = heightmap.clone_heights();
+            let hm_w = heightmap.width;
+            let hm_d = heightmap.depth;
+
+            // Load splat map pixels for grass compute shader
+            let splat_path = {
+                let p = scene_dir.join(&config.splat_map_path);
+                if vfs::exists(&p) {
+                    p
+                } else {
+                    scene_dir
+                        .parent()
+                        .map(|pp| pp.join(&config.splat_map_path))
+                        .filter(|pp| vfs::exists(pp))
+                        .unwrap_or(p)
+                }
+            };
+
+            if let Ok(splat_img) = flint_render::open_image(&splat_path) {
+                let splat_rgba = splat_img.to_rgba8();
+                let (sw, sh) = splat_rgba.dimensions();
+
+                scene_renderer.load_grass(
+                    device,
+                    queue,
+                    &grass_config,
+                    &hm_data,
+                    hm_w,
+                    hm_d,
+                    splat_rgba.as_raw(),
+                    sw,
+                    sh,
+                    offset,
+                    config.width,
+                    config.depth,
+                    config.height_scale,
+                );
+
+                tracing::info!(
+                    "Grass enabled: density={}, max_dist={}",
+                    grass_config.density,
+                    grass_config.max_distance
+                );
+
+                *grass_info_out = Some(LoadedGrassInfo {
+                    config: grass_config.clone(),
+                    terrain_entity_name: entity.name.clone(),
+                    component: comp::TERRAIN,
+                });
+            } else {
+                tracing::warn!("Grass enabled but splat map not found at {:?}", splat_path);
+            }
+        }
+
+        tracing::info!(
+            "Loaded terrain '{}': {}x{} heightmap, {} chunks, {}x{} world units",
+            entity.name,
+            heightmap.width,
+            heightmap.depth,
+            terrain.chunks.len(),
+            config.width,
+            config.depth,
+        );
+
+        *terrain_out = Some((terrain, config));
+        break; // Only one terrain entity for now
+    }
+
+    // Grass on a scene-authored mesh ground (ADR 0089). One grass field per
+    // scene: a grass_ground replaces a terrain's grass.
+    if let Some(info) = load_grass_ground(world, scene_dir, device, queue, scene_renderer) {
+        if grass_info_out.is_some() {
+            tracing::warn!(
+                "grass_ground '{}' replaces the terrain's grass",
+                info.terrain_entity_name
+            );
+        }
+        *grass_info_out = Some(info);
+    }
+}
+
+/// Load a scene's `grass_ground` into `scene_renderer`, as the player does
+/// (ADR 0089). Returns whether grass was set. Public for `flint render`.
+pub fn load_scene_grass_ground(
+    world: &FlintWorld,
+    scene_path: &str,
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    scene_renderer: &mut SceneRenderer,
+) -> bool {
+    let scene_dir = Path::new(scene_path)
+        .parent()
+        .unwrap_or_else(|| Path::new("."));
+    load_grass_ground(world, scene_dir, device, queue, scene_renderer).is_some()
+}
+
+/// Load the first `grass_ground` entity's mask and hand it to the renderer
+/// (ADR 0089). The ground is level at the entity's `y`, from its `x`, `z`
+/// across `width` × `depth`.
+fn load_grass_ground(
+    world: &FlintWorld,
+    scene_dir: &Path,
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    scene_renderer: &mut SceneRenderer,
+) -> Option<LoadedGrassInfo> {
+    for entity in world.all_entities() {
+        let Some(ground) = world.get_component(entity.id, comp::GRASS_GROUND) else {
+            continue;
+        };
+        let config = flint_terrain::GrassConfig::from_component(ground, true);
+        if !config.enabled {
+            return None;
+        }
+        let mask_rel = ground.get("mask").and_then(|v| v.as_str()).unwrap_or("");
+        if mask_rel.is_empty() {
+            tracing::warn!("grass_ground '{}': missing mask path", entity.name);
+            return None;
+        }
+        let mask_path = {
+            let p = scene_dir.join(mask_rel);
+            match scene_dir.parent().map(|pp| pp.join(mask_rel)) {
+                Some(pp) if !vfs::exists(&p) && vfs::exists(&pp) => pp,
+                _ => p,
+            }
+        };
+        let mask = match flint_render::open_image(&mask_path) {
+            Ok(img) => img.to_luma8(),
+            Err(e) => {
+                tracing::warn!(
+                    "grass_ground '{}': mask {:?}: {}",
+                    entity.name,
+                    mask_path,
+                    e
+                );
+                return None;
+            }
+        };
+        let get_f32 = |key: &str, default: f32| -> f32 {
+            ground.get(key).and_then(toml_f32).unwrap_or(default)
+        };
+        let pos = world
+            .get_component(entity.id, comp::TRANSFORM)
+            .and_then(|t| t.get("position").and_then(toml_vec3))
+            .unwrap_or([0.0; 3]);
+        let (mask_width, mask_height) = mask.dimensions();
+        let result = scene_renderer.set_grass_ground(
+            device,
+            queue,
+            &config,
+            &flint_render::GrassGround {
+                origin: [pos[0], pos[2]],
+                size: [get_f32("width", 64.0), get_f32("depth", 64.0)],
+                mask: mask.as_raw(),
+                mask_width,
+                mask_height,
+                scale_by_mask: ground
+                    .get("scale_by_mask")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(true),
+                height: flint_render::GrassHeight::Flat(pos[1]),
+            },
+        );
+        if let Err(e) = result {
+            tracing::warn!("grass_ground '{}': {}", entity.name, e);
+            return None;
+        }
+        tracing::info!(
+            "Grass ground '{}': {}x{} mask, density={}, max_dist={}",
+            entity.name,
+            mask_width,
+            mask_height,
+            config.density,
+            config.max_distance
+        );
+        return Some(LoadedGrassInfo {
+            config,
+            terrain_entity_name: entity.name.clone(),
+            component: comp::GRASS_GROUND,
+        });
+    }
+    None
+}
+
+/// Build a ModelLoadConfig with catalog-resolved path overrides.
+pub(super) fn build_model_load_config(
+    scene_path: &str,
+    world: &FlintWorld,
+    catalog: Option<&AssetCatalog>,
+    store: Option<&ContentStore>,
+) -> ModelLoadConfig {
+    let mut config = ModelLoadConfig::from_scene_path(scene_path);
+
+    let (Some(cat), Some(st)) = (catalog, store) else {
+        return config;
+    };
+
+    for entity in world.all_entities() {
+        if let Some(comps) = world.get_components(entity.id) {
+            // Resolve model assets
+            if let Some(model) = comps.get(comp::MODEL) {
+                if let Some(name) = model.get("asset").and_then(|v| v.as_str()) {
+                    if !config.overrides.contains_key(name) {
+                        if let Some(path) = resolve_catalog(cat, st, name) {
+                            config.overrides.insert(name.to_string(), path);
+                        }
+                    }
+                }
+            }
+            // Resolve textures
+            for comp_name in &[comp::MATERIAL, comp::SPRITE] {
+                if let Some(comp) = comps.get(*comp_name) {
+                    if let Some(tex) = comp.get("texture").and_then(|v| v.as_str()) {
+                        if !config.overrides.contains_key(tex) {
+                            if let Some(path) = resolve_catalog(cat, st, tex) {
+                                config.overrides.insert(tex.to_string(), path);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    config
+}
+
+/// Look up an asset name in the catalog and content store.
+pub(super) fn resolve_catalog(
+    catalog: &AssetCatalog,
+    store: &ContentStore,
+    name: &str,
+) -> Option<PathBuf> {
+    let meta = catalog.get(name)?;
+    let hash = flint_core::ContentHash::from_prefixed_hex(&meta.hash)?;
+    store.get(&hash)
+}
+
+/// Register skeletal data from loaded models into the animation system.
+pub(super) fn register_skeletal_data(
+    load_result: &model_loader::ModelLoadResult,
+    animation: &mut AnimationSystem,
+) {
+    // Skeletons built from the first import of each asset, so entities that hit
+    // the mesh cache (`import_result: None` — every 2nd+ entity sharing a
+    // skinned asset) still get their own skeleton and animate independently.
+    let mut skeletons_by_asset: HashMap<String, Vec<Skeleton>> = HashMap::new();
+    let mut deferred: Vec<(EntityId, String)> = Vec::new();
+
+    for loaded in &load_result.models {
+        if !loaded.is_skinned {
+            continue;
+        }
+        let Some(ref import_result) = loaded.import_result else {
+            deferred.push((loaded.entity_id, loaded.asset_name.clone()));
+            continue;
+        };
+        let skeletons: Vec<Skeleton> = import_result
+            .skeletons
+            .iter()
+            .map(Skeleton::from_imported)
+            .collect();
+        for skeleton in &skeletons {
+            animation.add_skeleton(loaded.entity_id, skeleton.clone());
+        }
+        skeletons_by_asset
+            .entry(loaded.asset_name.clone())
+            .or_insert(skeletons);
+        for imported_clip in &import_result.skeletal_clips {
+            let clip = SkeletalClip::from_imported(imported_clip);
+            println!(
+                "  Skeletal clip: {} ({:.1}s, {} tracks)",
+                clip.name,
+                clip.duration,
+                clip.joint_tracks.len()
+            );
+            animation.add_skeletal_clip(clip);
+        }
+    }
+
+    for (entity_id, asset_name) in deferred {
+        match skeletons_by_asset.get(&asset_name) {
+            Some(skeletons) => {
+                for skeleton in skeletons {
+                    animation.add_skeleton(entity_id, skeleton.clone());
+                }
+            }
+            None => tracing::warn!(
+                "skinned entity {:?} uses `{}` but no import of that asset produced a skeleton this load; it will render in rest pose",
+                entity_id,
+                asset_name
+            ),
+        }
+    }
+}
+
+/// Register node-level animation data from loaded models into the animation system.
+pub(super) fn register_node_animation_data(
+    load_result: &model_loader::ModelLoadResult,
+    animation: &mut AnimationSystem,
+) {
+    for loaded in &load_result.models {
+        if let Some(ref import_result) = loaded.import_result {
+            for imported_clip in &import_result.node_clips {
+                let clip = NodeClip::from_imported(imported_clip);
+                println!(
+                    "  Node clip: {} ({:.1}s, {} tracks)",
+                    clip.name,
+                    clip.duration,
+                    clip.node_tracks.len()
+                );
+                animation.add_node_clip(clip);
+            }
+        }
+        if let Some(ref node_map) = loaded.node_map {
+            animation.register_node_entity(loaded.entity_id, node_map.clone());
+        }
+    }
+}
+
+/// Load audio files referenced by audio_source components and (unless the
+/// scene opts out via `[scene] preload_audio = false`) preload every audio
+/// file from audio/ for script-triggered sounds.
+///
+/// With `queue`, nothing is decoded here: each sound joins the engine's
+/// decode queue, which `tick_av_systems` works through a few milliseconds a
+/// frame, sources that are heard at once (autoplay, above silence) first,
+/// then the rest smallest first. That is how a late audio bundle arrives
+/// mid-game without a stall (#124). Without it, everything is decoded now,
+/// as a scene load can afford.
+pub(super) fn load_audio_from_world(
+    world: &FlintWorld,
+    audio: &mut AudioSystem,
+    scene_path: &str,
+    preload_all: bool,
+    queue: bool,
+) {
+    let mut load = |name: &str, path: &Path, need: Need| {
+        if audio.engine.has_sound(name) {
+            return;
+        }
+        let result = if queue {
+            audio.engine.queue_sound(name, path, need)
+        } else {
+            audio.engine.load_sound(name, path)
+        };
+        match result {
+            Err(e) => tracing::warn!("Failed to load audio '{}': {:?}", name, e),
+            Ok(()) if !queue => println!("Loaded audio: {}", name),
+            Ok(()) => {}
+        }
+    };
+    let scene_dir = Path::new(scene_path)
+        .parent()
+        .unwrap_or_else(|| Path::new("."));
+
+    // Build list of directories to search: scene dir first, then parent (game root)
+    let mut search_dirs = vec![scene_dir.to_path_buf()];
+    if let Some(parent) = scene_dir.parent() {
+        search_dirs.push(parent.to_path_buf());
+    }
+
+    // Load audio files referenced by audio_source components
+    for entity in world.all_entities() {
+        let Some(source) = world
+            .get_components(entity.id)
+            .and_then(|components| components.get(comp::AUDIO_SOURCE).cloned())
+        else {
+            continue;
+        };
+        let Some(file_name) = source.get("file").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        // Heard the moment it loads: an autoplay source above silence.
+        let audible = source
+            .get("autoplay")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true)
+            && source.get("volume").and_then(toml_f64).unwrap_or(1.0) > 0.0;
+        let need = if audible { Need::Audible } else { Need::Later };
+
+        let mut found = false;
+        for dir in &search_dirs {
+            let audio_path = dir.join(file_name);
+            if vfs::exists(&audio_path) {
+                load(file_name, &audio_path, need);
+                found = true;
+                break;
+            }
+        }
+        if !found {
+            tracing::warn!("Audio file not found: {}", file_name);
+        }
+    }
+
+    // Preload all audio files from the audio/ directory (for script-triggered
+    // sounds). Scenes with no audio can skip this — decoding a large stem
+    // library dominates their load time.
+    if !preload_all {
+        tracing::info!("Scene opts out of audio preload (preload_audio = false)");
+        return;
+    }
+    for dir in &search_dirs {
+        let audio_dir = dir.join("audio");
+        if vfs::is_dir(&audio_dir) {
+            if let Ok(entries) = vfs::read_dir(&audio_dir) {
+                for path in entries {
+                    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+                    if ext == "ogg" || ext == "wav" || ext == "mp3" || ext == "flac" {
+                        let rel_name =
+                            format!("audio/{}", path.file_name().unwrap().to_string_lossy());
+                        load(&rel_name, &path, Need::Later);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Load every texture referenced by live particle instances and registered
+/// effects into the renderer's texture cache. Searched in `particles/`, the
+/// scene dir, then its parent (game root) — see `flint_particles::texture_search_dirs`.
+pub(super) fn load_particle_textures_from_world(
+    particles: &flint_particles::ParticleSystem,
+    renderer: &mut SceneRenderer,
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    scene_path: &str,
+) {
+    let dirs = flint_particles::texture_search_dirs(scene_path);
+    flint_render::load_particle_textures(renderer, device, queue, &particles.sync, &dirs);
+}
+
+/// Load `.anim.toml` files from the `animations/` directory next to the scene.
+/// Also checks one level up (game root) for projects that use a `scenes/` subdirectory.
+pub(super) fn load_animations_from_world(scene_path: &str, animation: &mut AnimationSystem) {
+    let scene_dir = Path::new(scene_path)
+        .parent()
+        .unwrap_or_else(|| Path::new("."));
+
+    let mut anim_dir = scene_dir.join("animations");
+    if !vfs::is_dir(&anim_dir) {
+        // Check parent directory (game project structure)
+        if let Some(parent) = scene_dir.parent() {
+            let parent_anim = parent.join("animations");
+            if vfs::is_dir(&parent_anim) {
+                anim_dir = parent_anim;
+            } else {
+                return;
+            }
+        } else {
+            return;
+        }
+    }
+
+    let entries = match vfs::read_dir(&anim_dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+
+    for path in entries {
+        if path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map_or(false, |n| n.ends_with(".anim.toml"))
+        {
+            match flint_animation::loader::load_clip_from_file(&path) {
+                Ok(clip) => {
+                    println!("Loaded animation: {} ({:.1}s)", clip.name, clip.duration);
+                    animation.add_property_clip(clip);
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to load animation '{}': {:?}", path.display(), e);
+                }
+            }
+        }
+    }
+}
+
+/// Load `.sequence.toml` files from the `animations/` directory next to the scene
+/// (or one level up). Sequences are referenced by `name` from `animator.sequence`.
+pub(super) fn load_sequences_from_world(scene_path: &str, animation: &mut AnimationSystem) {
+    let Some(anim_dir) = resolve_animations_dir(scene_path) else {
+        return;
+    };
+    let entries = match vfs::read_dir(&anim_dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    for path in entries {
+        if path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.ends_with(".sequence.toml"))
+        {
+            match flint_animation::load_sequence_from_file(&path) {
+                Ok(seq) => {
+                    println!(
+                        "Loaded sequence: {} ({:.1}s, {} events)",
+                        seq.name,
+                        seq.resolved_duration(),
+                        seq.events.len()
+                    );
+                    animation.add_sequence(seq);
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to load sequence '{}': {:?}", path.display(), e);
+                }
+            }
+        }
+    }
+}
+
+/// `<scene_dir>/animations/`, falling back to `<scene_dir>/../animations/`
+/// for projects that keep scenes in a subdirectory.
+fn resolve_animations_dir(scene_path: &str) -> Option<std::path::PathBuf> {
+    let scene_dir = Path::new(scene_path)
+        .parent()
+        .unwrap_or_else(|| Path::new("."));
+    let local = scene_dir.join("animations");
+    if vfs::is_dir(&local) {
+        return Some(local);
+    }
+    let up = scene_dir.parent()?.join("animations");
+    vfs::is_dir(&up).then_some(up)
+}
+
+/// Load `.sprite.toml` files from the `animations/` directory next to the scene.
+/// Each file can define multiple sprite animation clips under `[animation.NAME]` sections.
+pub(super) fn load_sprite_animations_from_world(scene_path: &str, animation: &mut AnimationSystem) {
+    let scene_dir = Path::new(scene_path)
+        .parent()
+        .unwrap_or_else(|| Path::new("."));
+
+    let mut anim_dir = scene_dir.join("animations");
+    if !vfs::is_dir(&anim_dir) {
+        if let Some(parent) = scene_dir.parent() {
+            let parent_anim = parent.join("animations");
+            if vfs::is_dir(&parent_anim) {
+                anim_dir = parent_anim;
+            } else {
+                return;
+            }
+        } else {
+            return;
+        }
+    }
+
+    let entries = match vfs::read_dir(&anim_dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+
+    for path in entries {
+        if path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map_or(false, |n| n.ends_with(".sprite.toml"))
+        {
+            match flint_animation::sprite_clip::load_sprite_clips_from_file(&path) {
+                Ok(clips) => {
+                    for clip in clips {
+                        println!(
+                            "Loaded sprite animation: {} ({}ms, {} frames)",
+                            clip.name,
+                            clip.total_duration_ms(),
+                            clip.frames.len()
+                        );
+                        animation.add_sprite_clip(clip);
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "Failed to load sprite animation '{}': {:?}",
+                        path.display(),
+                        e
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// Resolve a scene path relative to the current scene.
+/// If target is already an absolute path or starts from a known root, use it directly.
+/// Otherwise resolve relative to the current scene's directory.
+pub(super) fn resolve_scene_path(current_scene: &str, target: &str) -> String {
+    let target_path = Path::new(target);
+    if target_path.is_absolute() || vfs::exists(&target_path) {
+        return target.to_string();
+    }
+
+    let current_dir = Path::new(current_scene)
+        .parent()
+        .unwrap_or_else(|| Path::new("."));
+
+    let resolved = current_dir.join(target);
+    if vfs::exists(&resolved) {
+        return resolved.to_string_lossy().to_string();
+    }
+
+    // Try parent directory (game root)
+    if let Some(parent) = current_dir.parent() {
+        let parent_resolved = parent.join(target);
+        if vfs::exists(&parent_resolved) {
+            return parent_resolved.to_string_lossy().to_string();
+        }
+    }
+
+    // Return as-is, let scene loader report the error
+    target.to_string()
+}
+
+/// Set up the script system's scripts directory from the scene path
+pub(super) fn load_scripts_from_world(scene_path: &str, script: &mut ScriptSystem) {
+    script.load_scripts_from_scene(scene_path);
+}
