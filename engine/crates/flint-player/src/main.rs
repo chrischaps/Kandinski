@@ -195,6 +195,12 @@ struct Args {
     /// and each pass's GPU time, as the web page's `?perf=1` copies it
     #[arg(long)]
     perf: bool,
+
+    /// Don't watch the game's files for changes (#633): scripts, UI
+    /// documents, user styles, glyph sets and palettes load once and never
+    /// reload, and nothing polls the disk. For captures and shipped builds
+    #[arg(long)]
+    no_hot_reload: bool,
 }
 
 fn main() -> Result<()> {
@@ -207,12 +213,19 @@ fn main() -> Result<()> {
 
     let args = Args::parse();
     if args.list_gpus {
-        for a in flint_render::list_adapters() {
+        let adapters = flint_render::list_adapters();
+        if adapters.is_empty() {
+            eprintln!("No GPU adapters found: {}", flint_render::no_adapter_hint());
+        }
+        for a in adapters {
             println!("{a}");
         }
         return Ok(());
     }
     flint_render::set_gpu_override(args.gpu.clone());
+    if args.no_hot_reload {
+        flint_core::file_watch::disable();
+    }
 
     let mut args = args;
     let late_bundles = match args.bundle.clone() {
@@ -260,7 +273,7 @@ fn main() -> Result<()> {
     println!("  Mouse    - Look");
     println!("  Space    - Jump");
     println!("  Shift    - Sprint");
-    println!("  Escape   - Release cursor / Exit");
+    println!("  Escape   - Release cursor / Exit (the game's, if it binds Escape)");
     println!("  F2       - Rendering stats overlay");
     println!("  F3       - Scene debug panels");
     println!("  F4       - Rendering & Effects menu");
@@ -361,6 +374,11 @@ fn main() -> Result<()> {
     app.set_schema_paths(all_schemas);
 
     event_loop.run_app(&mut app)?;
+    // A failed start or a screenshot that never reached the disk exits
+    // non-zero, never as a clean run (#639).
+    if let Some(failure) = app.run_failure() {
+        anyhow::bail!(failure);
+    }
 
     Ok(())
 }

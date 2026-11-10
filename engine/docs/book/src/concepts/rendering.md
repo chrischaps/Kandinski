@@ -19,7 +19,7 @@ Diffuse shading is Lambert by default, but the scene can blend toward Oren-Nayar
 
 Directional lights cast shadows via cascaded shadow maps. Multiple shadow cascades cover different distance ranges from the camera, giving high-resolution shadows close up and broader coverage at distance. A directional light with a non-zero `angular_size` gets contact-hardening PCSS shadows instead of the fixed PCF kernel.
 
-Shadows are toggled at runtime from the Rendering & Effects menu (**F4**), which also offers the shadow-map resolution (512 to 4096). Headlessly, use `--no-shadows` and `--shadow-resolution`. One entity stops casting with `material.cast_shadows = false`. See [Lighting](lighting.md#shadows) for details.
+Shadows are toggled at runtime from the Rendering & Effects menu (**F4**), which also offers the shadow-map resolution (512 to 4096). Headlessly, use `--no-shadows` and `--shadow-resolution`. One entity stops casting with `material.cast_shadows = false`, a scene with `[environment] shadows = false`, and a sun of intensity 0 draws no shadow pass. `material.unlit = true` draws a mesh without lighting. See [Lighting](lighting.md#shadows) for details.
 
 ## Camera Modes
 
@@ -61,7 +61,7 @@ Imported glTF models are rendered with their full mesh geometry and materials. T
 Two ECS components tint an imported model without touching the GLB:
 
 - `material.base_color_r/g/b[/a]` on the entity (or its direct parent) replaces the base colour of **every** primitive the entity draws. Scripts write it with `set_material_color`.
-- `material_overrides` maps glTF **material names** to colours: `Frame = [0.9, 0.3, 0.1]`, `Capsule = [0.2, 0.6, 1.0, 0.5]`. The renderer looks it up on the drawn entity and then on each ancestor, so a single component on a model's root entity recolours the matching materials on all of its expanded child nodes, including meshes that mix several materials. A three-component value keeps the material's own alpha. It takes precedence over `material.base_color_*` for the named material. Scripts write it with `set_material_override(id, name, r, g, b, a)`.
+- `material_overrides` maps glTF **material names** to colours: `Frame = [0.9, 0.3, 0.1]`, `Capsule = [0.2, 0.6, 1.0, 0.5]`. The renderer looks it up on the drawn entity and then on each ancestor, so a single component on a model's root entity recolours the matching materials on all of its expanded child nodes, including meshes that mix several materials. A three-component value keeps the material's own alpha. It takes precedence over `material.base_color_*` for the named material. Scripts write it with `set_material_override(id, name, r, g, b, a)`. A value can also be a table that recolours the material's glow: see [Recolouring an imported model's glow](#recolouring-an-imported-models-glow).
 
 Both are re-read whenever the renderer re-extracts the world (every frame in the player), so colour changes are live. A vertex-coloured mesh ignores both: tint it with `material.vertex_tint_*` ([Tinting vertex colours per entity](#tinting-vertex-colours-per-entity)).
 
@@ -195,6 +195,23 @@ Configure post-processing per-scene via the `[post_process]` TOML block, overrid
 
 *PBR materials with varying roughness and metallic values. Left to right: rough dielectric, smooth dielectric, rough metal, polished metal.*
 
+### Double-sided materials
+
+A glTF material with `"doubleSided": true` is drawn from both sides (#623). That is what thin cards need: leaves and palm fronds, flat roadside figures, wire strips, a flag, anything modelled as one sheet rather than a closed solid. A material that doesn't say is single-sided, glTF's default, and its back faces are culled.
+
+![Two palms built alike, their fronds single cards seen from below: the left palm's material is doubleSided](../images/double-sided-palms.png)
+
+*`demo/double_sided.scene.toml`: the same palm twice, each frond one strip of cards wound with its face up, seen from under the crowns. The left palm's frond material is `doubleSided`, so every underside draws. The right palm's isn't, so only the fronds that face the camera are left.*
+
+A double-sided material:
+
+- **draws with no face culled** in every mode: opaque, alpha-mask and blended (blended ones still draw their back faces before their front faces), static or skinned, with or without shallow wooze;
+- **lights a back face as the side you see:** its normal is turned toward the viewer, so the underside of a leaf is lit by what is under it and is dark when the sun is above, as a glTF viewer shows it. Normal maps and the shadow lookup's normal offset use the turned normal too;
+- **casts shadows from both sides**, so a card shadows the ground whichever way it faces the sun;
+- **is outlined and styled on both faces**, since the style mask and veil already draw both.
+
+For a runtime mesh, set `ImportedMaterial::double_sided`. Single-sided is the cheaper choice for closed solids: culling saves the back half of their fragments. A card generator that writes every card twice, the second copy wound the other way, can write it once with `doubleSided` instead, at half the triangles. The palms' models come from `tools/test-models/double_sided_palm.py`, and the test fixture `testModels/DoubleSidedCard.glb` from `double_sided_card.py` beside it.
+
 ### Emission
 
 A material can give off light of its own (ADR 0076): lamps, lit windows, embers, a glowing crown. Emission is added after lighting and before tonemapping, so it doesn't depend on facing, the sun or the ambient, and with post-processing on, bloom picks up anything brighter than its threshold. It lights only its own surface. To light the things around it, put a point light beside it.
@@ -244,6 +261,50 @@ let mut material = toml::Table::new();
 material.insert("emissive_scale".into(), (night * 1.6).into());
 world.set_component(id, "material", material.into())?;
 ```
+
+#### Recolouring an imported model's glow
+
+`emissive_scale` changes how bright a glow is, not its colour. To change the colour of one named glTF material's light, give its `material_overrides` entry a table instead of a plain colour (#624):
+
+```toml
+[entities.road.material_overrides]
+Paint = [0.05, 0.05, 0.06]                                   # a base colour, as before
+Neon  = { emissive = [0.05, 0.95, 1.0], emissive_strength = 6 }
+Sign  = { base_color = [0.1, 0.1, 0.1], emissive = [1.0, 0.2, 0.6] }
+```
+
+| Key | Replaces | Default |
+|---|---|---|
+| `base_color` | the base colour, exactly as the array form does | the material's |
+| `emissive` | the material's `emissive` colour, linear RGB; may pass 1 | the material's |
+| `emissive_strength` | its `emissive_strength` (`KHR_materials_emissive_strength`), per-vertex light included | the material's, 1 if the file has none |
+
+- **Any material can glow,** even one imported with no emission at all: an emissive colour on a material whose `emissive` is black lights it.
+- **An emissive texture keeps its pattern.** The colour multiplies it, as glTF's `emissiveFactor` does, so a lantern's glass keeps its leading and takes the new hue.
+- **Field by field, nearest first.** Each key is read from the nearest entity that sets it, the drawn entity and then each ancestor, so a model's root can paint a material and one of its expanded nodes light it.
+- **`emissive_scale` still applies on top,** so a stage can be a colour from the override and a dimmer from the entity.
+- **The scene keeps its lighting.** It's a real emission, through bloom like any other, so nothing has to be painted bright under a flat ambient to look lit.
+- **Cost:** the same as a new `base_color` override or `emissive_scale`: that draw's small material uniform is rebuilt on the next frame. Nothing is re-imported or re-uploaded.
+
+From a script:
+
+| Function | Does |
+|---|---|
+| `set_material_emissive(id, material, r, g, b)` | sets `emissive`, keeping the entry's strength and base colour |
+| `set_material_emissive(id, material, r, g, b, strength)` | sets `emissive` and `emissive_strength` |
+| `set_material_override(id, material, r, g, b, a)` | sets the base colour, keeping a light set before it |
+| `clear_material_override(id, material)` | drops the entity's own entry, light and colour, so the material (or an ancestor's entry) shows again |
+
+```rhai
+fn on_update() {
+    let hue = if total_time() % 5.0 < 2.5 { [0.05, 0.95, 1.0] } else { [1.0, 0.12, 0.75] };
+    set_material_emissive(self_entity(), "Alpha_Joints_MAT.002", hue[0], hue[1], hue[2], 6.0);
+}
+```
+
+`demo/emissive_recolor.scene.toml` is five figures of one skinned GLB, whose joints have no emission of their own, and two lanterns whose glass glows through a texture, all walking one palette a stage every 2.5 s under a moon that still lights them (`flint render demo/emissive_recolor.scene.toml --scripts --time 0..10 --fps 12 -o glow.gif`).
+
+![Five figures from one GLB, their joints glowing magenta to cyan along the row, under moonlight](../images/emissive-recolor.png)
 
 #### Lighting the glow as surface too
 

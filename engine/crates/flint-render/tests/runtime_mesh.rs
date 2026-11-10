@@ -243,6 +243,49 @@ fn replacing_a_mesh_1000_times_does_not_grow_gpu_memory() {
 }
 
 #[test]
+fn hidden_entities_and_their_children_are_not_drawn() {
+    // #628: `visibility { visible = false }` skips the draw outright (not
+    // culled: never extracted), and a hidden parent takes its children.
+    let gpu = gpu_or_skip!();
+    let mut renderer = gpu.renderer();
+    let mut world = FlintWorld::new();
+    let (vertices, indices) = square(1.0, [1.0; 4]);
+    renderer.load_procedural_mesh(
+        &gpu.device,
+        "tile",
+        &vertices,
+        &indices,
+        ImportedMaterial::vertex_colored("tile"),
+    );
+    spawn(&mut world, "a", "tile", [0.0; 3]);
+    spawn(&mut world, "b", "tile", [0.5, 0.0, 0.0]);
+    spawn(&mut world, "b_child", "tile", [0.0, 0.2, 0.0]);
+    let b = world.get_id("b").unwrap();
+    world
+        .set_parent(world.get_id("b_child").unwrap(), b)
+        .unwrap();
+    let camera = Camera::default();
+
+    gpu.frame(&mut renderer, &world, &camera);
+    assert_eq!(renderer.collect_stats().entity_draws, 3);
+
+    let hide = |world: &mut FlintWorld, visible: bool| {
+        world
+            .set_field(b, "visibility", "visible", toml::Value::Boolean(visible))
+            .unwrap();
+    };
+    hide(&mut world, false);
+    gpu.frame(&mut renderer, &world, &camera);
+    let stats = renderer.collect_stats();
+    assert_eq!(stats.entity_draws, 1, "b and its child are hidden");
+    assert_eq!(stats.culled_draws, 0, "hidden is skipped, not culled");
+
+    hide(&mut world, true);
+    gpu.frame(&mut renderer, &world, &camera);
+    assert_eq!(renderer.collect_stats().entity_draws, 3);
+}
+
+#[test]
 fn meshes_outside_the_view_are_culled() {
     let gpu = gpu_or_skip!();
     let mut renderer = gpu.renderer();
@@ -1153,6 +1196,156 @@ fn cast_shadows_false_keeps_a_mesh_out_of_the_shadow_map() {
     assert!(close(solid, gpu.centre_pixel()), "the child's own value wins");
 }
 
+/// A flat square of half-width `half` at the origin wound once, so it has
+/// one face: up (+Y, normal up) or down.
+fn card(half: f32, color: [f32; 4], up: bool) -> (Vec<Vertex>, Vec<u32>) {
+    let (mut vertices, _) = square(half, color);
+    let ny = if up { 1.0 } else { -1.0 };
+    vertices.iter_mut().for_each(|v| v.normal = [0.0, ny, 0.0]);
+    let indices = if up { vec![0, 1, 2, 0, 2, 3] } else { vec![0, 2, 1, 0, 3, 2] };
+    (vertices, indices)
+}
+
+/// A camera 8 m above (or below) `target` and 4 m back, looking at it.
+fn looking_at(target: [f32; 3], above: bool) -> Camera {
+    let [x, y, z] = target;
+    Camera {
+        position: flint_core::Vec3::new(x, y + if above { 8.0 } else { -8.0 }, z + 4.0),
+        target: flint_core::Vec3::new(x, y, z),
+        ..Camera::default()
+    }
+}
+
+fn set_sun(world: &mut FlintWorld, direction: [f64; 3], intensity: f64) {
+    let sun = world.get_id("sun").unwrap_or_else(|| world.spawn("sun").unwrap());
+    let mut light = toml::Table::new();
+    light.insert("type".into(), "directional".into());
+    light.insert("intensity".into(), intensity.into());
+    light.insert(
+        "direction".into(),
+        toml::Value::Array(direction.iter().map(|&d| d.into()).collect()),
+    );
+    world.set_component(sun, "light", light.into()).unwrap();
+}
+
+/// glTF `doubleSided` (#623): `testModels/DoubleSidedCard.glb` holds two
+/// cards wound once with their normals up, one `doubleSided`. From above
+/// both draw; from below only the double-sided one does, where before the
+/// fix both were culled.
+#[test]
+fn a_double_sided_glb_card_draws_from_behind() {
+    let gpu = gpu_or_skip!();
+    let mut renderer = gpu.renderer();
+    renderer.set_debug_mode(DebugMode::Unlit);
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../testModels/DoubleSidedCard.glb");
+    let model = flint_import::import_gltf(path).unwrap();
+    renderer.load_model(&gpu.device, &gpu.queue, "cards", &model);
+    let mut world = FlintWorld::new();
+    spawn(&mut world, "cards", "cards", [0.0; 3]);
+
+    // The GLB's colours, warm and cool, as against the cool grey sky.
+    let orange = |[r, _, b, _]: [u8; 4]| r > b + 50;
+    let blue = |[r, _, b, _]: [u8; 4]| b > r + 45;
+    let mut seen = |x: f32, above: bool| {
+        gpu.frame(&mut renderer, &world, &looking_at([x, 0.0, 0.0], above));
+        gpu.centre_pixel()
+    };
+    let two_above = seen(-1.25, true);
+    let one_above = seen(1.25, true);
+    let two_below = seen(-1.25, false);
+    let one_below = seen(1.25, false);
+    assert!(orange(two_above), "the two-sided card from above: {two_above:?}");
+    assert!(blue(one_above), "the one-sided card from above: {one_above:?}");
+    assert!(orange(two_below), "the two-sided card from below: {two_below:?}");
+    assert!(
+        !blue(one_below) && !orange(one_below),
+        "the one-sided card from below is culled: {one_below:?}"
+    );
+}
+
+/// A double-sided card's back face is lit with its normal turned toward the
+/// viewer (#623): seen from below under a sun below, it reads as its front
+/// does from above under a sun above, and from below under a sun above it
+/// is in the dark, as the side that faces away from the light.
+#[test]
+fn a_double_sided_back_face_is_lit_as_the_side_it_shows() {
+    let gpu = gpu_or_skip!();
+    let mut renderer = gpu.renderer();
+    renderer.set_tonemapping(false);
+    renderer.set_ambient([0.0; 3], [0.0; 3]);
+    let mut world = FlintWorld::new();
+    spawn(&mut world, "card", "card", [0.0; 3]);
+    let (vertices, indices) = card(20.0, [0.5, 0.5, 0.5, 1.0], true);
+    let material = ImportedMaterial {
+        roughness: 1.0,
+        double_sided: true,
+        ..ImportedMaterial::vertex_colored("card")
+    };
+    renderer.load_procedural_mesh(&gpu.device, "card", &vertices, &indices, material);
+    let mut shoot = |sun_up: bool, above: bool| {
+        set_sun(&mut world, [0.0, if sun_up { 1.0 } else { -1.0 }, 0.0], 3.0);
+        gpu.frame(&mut renderer, &world, &looking_at([0.0; 3], above));
+        gpu.centre_pixel()
+    };
+    let front = shoot(true, true);
+    let back = shoot(false, false);
+    let back_in_the_dark = shoot(true, false);
+    assert!(front[0] > 60, "the front is lit: {front:?}");
+    let close = |a: [u8; 4], b: [u8; 4]| (0..3).all(|i| a[i].abs_diff(b[i]) <= 3);
+    assert!(close(front, back), "the back lit as a front: {back:?} vs {front:?}");
+    assert!(
+        back_in_the_dark[0] + 50 < front[0],
+        "the back faces away from a sun above: {back_in_the_dark:?} vs {front:?}"
+    );
+}
+
+/// A double-sided sheet casts a shadow whichever way it faces the sun
+/// (#623): wound to face the ground, away from the sun, a single-sided
+/// sheet is culled from the shadow map and the ground under it stays lit.
+#[test]
+fn a_double_sided_sheet_casts_from_either_side() {
+    let gpu = gpu_or_skip!();
+    let mut renderer = gpu.renderer();
+    renderer.set_tonemapping(false);
+    renderer.set_ambient([0.0; 3], [0.0; 3]);
+    let mut world = FlintWorld::new();
+    let camera = Camera::default();
+    let material = |name: &str, double_sided: bool| ImportedMaterial {
+        roughness: 1.0,
+        double_sided,
+        ..ImportedMaterial::vertex_colored(name)
+    };
+    // As in the cast_shadows test: a sheet 2 m up whose shadow falls on the
+    // middle of the view, while the camera sees past it to the ground there.
+    let (ground, ground_indices) = square(20.0, [0.5, 0.5, 0.5, 1.0]);
+    let (sheet, sheet_indices) = card(1.5, [0.5, 0.5, 0.5, 1.0], false);
+    renderer.load_procedural_mesh(
+        &gpu.device,
+        "ground",
+        &ground,
+        &ground_indices,
+        material("ground", false),
+    );
+    set_sun(&mut world, [0.5, 1.0, 0.0], 3.0);
+    spawn(&mut world, "ground", "ground", [0.0; 3]);
+    gpu.frame(&mut renderer, &world, &camera);
+    let lit = gpu.centre_pixel();
+    assert!(lit[0] > 40, "the ground is lit: {lit:?}");
+
+    spawn(&mut world, "sheet", "sheet", [1.0, 2.0, 0.0]);
+    let mut shadow_with = |double_sided: bool| {
+        let sheet_material = material("sheet", double_sided);
+        renderer.load_procedural_mesh(&gpu.device, "sheet", &sheet, &sheet_indices, sheet_material);
+        gpu.frame(&mut renderer, &world, &camera);
+        gpu.centre_pixel()
+    };
+    let one_sided = shadow_with(false);
+    let two_sided = shadow_with(true);
+    let close = |a: [u8; 4], b: [u8; 4]| (0..3).all(|i| a[i].abs_diff(b[i]) <= 3);
+    assert!(close(lit, one_sided), "a one-sided sheet facing away casts: {one_sided:?}");
+    assert!(two_sided[0] + 30 < lit[0], "a two-sided one casts: {two_sided:?} vs {lit:?}");
+}
+
 #[test]
 fn a_ray_target_is_met_where_each_entity_draws_it() {
     use flint_core::ray_mesh::RayMesh;
@@ -1337,4 +1530,253 @@ fn thousands_of_distinct_looks_draw() {
     );
     assert_eq!(stats.entity_draws as usize, LOOKS);
     assert!(gpu.centre_pixel()[1] > 0, "the tiles drew");
+}
+/// A directional light of `intensity`, pointing at `direction`, on the
+/// entity `name` (spawned the first time).
+fn sun(world: &mut FlintWorld, name: &str, intensity: f64, direction: [f64; 3]) {
+    let id = world
+        .get_id(name)
+        .unwrap_or_else(|| world.spawn(name).unwrap());
+    let mut light = toml::Table::new();
+    light.insert("type".into(), "directional".into());
+    light.insert("intensity".into(), intensity.into());
+    light.insert(
+        "direction".into(),
+        toml::Value::Array(direction.iter().map(|&d| d.into()).collect()),
+    );
+    world.set_component(id, "light", light.into()).unwrap();
+}
+
+/// A grey double-sided ground filling the view, rough and vertex-coloured.
+fn grey_ground(gpu: &Gpu, renderer: &mut SceneRenderer, world: &mut FlintWorld) {
+    let (ground, indices) = square(20.0, [0.5, 0.5, 0.5, 1.0]);
+    let material = ImportedMaterial {
+        roughness: 1.0,
+        ..ImportedMaterial::vertex_colored("ground")
+    };
+    renderer.load_procedural_mesh(&gpu.device, "ground", &ground, &indices, material);
+    spawn(world, "ground", "ground", [0.0; 3]);
+}
+
+/// A sun of intensity 0 (#627) lights nothing the shadow maps could darken:
+/// its pass is skipped with every caster, the stats count 0 shadow
+/// triangles, and the frame is the one shadows off draws. God rays still
+/// read the maps, so a dark sun with a `volumetric_intensity` keeps them.
+#[test]
+fn a_dark_sun_draws_no_shadow_pass() {
+    let gpu = gpu_or_skip!();
+    let mut renderer = gpu.renderer();
+    renderer.set_shadows(true);
+    let mut world = FlintWorld::new();
+    let camera = Camera::default();
+    grey_ground(&gpu, &mut renderer, &mut world);
+
+    sun(&mut world, "sun", 3.0, [0.5, 1.0, 0.0]);
+    gpu.frame(&mut renderer, &world, &camera);
+    assert!(renderer.shadows_drawn());
+    assert!(
+        renderer.collect_stats().shadow_triangles > 0,
+        "a lit sun casts"
+    );
+
+    sun(&mut world, "sun", 0.0, [0.5, 1.0, 0.0]);
+    gpu.frame(&mut renderer, &world, &camera);
+    let dark = gpu.centre_pixel();
+    assert!(!renderer.shadows_drawn(), "a sun of 0 draws no cascades");
+    let stats = renderer.collect_stats();
+    assert_eq!((stats.shadow_triangles, stats.shadow_draw_calls), (0, 0));
+    assert!(renderer.shadows_enabled(), "the setting itself is kept");
+
+    renderer.set_shadows(false);
+    gpu.frame(&mut renderer, &world, &camera);
+    assert_eq!(dark, gpu.centre_pixel(), "the frame shadows off draws");
+    renderer.set_shadows(true);
+
+    let id = world.get_id("sun").unwrap();
+    let mut light = world
+        .get_components(id)
+        .unwrap()
+        .get("light")
+        .unwrap()
+        .clone();
+    light
+        .as_table_mut()
+        .unwrap()
+        .insert("volumetric_intensity".into(), 1.0.into());
+    world.set_component(id, "light", light).unwrap();
+    gpu.frame(&mut renderer, &world, &camera);
+    assert!(renderer.shadows_drawn(), "a dark sun with god rays casts");
+}
+
+/// `[environment] shadows = false` (#627) holds the pass off over the
+/// quality setting, which keeps its own value, and `default_lights =
+/// false` lights a scene with no light entities by its ambient alone.
+#[test]
+fn the_scene_says_no_shadows_and_no_default_lights() {
+    let gpu = gpu_or_skip!();
+    let mut renderer = gpu.renderer();
+    renderer.set_shadows(true);
+    renderer.set_tonemapping(false);
+    renderer.set_ambient([0.0; 3], [0.0; 3]);
+    let mut world = FlintWorld::new();
+    let camera = Camera::default();
+    grey_ground(&gpu, &mut renderer, &mut world);
+
+    // No light entities: the built-in key and fill light it, and the key casts
+    gpu.frame(&mut renderer, &world, &camera);
+    let built_in = gpu.centre_pixel();
+    assert!(
+        built_in[0] > 40,
+        "the default lights light it: {built_in:?}"
+    );
+    assert!(renderer.collect_stats().shadow_triangles > 0);
+
+    renderer.set_scene_shadows(false);
+    gpu.frame(&mut renderer, &world, &camera);
+    assert!(!renderer.shadows_drawn() && renderer.shadows_enabled());
+    assert_eq!(renderer.collect_stats().shadow_triangles, 0);
+
+    // Without them: black under a black ambient, grey under a white one
+    renderer.set_default_lights(false);
+    gpu.frame(&mut renderer, &world, &camera);
+    let [r, g, b, _] = gpu.centre_pixel();
+    assert!(r < 3 && g < 3 && b < 3, "nothing lights it: {r} {g} {b}");
+    renderer.set_ambient([1.0; 3], [1.0; 3]);
+    gpu.frame(&mut renderer, &world, &camera);
+    let ambient = gpu.centre_pixel();
+    assert!(ambient[0] > 150, "the ambient alone lights it: {ambient:?}");
+
+    renderer.set_scene_shadows(true);
+    renderer.set_default_lights(true);
+    renderer.set_ambient([0.0; 3], [0.0; 3]);
+    gpu.frame(&mut renderer, &world, &camera);
+    assert_eq!(gpu.centre_pixel(), built_in, "back as it was");
+}
+
+/// `material.unlit` (#627) draws the base colour times `emissive_scale`,
+/// whatever the sun, the ambient and the way it faces, and a parent's
+/// reaches its children.
+#[test]
+fn unlit_draws_its_colour_whatever_the_light() {
+    let gpu = gpu_or_skip!();
+    let mut renderer = gpu.renderer();
+    renderer.set_tonemapping(false);
+    let mut world = FlintWorld::new();
+    let camera = Camera::default();
+    let (up, indices) = square(20.0, [0.5, 0.25, 0.0, 1.0]);
+    let mut down = up.clone();
+    down.iter_mut().for_each(|v| v.normal = [0.0, -1.0, 0.0]);
+    let material = ImportedMaterial {
+        roughness: 1.0,
+        ..ImportedMaterial::vertex_colored("card")
+    };
+    let group = world.spawn("group").unwrap();
+    spawn(&mut world, "card", "card", [0.0; 3]);
+    world
+        .set_parent(world.get_id("card").unwrap(), group)
+        .unwrap();
+    let set = |world: &mut FlintWorld, name: &str, fields: &[(&str, toml::Value)]| {
+        let id = world.get_id(name).unwrap();
+        let mut table = toml::Table::new();
+        for (k, v) in fields {
+            table.insert((*k).into(), v.clone());
+        }
+        world.set_component(id, "material", table.into()).unwrap();
+    };
+    let close = |a: [u8; 4], b: [u8; 4]| (0..3).all(|i| a[i].abs_diff(b[i]) <= 2);
+    // `albedo`: draw in the albedo debug view, which returns the surface
+    // colour with no light at all, through the same composite
+    let mut shoot = |world: &mut FlintWorld,
+                     vertices: &[Vertex],
+                     ambient: f32,
+                     sun_on: f64,
+                     albedo: bool| {
+        sun(world, "sun", 4.0 * sun_on, [0.0, 1.0, 0.0]);
+        renderer.set_ambient([ambient; 3], [ambient; 3]);
+        renderer.set_debug_mode(if albedo {
+            DebugMode::Unlit
+        } else {
+            DebugMode::Pbr
+        });
+        renderer.load_procedural_mesh(&gpu.device, "card", vertices, &indices, material.clone());
+        gpu.frame(&mut renderer, world, &camera);
+        gpu.centre_pixel()
+    };
+
+    // Lit, the sun and the ambient move it
+    let lit_dark = shoot(&mut world, &up, 0.0, 0.0, false);
+    let lit_bright = shoot(&mut world, &up, 1.0, 1.0, false);
+    assert!(
+        lit_bright[0] > lit_dark[0] + 40,
+        "{lit_dark:?} {lit_bright:?}"
+    );
+
+    // Unlit from the parent: its colour, every time
+    let colour = shoot(&mut world, &up, 0.0, 0.0, true);
+    set(&mut world, "group", &[("unlit", true.into())]);
+    let unlit = shoot(&mut world, &up, 0.0, 0.0, false);
+    assert!(close(unlit, colour), "{unlit:?} vs its colour {colour:?}");
+    for (vertices, ambient, sun_on, what) in [
+        (&up, 1.0, 0.0, "the ambient"),
+        (&up, 0.0, 1.0, "the sun"),
+        (&down, 1.0, 1.0, "facing away"),
+    ] {
+        let seen = shoot(&mut world, vertices, ambient, sun_on, false);
+        assert!(
+            close(unlit, seen),
+            "{what} changed it: {unlit:?} vs {seen:?}"
+        );
+    }
+
+    // Times emissive_scale, and the child's own false wins
+    let (twice, _) = square(20.0, [1.0, 0.5, 0.0, 1.0]);
+    let twice = shoot(&mut world, &twice, 0.0, 0.0, true);
+    set(&mut world, "card", &[("emissive_scale", 2.0.into())]);
+    let doubled = shoot(&mut world, &up, 0.0, 0.0, false);
+    assert!(
+        close(doubled, twice),
+        "{doubled:?} vs twice its colour {twice:?}"
+    );
+    set(&mut world, "card", &[("unlit", false.into())]);
+    let lit = shoot(&mut world, &up, 0.0, 0.0, false);
+    assert!(close(lit_dark, lit), "lit again: {lit:?}");
+}
+
+/// Several entities sharing one skinned GLB all draw it skinned (#624).
+/// The second used to be re-imported and expanded into glTF nodes, which
+/// took its model away: of five figures in a row, one drew.
+#[test]
+fn every_instance_of_a_skinned_model_stays_skinned() {
+    let gpu = gpu_or_skip!();
+    let mut renderer = gpu.renderer();
+    let mut world = FlintWorld::new();
+    let ids: Vec<_> = (0..3)
+        .map(|i| {
+            let id = world.spawn(format!("figure_{i}")).unwrap();
+            let mut model = toml::Table::new();
+            model.insert("asset".into(), "YBotWithIdle".into());
+            world.set_component(id, "model", model.into()).unwrap();
+            id
+        })
+        .collect();
+    let demo = concat!(env!("CARGO_MANIFEST_DIR"), "/../../demo/x.scene.toml");
+    let config = flint_render::model_loader::ModelLoadConfig::from_scene_path(demo);
+    let loaded = flint_render::model_loader::load_models_from_world(
+        &mut world,
+        &mut renderer,
+        &gpu.device,
+        &gpu.queue,
+        &config,
+    );
+    for id in ids {
+        assert!(
+            loaded.skinned_entities.contains_key(&id),
+            "{id:?} is skinned"
+        );
+        assert!(
+            world.get_component(id, "model").is_some(),
+            "{id:?} kept its model"
+        );
+    }
+    assert!(loaded.models.iter().all(|m| !m.was_expanded));
 }

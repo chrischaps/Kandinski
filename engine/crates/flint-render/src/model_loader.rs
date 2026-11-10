@@ -391,7 +391,13 @@ pub fn load_models_from_world(
             // if this is a multi-node model that needs per-entity expansion.
             // Not for a mesh made at runtime (procgen): a file of the same
             // name must not replace it (catalog > procgen > file, #32).
-            let file = if renderer.mesh_cache().is_procedural(asset_name) {
+            // Nor for a skinned model: the first entity to load it drew it
+            // skinned, and so does every other one (below). Expanding the
+            // second into nodes took its model away, so of five figures one
+            // drew, in its bind pose (#624).
+            let file = if renderer.mesh_cache().is_procedural(asset_name)
+                || renderer.mesh_cache().contains_skinned(asset_name)
+            {
                 None
             } else {
                 resolve_model_path(config, asset_name)
@@ -601,16 +607,12 @@ pub fn load_textures_from_world(
                     }
                 }
             }
-            // Load font textures referenced by ui_text components
+            // Fonts ui_text names: built into glyph atlases and uploaded
+            // here, so extraction only lays text out (ADR 0113)
             if let Some(ui_text) = comps.get(comp::UI_TEXT) {
-                if let Some(font_path_str) = ui_text.get("font").and_then(|v| v.as_str()) {
-                    if !font_path_str.is_empty() {
-                        let font_file = config.scene_dir.join(font_path_str);
-                        if let Some(font) = crate::bitmap_font::BitmapFont::load(&font_file) {
-                            if !font.texture.is_empty() {
-                                tex_names.push(font.texture);
-                            }
-                        }
+                if let Some(font) = ui_text.get("font").and_then(|v| v.as_str()) {
+                    if !font.is_empty() {
+                        renderer.load_ui_font(device, queue, font, &config.scene_dir);
                     }
                 }
             }

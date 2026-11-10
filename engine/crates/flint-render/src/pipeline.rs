@@ -143,11 +143,19 @@ pub struct MaterialUniforms {
     /// unchanged, so with `emissive_scale` a light part's surface and light
     /// are set apart. 0 is the mesh as uploaded.
     pub glow_surface: f32,
-    pub _pad_emissive: u32,
+    /// 1 when the material is glTF `doubleSided` (#623): a back face is lit
+    /// with its normal turned toward the viewer. The draw also goes through
+    /// a pipeline that culls nothing.
+    pub double_sided: u32,
     /// Multiplies every vertex colour, `rgb` only, as surface and as
     /// per-vertex light (ADR 0102: the entity's `material.vertex_tint_*`).
     /// White is the mesh as uploaded. Unused without `use_vertex_color`.
     pub vertex_tint: [f32; 4],
+    /// Unlit (#627: the entity's `material.unlit`). `x` is 1 when the
+    /// material skips lighting and draws its base colour (texture and
+    /// vertex colour included) times `y`, its `emissive_scale`, plus its
+    /// emission, straight to the HDR target; 0 is lit. `zw` unused.
+    pub unlit: [f32; 4],
 }
 
 impl MaterialUniforms {
@@ -171,8 +179,9 @@ impl MaterialUniforms {
             has_emissive_tex: 0,
             vertex_emission: 0,
             glow_surface: 0.0,
-            _pad_emissive: 0,
+            double_sided: 0,
             vertex_tint: [1.0; 4],
+            unlit: [0.0; 4],
         }
     }
 
@@ -196,18 +205,44 @@ impl MaterialUniforms {
             has_emissive_tex: 0,
             vertex_emission: 0,
             glow_surface: 0.0,
-            _pad_emissive: 0,
+            double_sided: 0,
             vertex_tint: [1.0; 4],
+            unlit: [0.0; 4],
         }
     }
 
     /// Sets the emission from an imported material.
     pub fn set_emission(&mut self, material: &flint_import::ImportedMaterial) {
-        let [r, g, b] = material.emissive;
-        let s = material.emissive_strength;
+        self.set_emission_overridden(material, None, None);
+    }
+
+    /// [`set_emission`](Self::set_emission) with the material's `emissive`
+    /// colour and `emissive_strength` replaced where given (#624: a
+    /// `material_overrides` entry recolouring an imported model's glow). The
+    /// strength reaches per-vertex light too, as the material's own does.
+    pub fn set_emission_overridden(
+        &mut self,
+        material: &flint_import::ImportedMaterial,
+        emissive: Option<[f32; 3]>,
+        strength: Option<f32>,
+    ) {
+        let [r, g, b] = emissive.unwrap_or(material.emissive);
+        let s = strength.unwrap_or(material.emissive_strength);
         let per_vertex = material.vertex_emission && material.use_vertex_color;
         self.emissive = [r * s, g * s, b * s, if per_vertex { s } else { 0.0 }];
         self.vertex_emission = per_vertex as u32;
+    }
+
+    /// Whether back faces are lit as the side the viewer sees, from an
+    /// imported material's glTF `doubleSided` (#623).
+    pub fn set_double_sided(&mut self, material: &flint_import::ImportedMaterial) {
+        self.double_sided = material.double_sided as u32;
+    }
+
+    /// Draw unlit (#627): base colour times `scale` plus emission, no
+    /// lights, ambient or shadows. `scale` below 0 counts as 0.
+    pub fn set_unlit(&mut self, scale: f32) {
+        self.unlit = [1.0, scale.max(0.0), 0.0, 0.0];
     }
 
     /// Multiplies all of the emission, the material's own and per-vertex,
@@ -401,6 +436,8 @@ impl LightUniforms {
 /// The main render pipeline
 pub struct RenderPipeline {
     pub pipeline: wgpu::RenderPipeline,
+    /// `pipeline` culling nothing, for glTF `doubleSided` materials (#623).
+    pub pipeline_double_sided: wgpu::RenderPipeline,
     pub line_pipeline: wgpu::RenderPipeline,
     pub overlay_line_pipeline: wgpu::RenderPipeline,
     pub skeleton_line_pipeline: wgpu::RenderPipeline,
@@ -595,8 +632,9 @@ impl RenderPipeline {
             push_constant_ranges: &[],
         });
 
-        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("PBR Render Pipeline"),
+        let make_opaque = |label: &str, cull_mode: Option<wgpu::Face>| {
+        device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some(label),
             layout: Some(&pipeline_layout),
             vertex: wgpu::VertexState {
                 module: &shader,
@@ -618,7 +656,7 @@ impl RenderPipeline {
                 topology: wgpu::PrimitiveTopology::TriangleList,
                 strip_index_format: None,
                 front_face: wgpu::FrontFace::Ccw,
-                cull_mode: Some(wgpu::Face::Back),
+                cull_mode,
                 polygon_mode: wgpu::PolygonMode::Fill,
                 unclipped_depth: false,
                 conservative: false,
@@ -636,7 +674,11 @@ impl RenderPipeline {
             },
             multiview: None,
             cache: None,
-        });
+        })
+        };
+        let pipeline = make_opaque("PBR Render Pipeline", Some(wgpu::Face::Back));
+        // glTF `doubleSided` (#623): thin cards seen from behind
+        let pipeline_double_sided = make_opaque("PBR Render Pipeline (double-sided)", None);
 
         // Line pipeline for wireframes and grid
         let line_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -821,10 +863,14 @@ impl RenderPipeline {
                 cache: None,
             })
         };
-        let transparent_alpha_back_pipeline =
-            make_transparent_alpha("Transparent Alpha Pipeline (back faces)", Some(wgpu::Face::Front));
-        let transparent_alpha_pipeline =
-            make_transparent_alpha("Transparent Alpha Pipeline (front faces)", Some(wgpu::Face::Back));
+        let transparent_alpha_back_pipeline = make_transparent_alpha(
+            "Transparent Alpha Pipeline (back faces)",
+            Some(wgpu::Face::Front),
+        );
+        let transparent_alpha_pipeline = make_transparent_alpha(
+            "Transparent Alpha Pipeline (front faces)",
+            Some(wgpu::Face::Back),
+        );
 
         // Transparent additive pipeline: src*SrcAlpha + dst*One
         let transparent_additive_pipeline =
@@ -918,6 +964,7 @@ impl RenderPipeline {
 
         Self {
             pipeline,
+            pipeline_double_sided,
             line_pipeline,
             overlay_line_pipeline,
             skeleton_line_pipeline,
