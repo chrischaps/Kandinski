@@ -1,0 +1,14 @@
+# Font aliases for scripts/hud.rhai. All three are SIL Open Font License
+# (OFL-*.txt beside them), from github.com/google/fonts.
+
+[[font]]
+name = "title"                      # the neon-tube wordmark
+file = "Monoton-Regular.ttf"
+
+[[font]]
+name = "hud"                        # labels and big numerals
+file = "Audiowide-Regular.ttf"
+
+[[font]]
+name = "mono"                       # small print
+file = "ShareTechMono-Regular.ttf"

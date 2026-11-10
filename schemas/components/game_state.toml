@@ -1,0 +1,40 @@
+[component.game_state]
+description = "Everything scripts/drive.rhai publishes each frame for the HUD and the audio scripts. One entity (`game`) carries it. Readers may be a frame stale: script order is not deterministic."
+
+[component.game_state.fields]
+# what the scene author sets
+autopilot = { type = "bool", default = false, description = "Drive itself from the first frame, skipping the title (captures and tests)" }
+start_stage = { type = "i32", default = 0, description = "Stage the run starts in, 0-4 (captures and tests)" }
+start_speed = { type = "f32", default = 0.0, description = "Speed in m/s at the first frame (captures)" }
+
+# what drive.rhai writes
+mode = { type = "string", default = "title", description = "title | countdown | drive | over | finish" }
+mode_time = { type = "f32", default = 0.0, description = "Seconds in the current mode" }
+speed = { type = "f32", default = 0.0, description = "m/s" }
+speed_kmh = { type = "f32", default = 0.0 }
+rpm = { type = "f32", default = 0.0, description = "0-1 within the current gear" }
+gear = { type = "i32", default = 1 }
+shifted = { type = "f32", default = 0.0, description = "total_time() of the last gear change" }
+throttle = { type = "f32", default = 0.0 }
+steer = { type = "f32", default = 0.0 }
+time_left = { type = "f32", default = 0.0 }
+score = { type = "f32", default = 0.0 }
+hi_score = { type = "f32", default = 0.0 }
+stage = { type = "i32", default = 0 }
+stage_name = { type = "string", default = "" }
+stage_progress = { type = "f32", default = 0.0, description = "0-1 through the current stage" }
+run_progress = { type = "f32", default = 0.0, description = "0-1 through the whole road" }
+offroad = { type = "f32", default = 0.0, description = "0-1, smoothed" }
+skid = { type = "f32", default = 0.0, description = "0-1, how hard the tyres are sliding" }
+crash = { type = "f32", default = 0.0, description = "Seconds left in a spin-out" }
+event = { type = "string", default = "", description = "The last thing that happened: checkpoint | stage | crash | bump | near_miss | go | count | finish | over | start" }
+event_time = { type = "f32", default = -100.0, description = "total_time() when `event` was set" }
+event_value = { type = "f32", default = 0.0, description = "Seconds added, bonus scored..." }
+countdown = { type = "i32", default = 0, description = "3, 2, 1 then 0 = go" }
+near_count = { type = "i32", default = 0, description = "Close overtakes this run" }
+accent_r = { type = "f32", default = 1.0, description = "The stage's edge-line colour, for the HUD" }
+accent_g = { type = "f32", default = 0.3 }
+accent_b = { type = "f32", default = 0.7 }
+second_r = { type = "f32", default = 0.2, description = "The stage's grid colour, for the HUD" }
+second_g = { type = "f32", default = 0.8 }
+second_b = { type = "f32", default = 1.0 }

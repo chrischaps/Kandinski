@@ -1,0 +1,116 @@
+version = 1
+game_id = "kandinski"
+
+# --- Steering: -1 left .. +1 right ---
+[actions.steer]
+kind = "axis1d"
+[[actions.steer.bindings]]
+type = "key"
+code = "KeyA"
+scale = -1.0
+[[actions.steer.bindings]]
+type = "key"
+code = "ArrowLeft"
+scale = -1.0
+[[actions.steer.bindings]]
+type = "key"
+code = "KeyD"
+[[actions.steer.bindings]]
+type = "key"
+code = "ArrowRight"
+[[actions.steer.bindings]]
+type = "gamepad_axis"
+axis = "LeftStickX"
+gamepad = "any"
+deadzone = 0.12
+scale = 1.0
+
+# --- Accelerate ---
+# Triggers are bound as both button and axis: Windows Xbox drivers report
+# them as buttons, other platforms as analog axes.
+[actions.accelerate]
+kind = "axis1d"
+[[actions.accelerate.bindings]]
+type = "key"
+code = "KeyW"
+[[actions.accelerate.bindings]]
+type = "key"
+code = "ArrowUp"
+[[actions.accelerate.bindings]]
+type = "gamepad_button"
+button = "South"
+gamepad = "any"
+[[actions.accelerate.bindings]]
+type = "gamepad_button"
+button = "RightTrigger2"
+gamepad = "any"
+[[actions.accelerate.bindings]]
+type = "gamepad_axis"
+axis = "RightZ"
+gamepad = "any"
+deadzone = 0.05
+scale = 1.0
+
+# --- Brake ---
+[actions.brake]
+kind = "axis1d"
+[[actions.brake.bindings]]
+type = "key"
+code = "KeyS"
+[[actions.brake.bindings]]
+type = "key"
+code = "ArrowDown"
+[[actions.brake.bindings]]
+type = "gamepad_button"
+button = "West"
+gamepad = "any"
+[[actions.brake.bindings]]
+type = "gamepad_button"
+button = "LeftTrigger2"
+gamepad = "any"
+[[actions.brake.bindings]]
+type = "gamepad_axis"
+axis = "LeftZ"
+gamepad = "any"
+deadzone = 0.05
+scale = 1.0
+
+# --- Start / confirm ---
+[actions.start]
+kind = "button"
+[[actions.start.bindings]]
+type = "key"
+code = "Enter"
+[[actions.start.bindings]]
+type = "key"
+code = "Space"
+[[actions.start.bindings]]
+type = "gamepad_button"
+button = "Start"
+gamepad = "any"
+[[actions.start.bindings]]
+type = "gamepad_button"
+button = "South"
+gamepad = "any"
+
+# --- Pause ---
+[actions.pause]
+kind = "button"
+[[actions.pause.bindings]]
+type = "key"
+code = "KeyP"
+[[actions.pause.bindings]]
+type = "gamepad_button"
+button = "Select"
+gamepad = "any"
+
+# --- Back to the title ---
+[actions.restart]
+kind = "button"
+[[actions.restart.bindings]]
+type = "key"
+code = "KeyR"
+[[actions.restart.bindings]]
+type = "gamepad_button"
+button = "North"
+gamepad = "any"

@@ -1,0 +1,37 @@
+# The glass in front of the picture: faint scanlines, colour fringes that
+# grow toward the corners, a vignette and a breath of grain. A display style,
+# run last, kept light enough that the game reads as a modern frame
+# remembering an old tube rather than imitating one.
+version = 1
+name = "crt"
+label = "CRT glass"
+stage = "display"
+shader = "crt.wgsl"
+
+[params.scanlines]
+default = 0.14
+min = 0.0
+max = 1.0
+help = "Depth of the dark line between scanlines"
+
+[params.pitch]
+default = 3.0
+min = 1.0
+max = 12.0
+help = "Scanline spacing in points"
+
+[params.aberration]
+default = 0.6
+min = 0.0
+max = 4.0
+help = "Red/blue fringe at the corners; the script adds to it with speed"
+
+[params.vignette]
+default = 0.38
+min = 0.0
+max = 1.0
+
+[params.grain]
+default = 0.035
+min = 0.0
+max = 0.3
