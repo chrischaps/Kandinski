@@ -660,6 +660,92 @@ fn register_entity_api(engine: &mut Engine, ctx: Arc<Mutex<ScriptCallContext>>) 
         });
     }
 
+    // get_scale(id: i64) -> Map #{x, y, z}   (#628; 1,1,1 when unset)
+    {
+        let ctx = ctx.clone();
+        engine.register_fn("get_scale", move |id: i64| -> Map {
+            let mut map = Map::new();
+            if id < 0 {
+                return map;
+            }
+            let c = crate::lock_or_recover(&ctx);
+            let world = unsafe { c.world_ref() };
+            if let Some(transform) = world.get_transform(EntityId::from_raw(id as u64)) {
+                map.insert("x".into(), Dynamic::from(transform.scale.x as f64));
+                map.insert("y".into(), Dynamic::from(transform.scale.y as f64));
+                map.insert("z".into(), Dynamic::from(transform.scale.z as f64));
+            }
+            map
+        });
+    }
+
+    // set_scale(id: i64, x: f64, y: f64, z: f64)   (#628)
+    {
+        let ctx = ctx.clone();
+        engine.register_fn("set_scale", move |id: i64, x: f64, y: f64, z: f64| {
+            if id < 0 {
+                return;
+            }
+            let c = crate::lock_or_recover(&ctx);
+            let world = unsafe { c.world_mut() };
+            let eid = EntityId::from_raw(id as u64);
+            if let Some(comps) = world.get_components_mut(eid) {
+                comps.set_field(
+                    comp::TRANSFORM,
+                    "scale",
+                    toml::Value::Array(vec![
+                        toml::Value::Float(x),
+                        toml::Value::Float(y),
+                        toml::Value::Float(z),
+                    ]),
+                );
+            }
+        });
+    }
+
+    // set_visible(id: i64, visible: bool)   (#628)
+    // Writes `visibility.visible`: false keeps the entity and its descendants
+    // out of every draw; it goes on simulating and running scripts.
+    {
+        let ctx = ctx.clone();
+        engine.register_fn("set_visible", move |id: i64, visible: bool| {
+            if id < 0 {
+                return;
+            }
+            let c = crate::lock_or_recover(&ctx);
+            let world = unsafe { c.world_mut() };
+            let eid = EntityId::from_raw(id as u64);
+            // Unchanged: no write, so a pool that re-asserts every frame
+            // doesn't touch the component, and showing an entity that was
+            // never hidden doesn't give it one
+            if world.is_visible(eid) == visible {
+                return;
+            }
+            // World-level set_field keeps the component index, which is
+            // how the renderer finds hidden entities without a scan
+            let _ = world.set_field(
+                eid,
+                comp::VISIBILITY,
+                "visible",
+                toml::Value::Boolean(visible),
+            );
+        });
+    }
+
+    // is_visible(id: i64) -> bool: the entity's own switch (true when unset;
+    // a hidden ancestor isn't counted)
+    {
+        let ctx = ctx.clone();
+        engine.register_fn("is_visible", move |id: i64| -> bool {
+            if id < 0 {
+                return false;
+            }
+            let c = crate::lock_or_recover(&ctx);
+            let world = unsafe { c.world_ref() };
+            world.is_visible(EntityId::from_raw(id as u64))
+        });
+    }
+
     // get_rotation_quat(id: i64) -> Map #{x, y, z, w}
     // The rotation the entity renders with: `rotation_quat` when present,
     // otherwise the Euler angles converted (ADR 0069).
@@ -703,6 +789,64 @@ fn register_entity_api(engine: &mut Engine, ctx: Arc<Mutex<ScriptCallContext>>) 
                 }
             },
         );
+    }
+
+    // set_shear(id: i64, shear: Map) — any of #{xy, xz, yx, yz, zx, zy}
+    // (#625): `ab` is how far `a` moves per unit of `b`, applied between
+    // rotation and scale. Missing terms are 0, and the map replaces the
+    // whole shear; an all-zero map removes it. `set_shear(id, #{xz: 0.2})`
+    // leans an entity's far end 0.2 m sideways per metre along z.
+    {
+        let ctx = ctx.clone();
+        engine.register_fn("set_shear", move |id: i64, shear: Map| {
+            if id < 0 {
+                return;
+            }
+            let terms = shear_terms(&shear);
+            let c = crate::lock_or_recover(&ctx);
+            let world = unsafe { c.world_mut() };
+            if let Some(comps) = world.get_components_mut(EntityId::from_raw(id as u64)) {
+                write_shear(comps, terms);
+            }
+        });
+    }
+
+    // get_shear(id: i64) -> Map #{xy, xz, yx, yz, zx, zy}, all six; zeros
+    // for an entity without a shear (or without a transform).
+    {
+        let ctx = ctx.clone();
+        engine.register_fn("get_shear", move |id: i64| -> Map {
+            let terms = if id < 0 {
+                [0.0; 6]
+            } else {
+                let c = crate::lock_or_recover(&ctx);
+                let world = unsafe { c.world_ref() };
+                world
+                    .get_transform(EntityId::from_raw(id as u64))
+                    .and_then(|t| t.shear)
+                    .unwrap_or([0.0; 6])
+            };
+            let mut map = Map::new();
+            for (key, v) in flint_core::Shear::KEYS.iter().zip(terms) {
+                map.insert((*key).into(), Dynamic::from(v as f64));
+            }
+            map
+        });
+    }
+
+    // clear_shear(id: i64) — the entity goes back to rotation and scale.
+    {
+        let ctx = ctx.clone();
+        engine.register_fn("clear_shear", move |id: i64| {
+            if id < 0 {
+                return;
+            }
+            let c = crate::lock_or_recover(&ctx);
+            let world = unsafe { c.world_mut() };
+            if let Some(comps) = world.get_components_mut(EntityId::from_raw(id as u64)) {
+                write_shear(comps, [0.0; 6]);
+            }
+        });
     }
 
     // rotate_local(id: i64, x_deg: f64, y_deg: f64, z_deg: f64)
@@ -934,15 +1078,105 @@ fn register_entity_api(engine: &mut Engine, ctx: Arc<Mutex<ScriptCallContext>>) 
                 let c = crate::lock_or_recover(&ctx);
                 let world = unsafe { c.world_mut() };
                 let eid = EntityId::from_raw(id as u64);
-                let value = toml::Value::Array(vec![
+                let colour = toml::Value::Array(vec![
                     toml::Value::Float(r),
                     toml::Value::Float(g),
                     toml::Value::Float(b),
                     toml::Value::Float(a),
                 ]);
+                // An entry that already holds a light (a table) keeps it.
+                let holds_light = world
+                    .get_components(eid)
+                    .and_then(|c| c.get(comp::MATERIAL_OVERRIDES))
+                    .and_then(|m| m.get(material))
+                    .is_some_and(|v| v.is_table());
+                let table = holds_light
+                    .then(|| material_override_table(world, eid, material))
+                    .flatten();
+                let value = match table {
+                    Some(mut t) => {
+                        t.insert("base_color".into(), colour);
+                        toml::Value::Table(t)
+                    }
+                    None => colour,
+                };
                 let _ = world.set_field(eid, comp::MATERIAL_OVERRIDES, material, value);
             },
         );
+    }
+
+    // set_material_emissive(entity_id, material, r, g, b[, strength]) (#624)
+    // Recolours one named glTF material's emission (linear RGB) on this
+    // entity and every descendant; `strength` replaces its
+    // emissive_strength. Writes `material_overrides.<material>` as a table,
+    // keeping a base colour set by set_material_override.
+    fn set_material_emissive(
+        ctx: &Arc<Mutex<ScriptCallContext>>,
+        id: i64,
+        material: &str,
+        rgb: [f64; 3],
+        strength: Option<f64>,
+    ) {
+        if id < 0 || material.is_empty() {
+            return;
+        }
+        let c = crate::lock_or_recover(ctx);
+        let world = unsafe { c.world_mut() };
+        let eid = EntityId::from_raw(id as u64);
+        let mut t = material_override_table(world, eid, material).unwrap_or_default();
+        t.insert(
+            "emissive".into(),
+            toml::Value::Array(rgb.iter().map(|&v| toml::Value::Float(v)).collect()),
+        );
+        if let Some(s) = strength {
+            t.insert("emissive_strength".into(), toml::Value::Float(s));
+        }
+        let _ = world.set_field(
+            eid,
+            comp::MATERIAL_OVERRIDES,
+            material,
+            toml::Value::Table(t),
+        );
+    }
+    {
+        let ctx = ctx.clone();
+        engine.register_fn(
+            "set_material_emissive",
+            move |id: i64, material: &str, r: f64, g: f64, b: f64| {
+                set_material_emissive(&ctx, id, material, [r, g, b], None);
+            },
+        );
+    }
+    {
+        let ctx = ctx.clone();
+        engine.register_fn(
+            "set_material_emissive",
+            move |id: i64, material: &str, r: f64, g: f64, b: f64, strength: f64| {
+                set_material_emissive(&ctx, id, material, [r, g, b], Some(strength));
+            },
+        );
+    }
+
+    // clear_material_override(entity_id, material) (#624)
+    // Drops the entity's own override of one material, base colour and
+    // light alike, so the material (or an ancestor's override) shows again.
+    {
+        let ctx = ctx.clone();
+        engine.register_fn("clear_material_override", move |id: i64, material: &str| {
+            if id < 0 {
+                return;
+            }
+            let c = crate::lock_or_recover(&ctx);
+            let world = unsafe { c.world_mut() };
+            let eid = EntityId::from_raw(id as u64);
+            if let Some(t) = world
+                .get_components_mut(eid)
+                .and_then(|comps| comps.get_mut(comp::MATERIAL_OVERRIDES))
+                .and_then(|v| v.as_table_mut())
+            {
+                t.remove(material);
+            }
+        });
     }
 
     // find_entities_with(component: &str) -> Array of entity IDs
@@ -971,6 +1205,29 @@ fn register_entity_api(engine: &mut Engine, ctx: Arc<Mutex<ScriptCallContext>>) 
 }
 
 // ─── Spline API ──────────────────────────────────────────
+
+/// The entity's own `material_overrides.<material>` as a table (#624): a
+/// table as is, a plain base colour array as `{ base_color = [...] }`,
+/// `None` when it has none.
+fn material_override_table(
+    world: &flint_ecs::FlintWorld,
+    id: EntityId,
+    material: &str,
+) -> Option<toml::Table> {
+    match world
+        .get_components(id)?
+        .get(comp::MATERIAL_OVERRIDES)?
+        .get(material)?
+    {
+        toml::Value::Table(t) => Some(t.clone()),
+        colour @ toml::Value::Array(_) => {
+            let mut t = toml::Table::new();
+            t.insert("base_color".into(), colour.clone());
+            Some(t)
+        }
+        _ => None,
+    }
+}
 
 fn register_spline_api(engine: &mut Engine, ctx: Arc<Mutex<ScriptCallContext>>) {
     // spline_closest_point(spline_entity, x, y, z) -> Map #{t, x, y, z, dist_sq}
@@ -1887,6 +2144,46 @@ fn edit_anim_layer(
 }
 
 // ─── Physics / Raycast API ───────────────────────────────
+
+/// A script's shear map as the six terms, in `Shear::KEYS` order. Integers
+/// count (`#{xz: 1}`); an unknown key or a non-number warns and is skipped.
+fn shear_terms(shear: &Map) -> [f32; 6] {
+    let mut terms = [0.0f32; 6];
+    for (key, value) in shear.iter() {
+        let Some(i) = flint_core::Shear::KEYS
+            .iter()
+            .position(|k| *k == key.as_str())
+        else {
+            tracing::warn!(
+                "set_shear: unknown term '{}' (expected xy, xz, yx, yz, zx, zy)",
+                key
+            );
+            continue;
+        };
+        let v = value
+            .as_float()
+            .ok()
+            .or_else(|| value.as_int().ok().map(|n| n as f64));
+        match v {
+            Some(v) => terms[i] = v as f32,
+            None => tracing::warn!("set_shear: '{}' is not a number", key),
+        }
+    }
+    terms
+}
+
+/// Store a shear (#625) as the table a scene would write, only the terms
+/// that aren't zero; an all-zero shear removes the key.
+fn write_shear(comps: &mut flint_ecs::DynamicComponents, terms: [f32; 6]) {
+    if terms.iter().any(|v| *v != 0.0) {
+        comps.set_field(comp::TRANSFORM, "shear", flint_core::Shear::to_toml(&terms));
+    } else if let Some(table) = comps
+        .get_mut(comp::TRANSFORM)
+        .and_then(|t| t.as_table_mut())
+    {
+        table.remove("shear");
+    }
+}
 
 /// Store a quaternion as the entity's rotation. The Euler `rotation` is
 /// zeroed so readers that only know Euler see a neutral value rather than a
@@ -2901,6 +3198,7 @@ fn register_ui_api(engine: &mut Engine, ctx: Arc<Mutex<ScriptCallContext>>) {
                     font: None,
                     letter_spacing: 0.0,
                     shadow: None,
+                    glow: None,
                 });
             },
         );
@@ -2933,6 +3231,7 @@ fn register_ui_api(engine: &mut Engine, ctx: Arc<Mutex<ScriptCallContext>>) {
                     font: None,
                     letter_spacing: 0.0,
                     shadow: None,
+                    glow: None,
                 });
             },
         );
@@ -2969,6 +3268,7 @@ fn register_ui_api(engine: &mut Engine, ctx: Arc<Mutex<ScriptCallContext>>) {
                     font: None,
                     letter_spacing: 0.0,
                     shadow: None,
+                    glow: None,
                 });
             },
         );
@@ -3006,6 +3306,7 @@ fn register_ui_api(engine: &mut Engine, ctx: Arc<Mutex<ScriptCallContext>>) {
                     font: None,
                     letter_spacing: 0.0,
                     shadow: None,
+                    glow: None,
                 });
             },
         );
@@ -3013,7 +3314,8 @@ fn register_ui_api(engine: &mut Engine, ctx: Arc<Mutex<ScriptCallContext>>) {
 
     // draw_text_opts(x, y, text, size, opts) — opts is a map with optional keys:
     //   font (string), color ([r,g,b,a]), align ("left"|"center"|"right"),
-    //   stroke ([r,g,b,a,width]), spacing (px), layer (int), shadow ([dx,dy,r,g,b,a])
+    //   stroke ([r,g,b,a,width]), spacing (px), layer (int), shadow ([dx,dy,r,g,b,a]),
+    //   glow ([r,g,b,a,radius]: a soft halo under the stroke, #626)
     {
         let ctx = ctx.clone();
         engine.register_fn(
@@ -3033,6 +3335,7 @@ fn register_ui_api(engine: &mut Engine, ctx: Arc<Mutex<ScriptCallContext>>) {
                     font: o.font,
                     letter_spacing: o.spacing,
                     shadow: o.shadow,
+                    glow: o.glow,
                 });
             },
         );
@@ -3421,7 +3724,7 @@ fn register_ui_api(engine: &mut Engine, ctx: Arc<Mutex<ScriptCallContext>>) {
     // draw_world_text(x, y, z, text, size, opts)
     // Text at a world point, drawn in the 3D frame with a depth test
     // (ADR 0104): geometry in front hides it. opts are draw_text_opts's
-    // (font, color, align, stroke, spacing, shadow; no layer), centred on
+    // (font, color, align, stroke, spacing, shadow, glow; no layer), centred on
     // the point by default, plus valign ("top"|"middle"|"bottom"), and
     // facing ([nx, ny, nz]) with up ([x, y, z], world up by default) to lay
     // it in a plane. A billboard's size is in points; on a plane, every
@@ -5716,6 +6019,8 @@ pub(crate) struct TextOpts {
     pub font: Option<String>,
     pub spacing: f32,
     pub shadow: Option<([f32; 4], f32, f32)>,
+    /// A blurred halo under the stroke: colour and reach in points (#626).
+    pub glow: Option<([f32; 4], f32)>,
 }
 
 impl Default for TextOpts {
@@ -5728,6 +6033,7 @@ impl Default for TextOpts {
             font: None,
             spacing: 0.0,
             shadow: None,
+            glow: None,
         }
     }
 }
@@ -5781,6 +6087,13 @@ impl TextOpts {
             if let Some(arr) = v.clone().try_cast::<Array>() {
                 if let [dx, dy, r, g, b, a] = array_to_f32s(&arr)[..] {
                     o.shadow = Some(([r, g, b, a], dx, dy));
+                }
+            }
+        }
+        if let Some(v) = opts.get("glow") {
+            if let Some(arr) = v.clone().try_cast::<Array>() {
+                if let [r, g, b, a, radius] = array_to_f32s(&arr)[..] {
+                    o.glow = Some(([r, g, b, a], radius));
                 }
             }
         }
@@ -5838,6 +6151,7 @@ pub(crate) fn world_text_from(
         font: o.font,
         spacing: o.spacing,
         shadow: o.shadow,
+        glow: o.glow,
         plane,
     }
 }
@@ -5912,7 +6226,19 @@ mod text_opts_tests {
                 Dynamic::from(0.6_f64),
             ]),
         );
+        m.insert(
+            "glow".into(),
+            arr(&[
+                Dynamic::from(1_i64),
+                Dynamic::from(0.2_f64),
+                Dynamic::from(0.6_f64),
+                Dynamic::from(0.9_f64),
+                Dynamic::from(18_i64),
+            ]),
+        );
         let o = TextOpts::from_map(&m);
+        assert_eq!(o.glow, Some(([1.0, 0.2, 0.6, 0.9], 18.0)));
+        assert_eq!(world_text_from([0.0; 3], "x", 1.0, &m).glow, o.glow);
         assert_eq!(o.font.as_deref(), Some("display"));
         assert_eq!(o.color, [1.0, 0.5, 0.0, 1.0]);
         assert_eq!(o.align, 1);
@@ -5929,7 +6255,9 @@ mod text_opts_tests {
         m.insert("color".into(), arr(&[Dynamic::from(1.0_f64)]));
         m.insert("align".into(), Dynamic::from("right"));
         m.insert("stroke".into(), Dynamic::from("nope"));
+        m.insert("glow".into(), arr(&vec![Dynamic::from(1.0_f64); 4]));
         let o = TextOpts::from_map(&m);
+        assert_eq!(o.glow, None, "a glow needs five numbers");
         assert_eq!(o.font, None);
         assert_eq!(o.color, [1.0, 1.0, 1.0, 1.0]);
         assert_eq!(o.align, 2);

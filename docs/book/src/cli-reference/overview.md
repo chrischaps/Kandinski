@@ -59,7 +59,7 @@ flint play scenes/body.scene.toml --width 480 --height 480 --position 1400,560  
 | `--fullscreen` | Launch in fullscreen mode |
 | `--width <px>` / `--height <px>` | Initial window size in physical pixels (default `1280`x`720`; ignored with `--fullscreen`). A narrow or square window keeps the camera's aspect: it shows less to the sides, never a stretched scene |
 | `--position <x,y>` | Put the window's outer top-left corner here, in physical desktop pixels. Negative values reach a monitor left of or above the main one; write them with `=` (`--position=-1920,0`). Default: wherever the system puts it |
-| `--borderless` | No title bar or frame. Esc still exits and Alt+F4 still closes it |
+| `--borderless` | No title bar or frame. Esc still exits (unless the game binds it) and Alt+F4 still closes it |
 | `--always-on-top` | Keep the window above other windows |
 | `--no-activate` | Open without taking the keyboard from the window that has it, for a companion window beside a terminal. Clicking the window still focuses it. Not with `--fullscreen`, whose path takes the foreground on Windows |
 | `--input-config <path>` | Input config overlay path (highest priority, overrides all other layers) |
@@ -98,6 +98,15 @@ and ignores the real keyboard, mouse and pads, so a stray scroll over its
 window can't change the shot. Only the input script drives it (see
 [input gates](../concepts/input-gates.md#during-a-capture)).
 
+A run that asks for a screenshot either writes it or fails (#639). A read-back
+or save that fails is warned about and tried again on the next frames (up to
+30), and `--exit-after` waits for those retries. If the file still isn't on
+disk when the run ends, the player prints `Error: --screenshot <path> was
+never written: <why>` and exits with status 1. The reason can be the failure,
+or that the run ended before `--screenshot-at`. With `--screenshot-every`, a
+lost frame fails the run the same way. A player that fails to start (no GPU
+adapter, no window) also exits 1 now, from `flint play` too.
+
 | Flag | Description |
 |------|-------------|
 | `--screenshot <path>` | Write a PNG of the presented frame (scene + HUD). Parent directories are created |
@@ -110,6 +119,7 @@ window can't change the shot. Only the input script drives it (see
 | `--input-script <file>` | Play timed keys, typed text, axes, gamepad buttons, the wheel and the mouse, one event per line (below). Scripted keys reach egui and the debug keys too, so `2.0 tap F2` opens the stats overlay |
 | `--stats` | Open the F2 rendering stats overlay from the first frame. F2 still closes it |
 | `--perf` | Print a perf line every 10 s: frame p50/p99/max, each phase's CPU time (mean/max), each pass's GPU time where the adapter can time, draws and triangles. The same line the web page's `?perf=1` copies, so a desktop and a browser can be set side by side |
+| `--no-hot-reload` | Don't watch the game's files: scripts, UI documents, user styles, glyph sets and palettes load once and never reload, and nothing polls the disk (#633). Also on `flint play` |
 
 An input script plays its events at set game times. `#` starts a comment:
 
@@ -197,7 +207,7 @@ These are the built-in defaults. Games can override any binding via input config
 | E | Interact with nearby object |
 | R | Reload |
 | 1 / 2 | Select weapon slot |
-| Escape | Release cursor / Exit |
+| Escape | Release cursor / Exit (the game's own key when its input config binds it, see [Escape](../concepts/physics-and-runtime.md#escape)) |
 | F2 | Toggle the render stats overlay (FPS, frame time, draw stats) |
 | F3 | Toggle the scene debug panels (see below); leaves the Rendering & Effects panel alone |
 | F4 | Toggle the **Rendering & Effects** menu: every render and post-processing control, including debug shading mode, shadows, and the lighting levers |
@@ -313,9 +323,11 @@ flint render scene.toml -o shot.png --distance 20 --pitch 30 --yaw 45 --target 0
 | `--orbit <deg/s>` / `--camera-path <file>` | (still) | With `--frames`: orbit the camera about its target, or follow a TOML of `[[key]] time/position/target` keys |
 | `--flip-stats` / `--flip-json <file>` | (off) | With `--frames`: count the ASCII style's glyph flips and A-B-A reversals from its own grid, printed per frame and in sum, or written as JSON |
 | `--no-images` | `false` | With `--frames`: write no PNGs |
+| `--mesh <entity>=<files>` | (none) | A frame per mesh file (one GLB, a folder, or `out/f*.glb`, natural order) shown on that entity, all on one renderer; repeatable, frame for frame. `-o` numbered PNGs, `%03d`, a `.gif` at `--fps`, or `--sheet` ([Mesh sequences](../guides/headless-rendering.md#mesh-sequences), #222) |
+| `--sheet` | `false` | With `--mesh`: one labelled contact sheet, a cell a file |
 | `--ascii` | (off) | The full-screen ASCII style (#265, [Stylize Passes](../concepts/stylize-passes.md#ascii)): one glyph per cell on one screen grid. Any `--ascii-*` flag below marked *style* also turns it on |
 | `--ascii-font <name>` | `builtin` | *Style:* glyph set, `builtin` or `fonts/<name>.glyphs.toml` beside the scene ([Glyph Atlas](../concepts/glyph-atlas.md)) |
-| `--ascii-ramp <name>` | the set's | *Style:* ramp of that set (built-in: `classic`, `blocks`, `minimal`, `detailed`) |
+| `--ascii-ramp <name>` | the set's | *Style:* ramp of that set (built-in: `classic`, `blocks`, `minimal`, `detailed`, `quadrants`, `braille`) |
 | `--ascii-color <mode>` | `source` | *Style:* `source` (the cell's hue), `tint` (one colour), `raw` (the cell's colour as it is), `mono` (white on grey) or `palette` ([colour modes](../concepts/stylize-passes.md#colour-modes)) |
 | `--ascii-palette <name>` | `phosphor` | *Style:* palette for `palette` mode: `cga`, `cga-warm`, `cga16`, `phosphor`, `amber`, `mono` or `palettes/<name>.palette.toml` beside the scene; sets `--ascii-color palette` unless that's given |
 | `--ascii-ground <mode>` | `dim` | *Style:* behind the glyph: `dim` (the mode's own), `black` or `inverse` (ink fills the cell, the glyph is cut out) |
@@ -595,6 +607,8 @@ flint gen specs/oak_tree.procgen.toml --dry-run
 flint gen specs/oak_tree.procgen.toml --seed 42 -o tree.glb
 flint gen specs/oak_tree.procgen.toml --batch 10 --seed-start 0
 ```
+
+`flint gen` also previews a glyph set: `flint gen fonts/terminal.glyphs.toml -o sheet.png` writes the atlas, each ramp's ink and a specimen as one sheet, and `-o out/` writes the pieces as well. See [Glyph Atlas](../concepts/glyph-atlas.md#looking-at-a-set).
 
 | Flag | Default | Description |
 |------|---------|-------------|

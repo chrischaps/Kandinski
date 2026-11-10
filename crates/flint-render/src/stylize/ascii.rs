@@ -17,6 +17,7 @@
 //! edge_max = 3.0        # more than this is texture (grass), not a line
 //! edge_depth = 0.6      # relative view-distance step that is an edge
 //! edge_normal = 2.5     # normal change (Sobel) that is a crease
+//! edge_corner = 0.9     # #348: coherence under which a cell can draw ┌ ├ ┼ (0: no corners, #637's line ends and gaps too)
 //! edge_ink = "cell"     # cell | color | hue: the line glyphs' ink (#351)
 //! edge_color = [0.85, 0.82, 0.74]  # for edge_ink = "color"; or "#d9d1bd"
 //! edge_tint = 0.0       # for edge_ink = "color": toward the near side's hue
@@ -140,7 +141,10 @@ use super::{
     choices_with, ChoiceScope, MaskUse, StyleDescriptor, StyleDevice, StyleFrame, StyleHint,
     StyleInput, StyleOption, StyleParam, StylePass, StyleStage, StyleTexture,
 };
-use crate::glyph_atlas::{GlyphSet, GlyphSetCache, GpuGlyphStack, BUILTIN_SET, GLYPHS_SUFFIX};
+use crate::glyph_atlas::{
+    calibrated_bounds, GlyphRamp, GlyphSet, GlyphSetCache, GpuGlyphStack, RampMap, BUILTIN_SET,
+    GLYPHS_SUFFIX,
+};
 use crate::palette::{Palette, PaletteCache, BUILTIN_PALETTES, MAX_COLORS, PALETTE_SUFFIX};
 use bytemuck::{Pod, Zeroable};
 use std::path::{Path, PathBuf};
@@ -169,7 +173,14 @@ pub const GROUND_MODES: &[&str] = &["dim", "black", "inverse"];
 pub const DEFAULT_PALETTE: &str = "phosphor";
 
 /// The built-in glyph set's ramps, in the order the menu offers them.
-pub const RAMPS: &[&str] = &["classic", "blocks", "minimal", "detailed"];
+pub const RAMPS: &[&str] = &[
+    "classic",
+    "blocks",
+    "minimal",
+    "detailed",
+    "quadrants",
+    "braille",
+];
 
 /// The fonts to offer (#322): the built-in set, then every
 /// `fonts/*.glyphs.toml` beside the scene or in its parent.
@@ -223,6 +234,10 @@ const PARAMS: &[StyleParam] = &[
     StyleParam::new("edge_max", 3.0, 0.5..=8.0),
     StyleParam::new("edge_depth", 0.6, 0.05..=4.0),
     StyleParam::new("edge_normal", 2.5, 0.2..=8.0),
+    // Corners (#348): a cell whose edge pixels run in no one direction
+    // (the structure tensor's coherence under this) draws the corner or tee
+    // its neighbours' line glyphs meet in, where its font has one
+    StyleParam::new("edge_corner", 0.9, 0.0..=1.0),
     // The edge ink (#351): `edge_ink = "color"` inks line glyphs in
     // this colour (the ASCII spike's warm off-white), mixed toward the
     // near side's hue by `edge_tint`
@@ -348,6 +363,11 @@ const HINTS: &[StyleHint] = &[
         "edge_normal",
         "Edge crease",
         "The normal change that counts as a crease; lower finds more",
+    ),
+    StyleHint::new(
+        "edge_corner",
+        "Edge corners",
+        "Where a cell's edge turns (its direction this uncertain or less, 0..1), it draws the corner or tee its neighbours' lines meet in: ┌ ├ ┼; so do a line ending beside a perpendicular one and a gap between two (#637); 0 = every corner off",
     ),
     StyleHint::new(
         "edge_ink",
@@ -782,10 +802,11 @@ struct AsciiUniforms {
     /// For edge ink color: how far the colour mixes toward the near
     /// side's hue (#351).
     edge_tint: f32,
-    _pad_palette: u32,
-    /// The four edge glyphs' atlas origins, in `EdgeGlyphs::all()` order,
-    /// two a vec4.
-    edge_glyphs: [[u32; 4]; 2],
+    /// How many corner glyphs the whole frame's font has: 0, 4 or 9 (#348).
+    corners: u32,
+    /// The edge glyphs' atlas origins, in `EdgeGlyphs::slots()` order (the
+    /// four lines, then the corners, #348), two a vec4.
+    edge_glyphs: [[u32; 4]; EDGE_SLOTS.div_ceil(2)],
     /// Every variant's ramp, one after another (the whole frame's first):
     /// each step's atlas cell origin, two steps a vec4.
     ramp: [[u32; 4]; MAX_RAMP / 2],
@@ -818,6 +839,9 @@ struct AsciiUniforms {
     dissolve_meta: [u32; 4],
     /// Each one's (slot, first row, rows, columns).
     dissolve: [[u32; 4]; MAX_DISSOLVE],
+    /// Beside `ramp`, each step's least tone for a calibrated ramp (#281),
+    /// four a vec4; [`EQUAL_BANDS`] at a ramp's first step for equal bands.
+    ramp_tone: [[f32; 4]; MAX_RAMP / 4],
 }
 
 /// One per-entity variant's settings (#266), a row of the variant table's
@@ -861,7 +885,7 @@ struct VariantUniform {
     chroma: f32,
     /// The variant's font's glyph cell in atlas pixels (#335).
     glyph: [f32; 2],
-    /// Where the variant's four edge glyphs sit in the ramp table, or
+    /// Where the variant's edge glyphs sit in the ramp table, or
     /// [`NO_EDGE_START`] for the whole frame's (a variant in its font).
     edge_start: u32,
     /// With [`SNAP`], the least share of a cell's 16 samples the variant
@@ -870,12 +894,20 @@ struct VariantUniform {
     /// The first row + 1 of the variant's band in the dissolve rank state
     /// (#398); 0 when it has none and its cells take their order as it is.
     dissolve_row: u32,
-    _pad_dissolve: [u32; 3],
+    /// How many corner glyphs the variant's own font has (#348); read only
+    /// with an `edge_start` of its own.
+    corners: u32,
+    _pad_dissolve: [u32; 2],
 }
 
 /// A variant whose edge glyphs are the uniform's own; `NO_EDGE_START` in
 /// ascii_common.wgsl.
 const NO_EDGE_START: u32 = u32::MAX;
+
+/// The most glyphs an edge cell can draw (#348): four lines, four corners,
+/// four tees and the cross, numbered so in the shaders
+/// (`ascii_edge_thin.wgsl`).
+const EDGE_SLOTS: usize = 13;
 
 /// The edge pass's uniforms (#267), `ascii_edges.wgsl`.
 #[repr(C)]
@@ -906,7 +938,8 @@ struct EdgeCellUniforms {
     /// Whether the picture arrives linear, to be read as display values
     /// for the near side's hue (#351).
     srgb: u32,
-    _pad: f32,
+    /// The coherence under which a cell is marked as a corner (#348; 0 off).
+    corner: f32,
 }
 
 /// The edge debug view's uniforms (#349), `ascii_edge_view.wgsl`.
@@ -922,7 +955,10 @@ struct EdgeViewUniforms {
     srgb: f32,
     dim: f32,
     thick: f32,
-    _pad: [f32; 3],
+    /// How many corner glyphs the frame's font has (#348): the view draws
+    /// the corners the glyphs do.
+    corners: u32,
+    _pad: [f32; 2],
 }
 
 /// The edge debug view's colours (#349), as `ascii_edge_view.wgsl` paints
@@ -934,6 +970,7 @@ pub const EDGE_VIEW_LEGEND: &[([f32; 3], &str)] = &[
     ([1.0, 0.35, 0.85], "styled outline"),
     ([0.4, 1.0, 0.45], "cell draws a line glyph"),
     ([0.25, 0.55, 0.3], "cell yields its line (dashed)"),
+    ([1.0, 0.9, 0.3], "cell draws a corner or tee (#348)"),
     ([1.0, 0.25, 0.2], "past edge_max: texture"),
     ([0.55, 0.55, 0.55], "under edge_threshold"),
 ];
@@ -1589,15 +1626,45 @@ pub fn ground_mode(name: &str) -> u32 {
     GROUND_MODES.iter().position(|m| *m == name).unwrap_or(0) as u32
 }
 
-/// Up to [`MAX_RAMP`] steps of `indices`, evenly resampled when longer.
-fn fit_ramp(indices: &[u32]) -> Vec<u32> {
-    if indices.len() <= MAX_RAMP {
-        return indices.to_vec();
-    }
-    (0..MAX_RAMP)
-        .map(|i| indices[i * (indices.len() - 1) / (MAX_RAMP - 1)])
+/// Up to [`MAX_RAMP`] steps of `ramp`, evenly resampled when longer: each
+/// step's atlas index and its `ramp_tone` entry (#281), the least tone it
+/// draws at for a calibrated ramp, [`EQUAL_BANDS`] on every step of an
+/// equal-band one.
+fn fit_ramp(ramp: &GlyphRamp) -> Vec<(u32, f32)> {
+    let indices = ramp.atlas_indices();
+    let picked = fit_positions(indices.len());
+    let tones = match ramp.map() {
+        RampMap::Index => vec![EQUAL_BANDS; picked.len()],
+        // The steps kept, banded among themselves
+        RampMap::Coverage => calibrated_bounds(
+            &picked
+                .iter()
+                .map(|i| ramp.coverage()[*i])
+                .collect::<Vec<_>>(),
+        ),
+    };
+    picked
+        .iter()
+        .zip(tones)
+        .map(|(i, t)| (indices[*i], t))
         .collect()
 }
+
+/// The steps of a `len`-step ramp kept in [`MAX_RAMP`]: all of them, or an
+/// even resampling end to end.
+fn fit_positions(len: usize) -> Vec<usize> {
+    if len <= MAX_RAMP {
+        (0..len).collect()
+    } else {
+        (0..MAX_RAMP)
+            .map(|i| i * (len - 1) / (MAX_RAMP - 1))
+            .collect()
+    }
+}
+
+/// A `ramp_tone` entry saying the ramp it starts takes equal bands, as
+/// every ramp did before #281; `EQUAL_BANDS` in ascii_common.wgsl.
+const EQUAL_BANDS: f32 = -1.0;
 
 /// The sets in use and their atlases stacked on the GPU (#335).
 struct LoadedStack {
@@ -1867,8 +1934,19 @@ fn variant_uniform(
         edge_start: NO_EDGE_START,
         cell_share: param("cell_share").clamp(1.0 / 16.0, 1.0),
         dissolve_row: 0,
-        _pad_dissolve: [0; 3],
+        corners: 0,
+        _pad_dissolve: [0; 2],
     }
+}
+
+/// How many corner glyphs the edge cells may draw in `set`'s font (#348):
+/// its own count, or none with `edge_corner = 0`, which turns every corner
+/// off, the coherence test's and the line ends' and gaps' too (#637).
+fn corner_glyphs(frame: &StyleFrame<'_>, set: &GlyphSet) -> u32 {
+    if frame.param("edge_corner") <= 0.0 {
+        return 0;
+    }
+    set.edges().corner_count() as u32
 }
 
 /// The silhouette outline (#288), `points` wide, in output pixels: at
@@ -1942,10 +2020,12 @@ pub fn anchored_origin(anchor: [f32; 2], cell: [f32; 2]) -> [f32; 2] {
 
 /// The ramps in use, packed one after another into the uniform: each step
 /// a (font, atlas index) pair, the font an index into the frame's
-/// [`FontsInUse`] (#335), made an origin in the glyph stack at upload.
+/// [`FontsInUse`] (#335), made an origin in the glyph stack at upload, and
+/// beside it the step's `ramp_tone` entry (#281).
 #[derive(Default)]
 struct Ramps {
     steps: Vec<(u32, u32)>,
+    tones: Vec<f32>,
     placed: Vec<((u32, String), (u32, u32))>,
 }
 
@@ -1958,8 +2038,7 @@ impl Ramps {
     /// use; `None` when it doesn't fit in what's left.
     fn place(&mut self, font: u32, set: &GlyphSet, name: &str) -> Option<(u32, u32)> {
         let ramp = set.ramp(name).unwrap_or_else(|| set.default_ramp());
-        let fit = fit_ramp(ramp.atlas_indices());
-        self.pack(font, name, fit)
+        self.pack(font, name, fit_ramp(ramp))
     }
 
     /// Ramp `name` of font `font` and the font's edge glyphs (#335), both
@@ -1971,13 +2050,13 @@ impl Ramps {
         name: &str,
     ) -> Option<((u32, u32), u32)> {
         let ramp = set.ramp(name).unwrap_or_else(|| set.default_ramp());
-        let fit = fit_ramp(ramp.atlas_indices());
+        let fit = fit_ramp(ramp);
         let atlas = set.atlas();
-        let edges: Vec<u32> = set
+        let edges: Vec<(u32, f32)> = set
             .edges()
-            .all()
+            .slots()
             .iter()
-            .map(|c| atlas.index_of(*c).unwrap_or(0))
+            .map(|c| (atlas.index_of(*c).unwrap_or(0), EQUAL_BANDS))
             .collect();
         let need = |key: &str, len: usize| {
             if self.find(font, key).is_some() {
@@ -2001,15 +2080,18 @@ impl Ramps {
             .map(|(_, at)| *at)
     }
 
-    fn pack(&mut self, font: u32, name: &str, indices: Vec<u32>) -> Option<(u32, u32)> {
+    fn pack(&mut self, font: u32, name: &str, steps: Vec<(u32, f32)>) -> Option<(u32, u32)> {
         if let Some(at) = self.find(font, name) {
             return Some(at);
         }
-        if self.steps.len() + indices.len() > MAX_RAMP {
+        if self.steps.len() + steps.len() > MAX_RAMP {
             return None;
         }
-        let at = (self.steps.len() as u32, indices.len() as u32);
-        self.steps.extend(indices.into_iter().map(|i| (font, i)));
+        let at = (self.steps.len() as u32, steps.len() as u32);
+        // A test may pad `steps` alone; the tones line up from here
+        self.tones.resize(self.steps.len(), EQUAL_BANDS);
+        self.tones.extend(steps.iter().map(|(_, t)| *t));
+        self.steps.extend(steps.into_iter().map(|(i, _)| (font, i)));
         self.placed.push(((font, name.to_string()), at));
         Some(at)
     }
@@ -2348,6 +2430,8 @@ impl Ascii {
             row.tint = frame.variant_color(v, "tint");
             row.glyph = [glyph[0] as f32, glyph[1] as f32];
             row.edge_start = edge_start;
+            // Its own font's corners (#348); one in the frame's font reads the frame's
+            row.corners = corner_glyphs(frame, &set);
             // The row holds the outline in points; the shader wants pixels
             row.outline = outline_pixels(row.outline, frame.pixels_per_point);
             rows.push(row);
@@ -2434,7 +2518,7 @@ impl Ascii {
             max_len: frame.param("edge_max"),
             edge_size: [edges.size[0] as f32, edges.size[1] as f32],
             srgb: frame.srgb() as u32,
-            _pad: 0.0,
+            corner: frame.param("edge_corner").clamp(0.0, 1.0),
         };
         frame.queue.write_buffer(
             &self.edge_cell_uniforms,
@@ -2472,6 +2556,7 @@ impl Ascii {
         edge_cells: &Owned,
         cell: [f32; 2],
         origin: [f32; 2],
+        corners: u32,
     ) {
         let edges_slot = self.edges.lock().unwrap_or_else(|e| e.into_inner());
         let Some(edges) = edges_slot.as_ref() else {
@@ -2487,7 +2572,8 @@ impl Ascii {
             srgb: if frame.srgb() { 1.0 } else { 0.0 },
             dim: 0.3,
             thick: frame.pixels_per_point.max(1.0).round(),
-            _pad: [0.0; 3],
+            corners,
+            _pad: [0.0; 2],
         };
         frame
             .queue
@@ -2701,7 +2787,7 @@ impl StylePass for Ascii {
         };
         let atlas = set.atlas();
         let glyph = atlas.cell_size();
-        let steps = fit_ramp(ramp.atlas_indices());
+        let steps = fit_ramp(ramp);
         // Ramps and palettes are packed, the whole frame's first so its
         // steps and inks sit where the cell state expects them
         let mut ramps = Ramps::default();
@@ -2756,8 +2842,8 @@ impl StylePass for Ascii {
 
         // Edges (#267): line glyphs from geometry, one texel a cell on the
         // same grid as the cell state
-        let mut edge_glyphs = [[0u32; 4]; 2];
-        for (i, ch) in set.edges().all().iter().enumerate() {
+        let mut edge_glyphs = [[0u32; 4]; EDGE_SLOTS.div_ceil(2)];
+        for (i, ch) in set.edges().slots().iter().enumerate() {
             // A set's edge glyphs are always in its atlas (GlyphSet checks)
             let [x, y] = atlas
                 .index_of(*ch)
@@ -2792,7 +2878,10 @@ impl StylePass for Ascii {
             );
         }
         if edge_view {
-            self.encode_edge_view(frame, encoder, input, output, edge_cells, cell, origin);
+            let corners = corner_glyphs(frame, &set);
+            self.encode_edge_view(
+                frame, encoder, input, output, edge_cells, cell, origin, corners,
+            );
             return;
         }
 
@@ -2864,7 +2953,7 @@ impl StylePass for Ascii {
             chroma: frame.param("chroma").clamp(0.0, 8.0),
             palette_dither: frame.param("palette_dither").clamp(0.0, 1.0),
             edge_tint: frame.param("edge_tint").clamp(0.0, 1.0),
-            _pad_palette: 0,
+            corners: corner_glyphs(frame, &set),
             edge_glyphs,
             ramp: [[0; 4]; MAX_RAMP / 2],
             palette: [[0.0; 4]; MAX_COLORS],
@@ -2887,6 +2976,7 @@ impl StylePass for Ascii {
             },
             dissolve_meta: [dissolving.len() as u32, 0, 0, 0],
             dissolve: [[0; 4]; MAX_DISSOLVE],
+            ramp_tone: [[EQUAL_BANDS; 4]; MAX_RAMP / 4],
         };
         let mut uniforms = uniforms;
         // Every font the frame draws in, stacked; the whole frame's is at
@@ -2897,6 +2987,9 @@ impl StylePass for Ascii {
             let pair = &mut uniforms.ramp[i / 2];
             pair[(i % 2) * 2] = x;
             pair[(i % 2) * 2 + 1] = y;
+        }
+        for (i, t) in ramps.tones.iter().enumerate() {
+            uniforms.ramp_tone[i / 4][i % 4] = *t;
         }
         uniforms.palette[..palettes.inks.len()].copy_from_slice(&palettes.inks);
         uniforms.palette_lab[..palettes.lab.len()].copy_from_slice(&palettes.lab);
@@ -3226,8 +3319,8 @@ mod tests {
 
     #[test]
     fn uniforms_match_the_shader_layout() {
-        // 160 bytes of scalars (#267's edge strength, #320's palette look), 2
-        // vec4<u32> of edge glyphs, 64 vec4<u32> of ramp, 2 x 32 vec4<f32> of
+        // 160 bytes of scalars (#267's edge strength, #320's palette look), 7
+        // vec4<u32> of edge glyphs (#348's corners), 64 vec4<u32> of ramp, 2 x 32 vec4<f32> of
         // palette (inks, then their OKLab), then the variant table's 16-byte
         // header (its rows, and its slots, are storage buffers since #336:
         // a row is 144 bytes, #288's silhouette floors and #320's palette
@@ -3240,7 +3333,7 @@ mod tests {
         assert_eq!(std::mem::offset_of!(VariantUniform, glyph), 128);
         assert_eq!(
             std::mem::size_of::<AsciiUniforms>(),
-            160 + 2 * 16
+            160 + 7 * 16
                 + 64 * 16
                 + 2 * MAX_COLORS * 16
                 + 16
@@ -3251,16 +3344,17 @@ mod tests {
                 + 16
                 + 16
                 + MAX_DISSOLVE * 16
+                + MAX_RAMP * 4
         );
         assert_eq!(
             std::mem::offset_of!(AsciiUniforms, inv_view_proj) % 16,
             0,
             "a mat4x4 is 16-aligned in WGSL"
         );
-        // #351's edge colour, then #398's dissolve bands, last
+        // #351's edge colour, #398's dissolve bands, then #281's ramp tones, last
         assert_eq!(
             std::mem::offset_of!(AsciiUniforms, edge_color),
-            std::mem::size_of::<AsciiUniforms>() - 32 - MAX_DISSOLVE * 16
+            std::mem::size_of::<AsciiUniforms>() - 32 - MAX_DISSOLVE * 16 - MAX_RAMP * 4
         );
         assert_eq!(std::mem::offset_of!(AsciiUniforms, edges), 128);
         assert_eq!(std::mem::offset_of!(AsciiUniforms, edge_glyphs), 160);
@@ -3327,6 +3421,7 @@ mod tests {
             "edge_max",
             "edge_depth",
             "edge_normal",
+            "edge_corner",
         ] {
             let p = STYLE.params.iter().find(|p| p.name == name).unwrap();
             assert!(p.min <= p.default && p.default <= p.max, "{name}");
@@ -3526,14 +3621,37 @@ mod tests {
 
     #[test]
     fn long_ramps_are_resampled_end_to_end() {
-        let short: Vec<u32> = (0..10).collect();
-        assert_eq!(fit_ramp(&short), short);
-        let long: Vec<u32> = (0..300).collect();
-        let fit = fit_ramp(&long);
+        let short: Vec<usize> = (0..10).collect();
+        assert_eq!(fit_positions(10), short);
+        let fit = fit_positions(300);
         assert_eq!(fit.len(), MAX_RAMP);
         assert_eq!(fit[0], 0);
         assert_eq!(*fit.last().unwrap(), 299);
         assert!(fit.windows(2).all(|w| w[0] < w[1]));
+    }
+
+    #[test]
+    fn a_calibrated_ramp_packs_its_bands_and_an_equal_one_the_sentinel() {
+        // #281: the shader's `ramp_tone` table
+        let set = GlyphSet::builtin();
+        let classic = set.ramp("classic").unwrap();
+        let fit = fit_ramp(classic);
+        assert_eq!(fit.len(), classic.len());
+        assert!(fit.iter().all(|(_, t)| *t == EQUAL_BANDS));
+        let calibrated = classic.calibrated();
+        let fit = fit_ramp(&calibrated);
+        let tones: Vec<f32> = fit.iter().map(|(_, t)| *t).collect();
+        assert_eq!(tones, calibrated.bounds());
+        assert_eq!(tones[0], 0.0);
+        assert!(tones.windows(2).all(|w| w[0] <= w[1]));
+        let mut ramps = Ramps::default();
+        let at = ramps.pack(0, "c", fit.clone()).unwrap();
+        ramps.pack(0, "e", vec![(0, EQUAL_BANDS); 4]).unwrap();
+        assert_eq!(ramps.tones.len(), ramps.steps.len());
+        assert_eq!(
+            &ramps.tones[at.0 as usize..(at.0 + at.1) as usize],
+            &tones[..]
+        );
     }
 
     #[test]
@@ -3807,6 +3925,37 @@ mod tests {
         assert_eq!(ramps.place(0, &set, "minimal"), None);
     }
 
+    /// The glyph pass's arms-to-corner table (#348) is `EdgeGlyphs::for_arms`,
+    /// slot for slot, and the edge view's inverse table undoes it.
+    #[test]
+    fn the_shaders_corner_table_matches_for_arms() {
+        let table = |src: &str, name: &str| -> Vec<String> {
+            let start = src.find(&format!("const {name} = array<u32,")).expect(name);
+            let body = &src[start..];
+            let body = &body[body.find('(').unwrap() + 1..body.find(");").unwrap()];
+            body.lines()
+                .map(|l| l.split("//").next().unwrap())
+                .flat_map(|l| l.split(','))
+                .map(|t| t.trim().trim_end_matches('u').to_string())
+                .filter(|t| !t.is_empty())
+                .collect()
+        };
+        let arms = table(include_str!("ascii_edge_thin.wgsl"), "ARM_GLYPHS");
+        assert_eq!(arms.len(), 16);
+        let edges = GlyphSet::builtin().edges();
+        let slots = edges.slots();
+        assert_eq!(slots.len(), EDGE_SLOTS);
+        for (mask, entry) in arms.iter().enumerate() {
+            let want = edges.for_arms(mask & 1 != 0, mask & 2 != 0, mask & 4 != 0, mask & 8 != 0);
+            let got = (entry != "NO_EDGE").then(|| slots[entry.parse::<usize>().unwrap()]);
+            assert_eq!(got, want, "arms {mask:04b}");
+        }
+        let back = table(include_str!("ascii_edge_view.wgsl"), "SLOT_ARMS");
+        for (i, mask) in back.iter().enumerate() {
+            assert_eq!(arms[mask.parse::<usize>().unwrap()], (i + 4).to_string());
+        }
+    }
+
     #[test]
     fn a_fonts_ramp_and_edges_pack_together_or_not_at_all() {
         let set = GlyphSet::builtin();
@@ -3815,17 +3964,17 @@ mod tests {
         assert_eq!(ramp.0, 0);
         assert_eq!(edges, ramp.1, "the edges follow the ramp");
         let atlas = set.atlas();
-        let packed: Vec<u32> = ramps.steps[edges as usize..edges as usize + 4]
+        let packed: Vec<u32> = ramps.steps[edges as usize..edges as usize + EDGE_SLOTS]
             .iter()
             .map(|(_, i)| *i)
             .collect();
         let want: Vec<u32> = set
             .edges()
-            .all()
+            .slots()
             .iter()
             .map(|c| atlas.index_of(*c).unwrap())
             .collect();
-        assert_eq!(packed, want, "in EdgeGlyphs::all() order");
+        assert_eq!(packed, want, "in EdgeGlyphs::slots() order");
         // Again: placed once, edges shared by the font's ramps
         let len = ramps.steps.len();
         assert_eq!(
@@ -3837,7 +3986,12 @@ mod tests {
         assert!(ramps.steps.len() > len);
         // Room for the ramp but not its edges: neither is packed
         let blocks = set.ramp("minimal").unwrap().len();
-        ramps.steps.resize(MAX_RAMP - blocks - 3, (0, 0));
+        let slots = set.edges().slots().len();
+        assert_eq!(
+            slots, EDGE_SLOTS,
+            "the built-in set has every corner (#348)"
+        );
+        ramps.steps.resize(MAX_RAMP - blocks - slots + 1, (0, 0));
         let before = ramps.steps.len();
         assert_eq!(ramps.place_with_edges(2, &set, "minimal"), None);
         assert_eq!(ramps.steps.len(), before);

@@ -10,7 +10,6 @@ pub mod billboard_pipeline;
 pub mod bitmap_font;
 mod camera;
 mod context;
-pub mod contour;
 mod debug;
 mod file_watch;
 pub mod frustum;
@@ -56,13 +55,14 @@ pub use style_mask::{StyleIds, STYLE_MASK_FORMAT};
 pub use atlas::{AtlasRegistry, TextureAtlas};
 pub use glyph_atlas::{
     EdgeGlyphs, GlyphAtlas, GlyphError, GlyphRamp, GlyphSet, GlyphSetCache, GpuGlyphAtlas,
+    RampMap,
 };
 pub use billboard_pipeline::BillboardPipeline;
 pub use bitmap_font::{anchor_origin, apply_fill, BitmapFont};
 pub use camera::{Camera, CameraMode};
 pub use bind_cache::{new_depth_id, DepthKey, DepthTarget};
 pub use context::{RenderContext, RenderError};
-pub use gpu_select::{list_adapters, set_gpu_override};
+pub use gpu_select::{list_adapters, no_adapter_hint, set_gpu_override};
 pub use gpu_timer::{GpuPassTime, GpuScope, GpuTimer, GpuTimings};
 pub use ground_fog::GroundFog;
 pub use debug::{DebugMode, DebugState};
@@ -156,7 +156,7 @@ mod tests {
     #[test]
     fn shading_boil_shaders_validate() {
         for source in [
-            include_str!("contour_shader.wgsl"),
+            include_str!("stylize/contour.wgsl"),
             include_str!("stylize/kuwahara.wgsl"),
         ] {
             let module = naga::front::wgsl::parse_str(source).expect("failed to parse");

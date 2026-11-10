@@ -25,7 +25,7 @@ WARN styles.ascii.color: unknown value 'plaid'; it takes: source, tint, raw, mon
 WARN styles.invert.strength=3 is outside its range 0..1; kept as written, past what the style is tuned for
 ```
 
-Kuwahara's table is `[post_process.styles.kuwahara]`. Scenes from before the table spell it `kuwahara_enabled`, `kuwahara_radius` and so on in `[post_process]`; those keys are folded into the table when the scene loads (see [Post-Processing](post-processing.md#kuwahara-painterly-filter)).
+Kuwahara's table is `[post_process.styles.kuwahara]`, and the contour's `[post_process.styles.contour]`. Scenes from before the tables spell them `kuwahara_enabled`, `kuwahara_radius`, `contour_width` and so on in `[post_process]`; those keys are folded into the tables when the scene loads (see [Post-Processing](post-processing.md#kuwahara-painterly-filter)).
 
 From the command line, `--style name[:key=value,...]` turns any registered style on over a scene without editing it (#271), on `flint render` and on `flint edit <model or effect> --render`:
 
@@ -93,7 +93,7 @@ In the player and the scene viewer, **F4 → Styles** lists every style that rea
   glow = 0.77
   ```
 
-- **Commit to scene** (#364) writes that same block into the scene file, as the Grass, Ocean and Camera panels' Commit to File do for theirs. It works key by key through `toml_edit` (`SceneDocument::set_style_table`). A changed value is rewritten in place and keeps its comments. A key back at its default is removed, and a comment on its own line above that key goes with it. A key the style doesn't know is left alone. Comments and key order elsewhere in the file survive. A style that is off with nothing else set loses its table, and on Kuwahara the old `kuwahara_*` keys in `[post_process]` are removed. After the write the editor's authored settings are the committed ones, so the *edited* marker and the dots clear. The viewer reloads the file as it does any scene edit. Because that reload would drop entity edits not yet saved, the button is greyed out until Ctrl+S. A scene played from a bundle (`flint-player --bundle`, the web) has no file to write, so the button isn't drawn there.
+- **Commit to scene** (#364) writes that same block into the scene file, as the Grass, Ocean and Camera panels' Commit to File do for theirs. It works key by key through `toml_edit` (`SceneDocument::set_style_table`). A changed value is rewritten in place and keeps its comments. A key back at its default is removed, and a comment on its own line above that key goes with it. A key the style doesn't know is left alone. Comments and key order elsewhere in the file survive. A style that is off with nothing else set loses its table, and on Kuwahara and contour the old `kuwahara_*` / `contour_*` keys in `[post_process]` are removed. After the write the editor's authored settings are the committed ones, so the *edited* marker and the dots clear. The viewer reloads the file as it does any scene edit. Because that reload would drop entity edits not yet saved, the button is greyed out until Ctrl+S. A scene played from a bundle (`flint-player --bundle`, the web) has no file to write, so the button isn't drawn there.
 - **Against the scene.** The header says *edited* while the style differs from the scene's own table, and a dot marks each value that does (hover it for the scene's value).
 
 ![F4's Styles section in the player: the meadow under an authored amber ASCII look, with cell size, tone bands and glow tuned by eye. Each tuned value has a dot because it now differs from the scene, and Copy TOML has just copied the block above](../images/f4-styles-editor.png)
@@ -102,13 +102,14 @@ The same editor is the player's **F3 Styles** panel, which appears with the othe
 
 | Style | Stage | Parameters |
 |-------|-------|------------|
-| `kuwahara` | HDR | `radius` (whole pixels), `sharpness`, `hardness`, `anisotropy`; see [Post-Processing](post-processing.md#kuwahara-painterly-filter) |
+| `kuwahara` | HDR | `radius` (whole pixels), `sharpness`, `hardness`, `anisotropy`, `boil`; see [Post-Processing](post-processing.md#kuwahara-painterly-filter) |
 | `watercolor` | Display | see [Watercolor](#watercolor) |
 | `ascii` | Display | see [ASCII](#ascii) |
 | `pencil` | Display | see [Pencil](#pencil) |
 | `palette` | Display | `palette`, `dither` 0--1 (0), `pixel` 1--32 points (1); see [Palette](#palette) |
 | `invert` | Display | `strength` 0--1 (default 1): how far toward the negative |
 | `mask_view` | Display | `shading` 0--1 (0.8), `dim` 0--1 (0.35), `outline` 0--4 px (1): shows the [entity style mask](#the-entity-style-mask) |
+| `contour` | HDR | `width`, `threshold`, `strength`, `luma`, `color`, `fade`, `boil`: ink lines, last of the HDR chain; see [Post-Processing](post-processing.md#contour-ink-lines) |
 
 `invert` is the template style: the smallest one that exercises the framework.
 
@@ -147,7 +148,7 @@ flint render demo/mesh_meadow.scene.toml --ascii --ascii-ramp blocks --ascii-tin
 |-----|---------|---|
 | `cell` | `8` | Cell width in points (4--32). Times the window's scale factor, so cells look the same size on a high-DPI display; rounded to whole pixels |
 | `font` | `builtin` | The glyph set: `builtin`, a set name (`fonts/<name>.glyphs.toml` in the scene's folder or its parent) or a `.glyphs.toml` path. One that fails to load falls back to the built-in set, with a warning |
-| `ramp` | the set's default | A ramp of the set. The built-in set has `classic`, `blocks`, `minimal` and `detailed`. An unknown name warns once and uses the default |
+| `ramp` | the set's default | A ramp of the set. The built-in set has `classic`, `blocks`, `minimal`, `detailed`, `quadrants` and `braille`. An unknown name warns once and uses the default |
 | `color` | `source` | `source`: the cell's hue at full value. `tint`: one colour (`tint`, default phosphor green). `raw`: the cell's colour as it is, dark cells dark. `mono`: white glyphs on grey. `palette`: the inks of `palette` (see [Colour modes](#colour-modes)) |
 | `tint` | `[0.35, 1.0, 0.45]` | With `color = "tint"`: the ink, a [colour](#colours) (`[r, g, b]` 0--1 in display values, or `"#59ff73"`). `--ascii-tint r,g,b` sets it |
 | `palette` | `phosphor` | With `color = "palette"`: `cga`, `cga-warm`, `cga16`, `phosphor`, `amber`, `mono`, `paper` (with `ground = "inverse"`), or a palette file. One that can't be found warns once and uses `phosphor` |
@@ -167,6 +168,7 @@ flint render demo/mesh_meadow.scene.toml --ascii --ascii-ramp blocks --ascii-tin
 | `edge_max` | `3` | More edge than this is texture-like geometry (grass, foliage) and keeps its tone glyph. A styled entity's outline ignores it |
 | `edge_depth` | `0.6` | The relative view-distance step that counts as a silhouette (lower finds more) |
 | `edge_normal` | `2.5` | The normal change, as a Sobel over normals rebuilt from depth, that counts as a crease (lower finds more) |
+| `edge_corner` | `0.9` | A cell whose edge has no one direction (its tensor's coherence under this) draws the [corner or tee](#corners) its neighbours' lines meet in, as do line ends and gaps (#637); 0 turns every corner off (#348) |
 | `edge_ink` | `cell` | What inks the line glyphs ([Edge ink](#edge-ink), #351): `cell` (as the cell's tone glyph), `color` (`edge_color`) or `hue` (the near side's own colour) |
 | `edge_color` | `[0.85, 0.82, 0.74]` | The line glyphs' ink for `edge_ink = "color"`, a warm off-white; `[r, g, b]` or `"#rrggbb"` |
 | `edge_tint` | `0` | For `edge_ink = "color"`: mix the colour toward the near side's hue (0--1) |
@@ -333,6 +335,49 @@ Edges come from geometry, never from colour, so a wood texture makes none but a 
 2. **Cells**, one fragment a glyph cell. It reads every edge pixel in its cell, not a sparse lattice, so a one-pixel outline can't slip between samples, and sums their structure tensors: the dominant orientation picks the glyph. The cell draws a line when it holds at least `edge_threshold` cell widths of edge and at most `edge_max` (an outline needs only the threshold).
 3. **The glyph pass** draws the cell's line glyph in the one cell the line passes within half a cell of, measured across it: down the cell's centre column for a line nearer horizontal, along its centre row for one nearer vertical (#352). The cell pass finds where that is from the edge pixels' centroid, each pixel weighted by how much its gradient agrees with the cell's line, so a corner's other arm doesn't pull it. That is the cell a Bresenham line lights, so a line along a cell border, a coarse diagonal or a silhouette at render scale 0.5 draws one chain of cells, not two. A band of edge pixels wider than one (two-pixel stairs at scale 0.5) can straddle the border; the two halves count as one line when they run within 10° of each other and lie within three quarters of a cell, and the pair's centroid decides. Two real edges a cell apart, or converging at an angle like a box's silhouette and the crease below it, each keep their own.
 
+#### Corners
+
+At a corner the outline turns 90° inside one cell, and the summed tensor has no dominant direction: the cell used to pick whichever of the four lines won by a hair, a stray `╱` at a box's top corner. Two more steps fix it (#348):
+
+- The cell pass measures the tensor's **coherence**, (λ1 − λ2) / (λ1 + λ2): nearly 1 for a straight line, (a − b) / (a + b) for two arms at right angles of lengths a and b, 0 when the corner sits in the cell's middle. A cell that draws a line with coherence under `edge_corner` is marked a corner.
+- The glyph pass asks the marked cell's four neighbours which **arms** run into it: a `─` beside it, a `│` above or below. The arms pick the glyph: right and down make `┌`, three arms a tee (`├ ┤ ┬ ┴`), four the cross `┼`, and two opposite arms the straight line, which also cleans up a stray diagonal inside a run. Only a neighbour sure of its own direction lends an arm, so two marked cells side by side don't each take the other for one. With fewer than two arms that meet, the cell keeps its line.
+
+```text
+edge_corner = 0                       edge_corner = 0.9 (the default)
+%%%%%╱──────────╲%%%%%%%%%%%%%%%%%    %%%%%┌──────────┐%%%%%%%%%%%%%%%%%   row 10: the pillar's top
+%%%%%│++++++++++│%%%%%%%%%%%%%%%%%    %%%%%│++++++++++│%%%%%%%%%%%%%%%%%
+...
+%%%%%│++++++++++│%%%%%%%%%%%%%%%%%    %%%%%│++++++++++│%%%%%%%%%%%%%%%%%
+─────╱++++++++++╲─────────────────    ─────┤++++++++++└─────────────────   row 30: the horizon meets it
+*****│+++++++++│******************    *****│+++++++++│******************
+...
+*****│++++++│::::───────########──    *****│++++++│::::───────########──
+╲****│++++++│:::::::::::────────**    ╲****│++++++│:::::::::::───┬────**   row 37: the box's top edges
+╲****│++++++│::::::::::::::│******    ╲****│++++++│::::::::::::::│******           meet its vertical
+```
+
+*`demo/ascii_edges.scene.toml` at 1280x720, columns 72 to 105 of `--ascii-text`. These five cells are all that changed in the frame. At the horizon's right the pillar's edge steps a column left below it, so the cell sees no `│` beneath and draws `└`.*
+
+The glyphs come from the set's `[edges] corners` ([glyph sets](glyph-atlas.md#a-glyph-set-file)); the built-in set has all nine. A set without them, like `demo/fonts/halftone.glyphs.toml`, draws the line glyphs it always did (the golden `ascii-edges-no-corner-glyphs` holds that to the pixel against `edge_corner = 0`), and a set with only the four corners keeps its lines at tees. A per-entity variant in a font of its own uses that font's corners. The edge view below draws a cell's corner in yellow, its arms from the cell's centre.
+
+Two corners the coherence test can't see turn too (#637):
+
+- **A line that ends beside a perpendicular one.** When the turn's two arms fall in neighbouring cells, each cell's pixels run one way and neither is marked: a `─` that runs on past the outline sits above the `│` that starts below it. A `─` (or `│`) with its own line on only one side ends in its cell; a `│` above or below it (a `─` beside it) is the turn's other arm, and the cell draws the corner, or the tee with an arm on both sides. Past the end, a perpendicular line that ends there itself counts as an arm, which is how the `│` under a `─` that turned down becomes `┤` when a crease runs into it from the side. A line that runs on through the cell never turns, so lines crossing never become `┼`.
+- **A gap.** A cell holding a sliver of edge, under `edge_threshold`, draws no line. Where a `─` runs into it from the side and a `│` from above or below, it draws their corner, or a tee with a `─` on both sides: the hole an outline leaves where it clips the cell's corner, or where a `─` ends in one cell and the `│` starts diagonally past it. Arms count only the way they run into the cell, so the cell diagonally inside a box's corner (a `─` above, a `│` beside) never draws one.
+
+Neither turns a staircase: a line that carries on past its end as a diagonal, or the same line a cell across (a near-vertical edge stepping a column), doesn't end, and a gap with a `│` beside it or a `─` above or below it is left empty. A marked corner whose own arms make no corner draws its line and lends it as an arm. `edge_corner = 0` turns all of it off.
+
+```text
+before #637                               after
+##########################────────****    ##########################───────┐****   the box's top-right
+───####################──────────│****    ───####################──────────┤****   (a crease meets it)
+:::───────###──────────**********│****    :::───────###──────────**********│****
+::::::::::─*─********************│****    ::::::::::─┬─********************│****   its front corner, a gap
+:::::::::::│*********************│****    :::::::::::│*********************│****
+```
+
+*`demo/ascii_edges.scene.toml` at 1920x1080, columns 138 to 175 of `--ascii-text`. These three cells are all that changed in the frame.*
+
 Under a render scale the edge pixels are the scene's, so a line is still one cell wide. The editor grid of `flint render` (on unless `--no-grid`) is an overlay drawn after the opaque geometry that writes no depth (#346), so the edges never trace it; its lines still lift the tone glyphs they cross, which is why renders of the look pass `--no-grid`.
 
 Edges come with the colour modes: by default (`edge_ink = "cell"`) line glyphs are inked as the cell's tone glyph would be, cut out of the ink under `ground = "inverse"`, and glow around them. The edge cells lie on the screen grid, so per-entity variants on that grid get them, and a variant on `grid = "object"` keeps its tone glyphs. Edge cells keep no history: under #277's temporal stability the tone glyphs hold still and the lines follow the geometry each frame. The [stylize goldens](#goldens) pin pbr_test without edges (the #265 golden, unchanged), with edges, and the sphere and box above.
@@ -370,7 +415,7 @@ flint render demo/ascii_edges.scene.toml --debug-mode edges --no-grid --style as
 ```
 
 - **Edge pixels**, by the source that marked them: cyan a depth step, amber a crease, magenta a styled entity's outline.
-- **Each cell's decision**: a green line in the glyph's direction where the cell draws one; a dim dashed line where it holds a line that runs more than half a cell from its centre, which a neighbour draws (pass 3's thinning); a red wash where it holds more than `edge_max` and counts as texture; nothing where it holds less than `edge_threshold`.
+- **Each cell's decision**: a green line in the glyph's direction where the cell draws one; a yellow corner or tee, its arms from the cell's centre, where it draws one of those ([corners](#corners)); a dim dashed line where it holds a line that runs more than half a cell from its centre, which a neighbour draws (pass 3's thinning); a red wash where it holds more than `edge_max` and counts as texture; nothing where it holds less than `edge_threshold`.
 - **Each cell's edge length**: a bar along the cell's foot, full at `edge_max`, with a white tick at `edge_threshold`. In cells 12 pixels or wider the length is also written in the top left, in cell widths.
 
 ![The ASCII edges demo in the edge view: cyan silhouettes on the pillar and the horizon, amber creases on the box, magenta outlines around the sphere and the box, green line glyphs through the cells, and the legend card in the lower left](../images/ascii-edges-debug.png)
@@ -1218,7 +1263,7 @@ One frame holds 15 variants of a style (and mask ids up to 255); any more take t
 - Save the `.shader.toml` and the style is replaced where it stands in the chain, with its new parameters, label, stage, inputs or shader. The scene's `[post_process.styles.<name>]` is read again against them (other F4 edits stay). A description that no longer reads keeps the old style and reports.
 - A new `*.shader.toml` dropped into a `styles/` folder is picked up too.
 
-Until a broken style compiles, a card in the bottom-left corner of the player and the viewer shows its error with the line it points at, and the style's F4 header is tagged `error` (hover it for the message; the `user` tag beside it names both files). `flint render` prints the same message and renders the passthrough. The goldens hold both of those to account (#417): `user-style-broken` renders a bench with a fixture style that fails (`crates/flint-cli/tests/golden/fixtures/styles/broken.*`), requires the frame to equal the same bench rendered without the style, and requires the error to name `broken.wgsl:9:9`. Next to it, `user-styles`, `user-style-risograph` and `user-style-contour` pin the three demo styles over `demo/user_styles.scene.toml`.
+Until a broken style compiles, a card in the bottom-left corner of the player and the viewer shows its error with the line it points at, and the style's F4 header is tagged `error` (hover it for the message; the `user` tag beside it names both files). `flint render` prints the same message and renders the passthrough. The goldens hold both of those to account (#417): `user-style-broken` renders a bench with a fixture style that fails (`crates/flint-cli/tests/golden/fixtures/styles/broken.*`), requires the frame to equal the same bench rendered without the style, and requires the error to name `broken.wgsl:9:9`. Next to it, `user-styles`, `user-style-risograph` and `user-style-contour-map` pin the three demo styles over `demo/user_styles.scene.toml`.
 
 | ![a cyanotype from a game folder, drawn by flint-player](../images/user-style-cyanotype.png) | ![the same style mid-edit: a typo, the card, the last good build](../images/user-style-error-card.png) |
 |---|---|
@@ -1228,7 +1273,7 @@ Until a broken style compiles, a card in the bottom-left corner of the player an
 
 ![the web player at ?game=frost: the card names frost.wgsl:12:42, 'fwidth' must only be called from uniform control flow](../images/user-style-web-error.png)
 
-| ![hologram](../images/user-style-hologram.png) `hologram`: `inputs = ["mask"]`; the YBot and the barrel carry `style_mask { style = "hologram" }`, the barrel at `blend = 0.6` (rendered before #414, with the table the scene then needed; [per entity](#user-authored-styles) shows it now) | ![contour](../images/user-style-contour.png) `--style contour`: `inputs = ["depth"]`; height lines from `flint_world_pos`, range rings round the eye |
+| ![hologram](../images/user-style-hologram.png) `hologram`: `inputs = ["mask"]`; the YBot and the barrel carry `style_mask { style = "hologram" }`, the barrel at `blend = 0.6` (rendered before #414, with the table the scene then needed; [per entity](#user-authored-styles) shows it now) | ![contour map](../images/user-style-contour-map.png) `--style contour_map` (named `contour` until #599 gave the name to the built-in ink): `inputs = ["depth"]`; height lines from `flint_world_pos`, range rings round the eye |
 |---|---|
 | ![risograph](../images/user-style-risograph.png) `--style risograph` (a crop at 1:1): two dot screens out of register, colour only | Each is one `.shader.toml` and under 50 lines of WGSL in `demo/styles/`; none needed a rebuild of the engine |
 
@@ -1376,7 +1421,7 @@ The F2 overlay's `Style targets` line includes them in its total. F4's `user` ta
 
 **Passes, images and per-entity settings together.** A pass that reads targets binds them in group 3 after the style's [images](#images-and-options), so `flint_image_<name>` and `flint_target_<name>` work side by side in any pass. Every pass reads the same `params`, and for a per-entity style (`inputs = ["mask"]`) that is the pixel's own entity's settings in every pass.
 
-**What a user style can't do yet:** compute passes, mip chains, or targets whose size isn't a fraction of the stage's. The built-ins that need those stay in Rust. The demos in `demo/styles/` show what user styles reach: `risograph` (two misregistered inks), `contour` (survey lines from depth), `darkroom` (a LUT and a paper picked by the scene), `neon` (an hdr style that feeds bloom, `demo/neon_bloom.scene.toml`), `hologram` (a style mask on chosen props, `demo/user_styles.scene.toml`) and `orton` (four passes through three half-size targets).
+**What a user style can't do yet:** compute passes, mip chains, or targets whose size isn't a fraction of the stage's. The built-ins that need those stay in Rust. The demos in `demo/styles/` show what user styles reach: `risograph` (two misregistered inks), `contour_map` (survey lines from depth; `contour` before #599), `darkroom` (a LUT and a paper picked by the scene), `neon` (an hdr style that feeds bloom, `demo/neon_bloom.scene.toml`), `hologram` (a style mask on chosen props, `demo/user_styles.scene.toml`) and `orton` (four passes through three half-size targets).
 
 ## Goldens
 
@@ -1407,6 +1452,7 @@ A run names every case that passes without being byte-identical with its golden,
 | `styles-mixed` | ASCII and pencil props in one frame, on the mixed bench: each style leaves the other's pixels alone (#386) |
 | `edges-view`, `edges-inkline-scale05` | the [shared edges](#shared-edges) on the props scene, and a user style reading them beside `edges_view` at `--render-scale 0.5` |
 | `invert`, `kuwahara` | the other styles, with a tighter tolerance |
+| `contour`, `contour-over-kuwahara`, `contour-flags-are-its-table`, `contour-blend-zero` | the ink alone and over Kuwahara's paint (#599), the old `--contour-*` flags against the table they set, and a blend of 0 against no ink at all |
 | `palette-phosphor-dither`, `palette-cga16` | the [palette style](#palette) on the props scene: a ladder dithered in 2-point blocks, and nearest colours flat. Glyph tolerance, since a colour on a boundary flips a whole block |
 
 Cases render single-sample with the post clock at 0 unless they say otherwise. The props cases share one clearing, `demo/prefabs/stylize_props.prefab.toml`, which loads in a few seconds in a debug build, with the grid off. Each style has a bench of its own on it (#386): `stylize_props_ascii` (the barrel and YBot in glyphs), `stylize_props_pencil` (the cask and crate sketched) and `stylize_props_plain` (nothing styled, for whole-frame styles and looks), so a change to pencil moves only the pencil cases and `look-graphite`. The mixed bench, `stylize_props.scene.toml`, keeps both styles for the mask cases and `styles-mixed`, the one case that moves with either: it holds that each style leaves the other's pixels alone. A new per-entity style adds a bench of its own (a scene placing the prefab, with overrides giving its props a `style_mask`); a whole-frame style or a look goes on the plain one. Glyph styles share #265's tolerance (fail when more than 2% of pixels differ by more than 48 levels, or the mean passes 3), since a cell on a ramp step's border can flip glyph on another GPU; smooth styles take `level = 8, share = 0.003, mean = 0.25`, because Kuwahara at radius 4 against a radius-5 golden is a 0.39 mean the glyph limits would pass. On one machine, every case is byte-identical run to run. **A new style adds a case here.** The manifest format is in [Headless Rendering](../guides/headless-rendering.md#golden-suites).

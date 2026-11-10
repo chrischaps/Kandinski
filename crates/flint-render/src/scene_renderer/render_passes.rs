@@ -50,12 +50,15 @@ impl SceneRenderer {
         camera: &Camera,
         camera_pos: [f32; 3],
     ) {
+        // Off, forbidden by the scene, or no sun that gives any light (#627):
+        // nothing to draw
+        let drawn = self.shadows_drawn();
         let shadow_pass = match &mut self.shadow_pass {
             Some(sp) => sp,
             None => return,
         };
 
-        if !shadow_pass.enabled || self.light_uniforms.directional_count == 0 {
+        if !drawn {
             // The shaders sample the maps whatever this pass does, so a pass
             // turned off at runtime would leave the last frame's shadows
             // standing (FlintKart#55). Zero splits read as "no shadows".
@@ -233,14 +236,22 @@ impl SceneRenderer {
                     }
                     let woozy = draw.wooze.as_ref().and(shadow_wooze);
                     if let Some(wooze) = woozy {
-                        bind_woozy(&mut pass, &mut next_slot, wooze, &wooze.pipeline);
+                        let pipeline = if draw.double_sided {
+                            &wooze.pipeline_double_sided
+                        } else {
+                            &wooze.pipeline
+                        };
+                        bind_woozy(&mut pass, &mut next_slot, wooze, pipeline);
                     } else {
+                        if draw.double_sided {
+                            pass.set_pipeline(&shadow_pass.shadow_pipeline_double_sided);
+                        }
                         bind_next(&mut pass, &mut next_slot);
                     }
                     pass.set_vertex_buffer(0, draw.vertex_buffer.slice(..));
                     pass.set_index_buffer(draw.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
                     pass.draw_indexed(0..draw.index_count, 0, 0..1);
-                    if woozy.is_some() {
+                    if woozy.is_some() || draw.double_sided {
                         pass.set_pipeline(&shadow_pass.shadow_pipeline);
                     }
                 }
@@ -292,14 +303,22 @@ impl SceneRenderer {
                     }
                     let woozy = draw.wooze.as_ref().and(shadow_wooze);
                     if let Some(wooze) = woozy {
-                        bind_woozy(&mut pass, &mut next_slot, wooze, &wooze.pipeline);
+                        let pipeline = if draw.double_sided {
+                            &wooze.pipeline_double_sided
+                        } else {
+                            &wooze.pipeline
+                        };
+                        bind_woozy(&mut pass, &mut next_slot, wooze, pipeline);
                     } else {
+                        if draw.double_sided {
+                            pass.set_pipeline(&shadow_pass.shadow_pipeline_double_sided);
+                        }
                         bind_next(&mut pass, &mut next_slot);
                     }
                     pass.set_vertex_buffer(0, draw.vertex_buffer.slice(..));
                     pass.set_index_buffer(draw.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
                     pass.draw_indexed(0..draw.index_count, 0, 0..1);
-                    if woozy.is_some() {
+                    if woozy.is_some() || draw.double_sided {
                         pass.set_pipeline(&shadow_pass.shadow_pipeline);
                     }
                 }
@@ -310,15 +329,23 @@ impl SceneRenderer {
                 for draw in self.skinned_entity_draws.iter().filter(|d| d.casts_shadow) {
                     let woozy = draw.wooze.as_ref().and(shadow_wooze);
                     if let Some(wooze) = woozy {
-                        bind_woozy(&mut pass, &mut next_slot, wooze, &wooze.skinned_pipeline);
+                        let pipeline = if draw.double_sided {
+                            &wooze.skinned_pipeline_double_sided
+                        } else {
+                            &wooze.skinned_pipeline
+                        };
+                        bind_woozy(&mut pass, &mut next_slot, wooze, pipeline);
                     } else {
+                        if draw.double_sided {
+                            pass.set_pipeline(&shadow_pass.skinned_shadow_pipeline_double_sided);
+                        }
                         bind_next(&mut pass, &mut next_slot);
                     }
                     pass.set_bind_group(1, &*draw.shadow_bone_bind_group, &[]);
                     pass.set_vertex_buffer(0, draw.vertex_buffer.slice(..));
                     pass.set_index_buffer(draw.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
                     pass.draw_indexed(0..draw.index_count, 0, 0..1);
-                    if woozy.is_some() {
+                    if woozy.is_some() || draw.double_sided {
                         pass.set_pipeline(&shadow_pass.skinned_shadow_pipeline);
                     }
                 }
@@ -1054,7 +1081,13 @@ impl SceneRenderer {
                 if draw.is_wireframe {
                     render_pass.set_pipeline(&self.pipeline.line_pipeline);
                 } else if let Some(woozy) = draw.wooze.as_ref().and(self.wooze_standard.as_ref()) {
-                    render_pass.set_pipeline(&woozy.opaque);
+                    render_pass.set_pipeline(if draw.double_sided {
+                        &woozy.opaque_double_sided
+                    } else {
+                        &woozy.opaque
+                    });
+                } else if draw.double_sided {
+                    render_pass.set_pipeline(&self.pipeline.pipeline_double_sided);
                 } else {
                     render_pass.set_pipeline(&self.pipeline.pipeline);
                 }
@@ -1069,13 +1102,20 @@ impl SceneRenderer {
             // Render skinned entities
             if let Some(sp) = &self.skinned_pipeline {
                 if !self.skinned_entity_draws.is_empty() {
-                    render_pass.set_pipeline(&sp.pipeline);
-                    let mut bound_woozy = false;
+                    // Rebound only when a draw needs another of the four
+                    // (woozy or not, double-sided or not)
+                    let mut bound = None;
                     for draw in &self.skinned_entity_draws {
                         let woozy = draw.wooze.as_ref().and(self.wooze_skinned.as_ref());
-                        if woozy.is_some() != bound_woozy {
-                            bound_woozy = woozy.is_some();
-                            render_pass.set_pipeline(woozy.map_or(&sp.pipeline, |w| &w.opaque));
+                        let wants = (woozy.is_some(), draw.double_sided);
+                        if bound != Some(wants) {
+                            bound = Some(wants);
+                            render_pass.set_pipeline(match (woozy, draw.double_sided) {
+                                (Some(w), true) => &w.opaque_double_sided,
+                                (Some(w), false) => &w.opaque,
+                                (None, true) => &sp.pipeline_double_sided,
+                                (None, false) => &sp.pipeline,
+                            });
                         }
                         render_pass.set_bind_group(0, &*draw.transform_bind_group, &[]);
                         render_pass.set_bind_group(1, &*draw.material_bind_group, &[]);
@@ -1476,36 +1516,6 @@ impl SceneRenderer {
             _ => None,
         };
         let hdr_scene = hdr_result.as_ref().map(|(t, id)| (&t.view, *id));
-        // Ink over whatever the HDR styles left (#214): the contour pass is
-        // still a plain post pass, so it reads the stage's result and the
-        // composite reads its output in place of it
-        let inked = config.enabled && config.contour_enabled && pp.contour_ready(resources);
-        if inked {
-            let input = match hdr_scene {
-                Some((view, id)) => crate::stylize::StyleInput { view, id },
-                None => crate::stylize::StyleInput {
-                    view: &resources.hdr_view,
-                    id: crate::stylize::input_id::HDR,
-                },
-            };
-            scoped("Contour", encoder, &mut |encoder| {
-                pp.run_contour(
-                    queue,
-                    encoder,
-                    device,
-                    resources,
-                    config,
-                    &input,
-                    depth_view,
-                    depth_key,
-                    camera,
-                )
-            });
-        }
-        let hdr_scene = match (inked, resources.contour.as_ref()) {
-            (true, Some(contour)) => Some((&contour.output_view, crate::stylize::input_id::CONTOUR)),
-            _ => hdr_scene,
-        };
 
         // Run SSAO if enabled
         if config.enabled && config.ssao_enabled {
@@ -1526,7 +1536,7 @@ impl SceneRenderer {
         // Run volumetric (god rays) if enabled and shadows are available
         if config.enabled && config.volumetric_enabled {
             if let Some(shadow_pass) = &self.shadow_pass {
-                if shadow_pass.enabled {
+                if self.shadows_drawn() {
                     scoped("Volumetric", encoder, &mut |encoder| {
                         pp.run_volumetric(
                             queue,
@@ -1744,7 +1754,8 @@ impl SceneRenderer {
         // Only the blades in view are drawn. The planes are pushed out by the
         // tallest blade, and with shadows on by how far its shadow reaches,
         // so nothing that leans or casts into the view is lost at its edges.
-        let sun = (self.shadows_enabled() && self.light_uniforms.directional_count > 0)
+        let sun = self
+            .shadows_drawn()
             .then(|| self.light_uniforms.directional_lights[0].direction);
         let tallest = config.blade_height * (1.0 + config.height_variation.max(0.0));
         let frustum_planes = grass_cull_planes(

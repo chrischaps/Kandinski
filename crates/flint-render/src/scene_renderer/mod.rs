@@ -107,6 +107,9 @@ pub(super) struct DrawCall {
     lod: Option<DrawLod>,
     /// Its drift this frame, if its entity has shallow wooze (#215).
     wooze: Option<ShallowWoozeUniforms>,
+    /// Drawn with no face culled, in the scene and shadow passes: its
+    /// material is glTF `doubleSided` (#623).
+    double_sided: bool,
 }
 
 /// A draw's level of detail in world space: the band of camera distances it
@@ -486,6 +489,8 @@ struct SkinnedDrawCall {
     world_aabb: Option<([f32; 3], [f32; 3])>,
     /// As [`DrawCall::wooze`].
     wooze: Option<ShallowWoozeUniforms>,
+    /// As [`DrawCall::double_sided`].
+    double_sided: bool,
 }
 
 /// One faint copy of a skinned entity (#228): bones of its own and how opaque
@@ -600,6 +605,14 @@ pub struct SceneRenderer {
     /// the built-in default; stored so the zero-light fallback in
     /// `extract_lights_from_world` cannot stomp it.
     ambient_override: Option<([f32; 3], [f32; 3])>,
+    /// The scene's `[environment] shadows` (#627): false keeps the shadow
+    /// pass from drawing whatever the quality tier or F4 say. True unless
+    /// a scene says otherwise.
+    scene_shadows: bool,
+    /// The scene's `[environment] default_lights` (#627): false lights a
+    /// scene with no light entities by its ambient alone, instead of the
+    /// built-in key and fill. True unless a scene says otherwise.
+    default_lights: bool,
     /// Scene-authored diffuse terminator wrap. Rides ambient_sky.w encoded as
     /// (1 + wrap) so legacy writes of 1.0 decode to wrap = 0 in the shader.
     diffuse_wrap_override: Option<f32>,
@@ -816,8 +829,9 @@ pub struct SceneRenderer {
     pub camera_offset: [f32; 2],
     pub ortho_height: f32,
     pub aspect_ratio: f32,
-    // Bitmap font cache for ui_text rendering
-    bitmap_font_cache: HashMap<String, BitmapFont>,
+    /// `ui_text` fonts by what the component named, each uploaded once
+    /// (`load_ui_font`); `None` for one that failed, warned about once.
+    bitmap_font_cache: HashMap<String, Option<BitmapFont>>,
     /// Scene directory for resolving relative font/texture paths
     pub scene_dir: Option<std::path::PathBuf>,
     /// Physical pixels per logical point of the window it draws into: the
@@ -995,6 +1009,8 @@ impl SceneRenderer {
             light_bind_group,
             light_uniforms,
             ambient_override: None,
+            scene_shadows: true,
+            default_lights: true,
             diffuse_wrap_override: None,
             oren_nayar_override: None,
             sheen_override: None,
@@ -2536,6 +2552,8 @@ impl SceneRenderer {
             light_bind_group,
             light_uniforms,
             ambient_override: None,
+            scene_shadows: true,
+            default_lights: true,
             diffuse_wrap_override: None,
             oren_nayar_override: None,
             sheen_override: None,
@@ -2996,6 +3014,51 @@ impl SceneRenderer {
         self.skinned_bone_binds.clear();
     }
 
+    /// Load the font a `ui_text.font` names (`builtin`, a glyph set, or a
+    /// `.font.toml`; ADR 0113) and upload its atlas to the texture cache,
+    /// once per name. Returns whether the font is ready to draw.
+    pub fn load_ui_font(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        spec: &str,
+        scene_dir: &Path,
+    ) -> bool {
+        if let Some(found) = self.bitmap_font_cache.get(spec) {
+            return found.is_some();
+        }
+        let font = match BitmapFont::resolve(spec, scene_dir) {
+            Ok(font) => match &mut self.texture_cache {
+                Some(cache) => {
+                    let (rgba, [w, h]) = font.rgba();
+                    match cache.upload_rgba(device, queue, &font.texture, w, h, &rgba, false) {
+                        Ok(_) => Some(font),
+                        Err(e) => {
+                            tracing::warn!("ui_text font `{spec}`: {e}");
+                            None
+                        }
+                    }
+                }
+                None => None,
+            },
+            Err(e) => {
+                tracing::warn!("ui_text font `{spec}`: {e}");
+                None
+            }
+        };
+        let ready = font.is_some();
+        self.bitmap_font_cache.insert(spec.to_string(), font);
+        ready
+    }
+
+    /// A loaded `ui_text` font whose atlas is in `tex_cache`.
+    pub(super) fn ui_font(&self, tex_cache: &TextureCache, spec: &str) -> Option<&BitmapFont> {
+        self.bitmap_font_cache
+            .get(spec)?
+            .as_ref()
+            .filter(|f| tex_cache.contains(&f.texture))
+    }
+
     /// Load a texture from an image file into the texture cache
     pub fn load_texture_file(
         &mut self,
@@ -3240,7 +3303,7 @@ impl SceneRenderer {
         // Shadow stats: estimate as main pass × the cascades drawn, counting
         // only the draws that cast (ADR 0100)
         let cascade_count = match &self.shadow_pass {
-            Some(sp) if sp.enabled => sp.cascades() as u32,
+            Some(sp) if self.shadows_drawn() => sp.cascades() as u32,
             _ => 0,
         };
         let casting = self.entity_draws.iter().filter(|d| d.casts_shadow);
@@ -3603,6 +3666,38 @@ impl SceneRenderer {
         self.shadow_pass.as_ref().is_some_and(|sp| sp.enabled)
     }
 
+    /// The scene's `[environment] shadows` (#627). False keeps the shadow
+    /// pass from drawing at all, over the quality tier and F4,
+    /// which keep their own setting for the next scene.
+    pub fn set_scene_shadows(&mut self, on: bool) {
+        self.scene_shadows = on;
+    }
+
+    /// The scene's `[environment] default_lights` (#627). False lights a
+    /// scene with no light entities by its ambient alone (and emission),
+    /// instead of the built-in key and fill. Takes effect at the next
+    /// `update_from_world`.
+    pub fn set_default_lights(&mut self, on: bool) {
+        self.default_lights = on;
+    }
+
+    /// Whether this frame draws the shadow cascades (#627): shadows are on,
+    /// the scene allows them, and its strongest directional light gives
+    /// light or god rays. A sun of intensity 0 contributes nothing the
+    /// maps could darken, so its pass is skipped and every caster with it.
+    pub fn shadows_drawn(&self) -> bool {
+        self.shadows_enabled() && self.scene_shadows && self.sun_casts()
+    }
+
+    /// The light the cascades follow, directional 0 after the sort that
+    /// puts the strongest first, gives light or god rays.
+    fn sun_casts(&self) -> bool {
+        self.light_uniforms.directional_count > 0 && {
+            let sun = &self.light_uniforms.directional_lights[0];
+            sun.intensity > 0.0 || sun.volumetric_intensity > 0.0
+        }
+    }
+
     /// Current shadow map resolution per cascade
     pub fn shadow_resolution(&self) -> u32 {
         self.shadow_pass
@@ -3770,7 +3865,14 @@ impl SceneRenderer {
         // The ray targets, placed afresh (ADR 0105).
         let mut ray_scene = flint_core::ray_mesh::RayScene::new();
 
+        // What `visibility { visible = false }` hides, descendants included
+        // (#628): empty and unwalked in a scene that never hides anything.
+        let hidden = world.hidden_entities();
+
         for entity in world.all_entities() {
+            if hidden.contains(&entity.id) {
+                continue;
+            }
             let archetype = entity.archetype.as_deref().unwrap_or("unknown");
             let visual =
                 self.archetype_visuals
@@ -4140,6 +4242,7 @@ impl SceneRenderer {
             style_aabb: None,
             lod: None,
             wooze: None,
+            double_sided: false,
         }
     }
 
@@ -4272,6 +4375,7 @@ impl SceneRenderer {
             style_aabb: None,
             lod: None,
             wooze: None,
+            double_sided: false,
         }
     }
 
@@ -4818,6 +4922,11 @@ impl SceneRenderer {
             .iter()
             .copied()
             .collect();
+        // A hidden entity's light goes out with it (#628)
+        let hidden = world.hidden_entities();
+        if !hidden.is_empty() {
+            light_entities.retain(|id| !hidden.contains(id));
+        }
         light_entities.sort_by(|a, b| {
             world
                 .get_name(*a)
@@ -4942,7 +5051,7 @@ impl SceneRenderer {
         });
 
         // If no lights found in scene, use defaults
-        if dir_count == 0 && point_count == 0 && spot_count == 0 {
+        if dir_count == 0 && point_count == 0 && spot_count == 0 && self.default_lights {
             self.light_uniforms = LightUniforms::default_scene_lights();
             self.apply_ambient_override();
         } else {
@@ -5032,10 +5141,8 @@ impl SceneRenderer {
             self.scaled_depth = Some(std::sync::Arc::new(depth));
         }
         // The recreated resources drop the FXAA intermediate; re-allocate it
-        // at the new size when the pass is active (ADR 0050). Likewise the
-        // contour's texture (#214).
+        // at the new size when the pass is active (ADR 0050).
         self.ensure_fxaa_resources(device);
-        self.ensure_contour_resources(device);
     }
 
     /// Draw the scene at `scale` of the surface's size on each side, and
@@ -5407,24 +5514,6 @@ impl SceneRenderer {
         }
     }
 
-    /// Ensure the contour pass's GPU resources exist (#214): call after enabling it
-    /// at runtime and after resize. No-op when it's off, which allocates nothing.
-    pub fn ensure_contour_resources(&mut self, device: &wgpu::Device) {
-        if !self.postprocess_config.contour_enabled {
-            return;
-        }
-        if let Some(pp) = &mut self.postprocess_pipeline {
-            pp.contour
-                .get_or_insert_with(|| crate::contour::ContourPipeline::new(device));
-        }
-        if let Some(resources) = &mut self.postprocess_resources {
-            if resources.contour.is_none() {
-                let (w, h) = (resources.width, resources.height);
-                resources.contour = Some(crate::contour::ContourTextures::new(device, w, h));
-            }
-        }
-    }
-
     /// This frame's drawing for the shading boil (#214), from the wooze field.
     pub fn set_boil(&mut self, boil: flint_core::wooze::BoilFrame) {
         self.postprocess_config.boil = boil;
@@ -5526,6 +5615,7 @@ impl SceneRenderer {
         let f = RenderPipeline::new(device, format, samples);
         let p = &mut self.pipeline;
         p.pipeline = f.pipeline;
+        p.pipeline_double_sided = f.pipeline_double_sided;
         p.line_pipeline = f.line_pipeline;
         p.overlay_line_pipeline = f.overlay_line_pipeline;
         p.skeleton_line_pipeline = f.skeleton_line_pipeline;
@@ -5545,6 +5635,7 @@ impl SceneRenderer {
                 samples,
             );
             s.pipeline = f.pipeline;
+            s.pipeline_double_sided = f.pipeline_double_sided;
             s.wire_line_pipeline = f.wire_line_pipeline;
             s.transparent_alpha_pipeline = f.transparent_alpha_pipeline;
             s.transparent_alpha_back_pipeline = f.transparent_alpha_back_pipeline;
@@ -6466,6 +6557,59 @@ mod tests {
         for (got, want) in max.iter().zip([r, 1.0, r]) {
             assert!((got - want).abs() < 1e-5, "{max:?}");
         }
+    }
+
+    /// A sheared tile (#625): its culling bounds hold every corner the
+    /// matrix moves, and its normals, through the inverse transpose, stay
+    /// perpendicular to the sheared surface rather than leaning with it.
+    #[test]
+    fn a_sheared_entity_is_bounded_and_lit_by_its_own_matrix() {
+        use super::helpers::mat4_inv_transpose;
+        use flint_core::{Transform, Vec3};
+        // An 8 m tile, 20 m wide, leaning 0.5 m sideways per metre along z
+        // and climbing 0.25 m per metre along z, then yawed 30 degrees.
+        let t = Transform::default()
+            .with_position(Vec3::new(3.0, 0.0, 1.0))
+            .with_rotation(Vec3::new(0.0, 30.0, 0.0))
+            .with_shear([0.0, 0.5, 0.0, 0.25, 0.0, 0.0]);
+        let m = t.to_matrix();
+        let apply = |p: [f32; 3]| {
+            let mut out = [m[3][0], m[3][1], m[3][2]];
+            for (row, o) in out.iter_mut().enumerate() {
+                for (col, v) in p.iter().enumerate() {
+                    *o += m[col][row] * v;
+                }
+            }
+            out
+        };
+        let (lo, hi) = ([-10.0, 0.0, -4.0], [10.0, 0.1, 4.0]);
+        let (min, max) = transform_aabb(&m, lo, hi);
+        for corner in 0..8 {
+            let p = [
+                if corner & 1 == 0 { lo[0] } else { hi[0] },
+                if corner & 2 == 0 { lo[1] } else { hi[1] },
+                if corner & 4 == 0 { lo[2] } else { hi[2] },
+            ];
+            let w = apply(p);
+            for axis in 0..3 {
+                assert!(w[axis] >= min[axis] - 1e-4 && w[axis] <= max[axis] + 1e-4);
+            }
+        }
+
+        // Two edges of the tile's top face, in world space.
+        let o = apply([0.0, 0.0, 0.0]);
+        let along_x = apply([1.0, 0.0, 0.0]);
+        let along_z = apply([0.0, 0.0, 1.0]);
+        let ex: Vec<f32> = (0..3).map(|i| along_x[i] - o[i]).collect();
+        let ez: Vec<f32> = (0..3).map(|i| along_z[i] - o[i]).collect();
+        let it = mat4_inv_transpose(&m);
+        let n: Vec<f32> = (0..3).map(|row| it[1][row]).collect(); // local +Y
+        let dot = |a: &[f32], b: &[f32]| a.iter().zip(b).map(|(x, y)| x * y).sum::<f32>();
+        assert!(dot(&n, &ex).abs() < 1e-5, "normal leans along x");
+        assert!(dot(&n, &ez).abs() < 1e-5, "normal leans along z");
+        // The plain model matrix would have tilted it with the shear.
+        let naive: Vec<f32> = (0..3).map(|row| m[1][row]).collect();
+        assert!(dot(&naive, &ez).abs() > 0.1);
     }
 
     /// A render-scale step keeps the surface's size, so it keeps the
