@@ -3,20 +3,61 @@ description = "Everything scripts/drive.rhai publishes each frame for the HUD an
 
 [component.game_state.fields]
 # what the scene author sets
-autopilot = { type = "bool", default = false, description = "Drive itself from the first frame, skipping the title (captures and tests)" }
+autopilot = { type = "bool", default = false, description = "Drive itself from the first frame, skipping the title (captures and tests). Any control an input script touches is taken back from the autopilot while it is held" }
 start_stage = { type = "i32", default = 0, description = "Stage the run starts in, 0-4 (captures and tests)" }
 start_speed = { type = "f32", default = 0.0, description = "Speed in m/s at the first frame (captures)" }
+manual = { type = "bool", default = false, description = "Hands on from the first frame: no title, no clock (handling tests)" }
+telemetry = { type = "bool", default = false, description = "Log one `TM key=value ...` line every 0.1 s (tools/telemetry.py reads them)" }
+test_track = { type = "bool", default = false, description = "Replace the road with a flat one with no scenery: straight, or one long bend of `test_curve` after 240 m (handling tests)" }
+test_curve = { type = "f32", default = 0.0, description = "The test track's curve value (per-tile dx step, as the track arrays; kappa = curve / 64 rad/m)" }
+telemetry_hz = { type = "f32", default = 10.0, description = "Telemetry lines per second" }
+test_wide = { type = "bool", default = false, description = "No shoulder and no edge: the road's grip everywhere (handling tests on the straight test track)" }
+cruise = { type = "f32", default = 0.0, description = "With `manual`: the throttle holds this speed (m/s) while neither pedal is pressed (handling tests)" }
+traffic = { type = "bool", default = true, description = "False parks the traffic (handling tests)" }
+start_boost = { type = "f32", default = 0.0, description = "Boost meter at the first frame, 0-1 (captures and tests)" }
+ap_skill = { type = "f32", default = 1.0, description = "The autopilot's skill: scales the lateral grip it plans its corner speeds with (0.6 cautious .. 1.1 on the limit)" }
+ap_style = { type = "i32", default = 0, description = "What else the autopilot does, for calibrating events: 0 nothing, 1 handbrake-drifts the bends, 2 shaves the traffic it passes, 3 burns whatever boost it earns on the straights" }
+ap_assist = { type = "bool", default = false, description = "The autopilot drives once an event (or the arcade run) starts, but the menus are the player's: a scripted menu path can finish an event (tools/menu_flow.py). Held controls still override it" }
+ghost_rivals = { type = "bool", default = false, description = "Race calibration: the rivals run unbanded and neither touch nor are touched by the player or the autopilot, so one run compares the player's pace with every rival skill" }
+start_event = { type = "i32", default = -1, description = "Start in this GRAND TOUR event (0-14, the order of scripts/lib/tour.rhai; 100 = HORIZON) instead of the title. With start_speed 0 the event runs by its rules from the countdown (the autopilot drives if `autopilot`); with a start_speed it is a rolling capture in section `start_stage`" }
+no_clock = { type = "bool", default = false, description = "The event clock shows but never runs down (tools/tour_check.py --calibrate measures splits with it)" }
+persist = { type = "bool", default = true, description = "False: read and write no save (captures and tests, which may run side by side)" }
+cmd = { type = "string", default = "", description = "An order from the pause menu (hud.rhai writes it, drive.rhai takes it and clears it): restart | quit" }
 
 # what drive.rhai writes
-mode = { type = "string", default = "title", description = "title | countdown | drive | over | finish" }
+mode = { type = "string", default = "title", description = "title | tour | brief | countdown | drive | results (an event or HORIZON ended) | over | finish (the arcade run ended)" }
 mode_time = { type = "f32", default = 0.0, description = "Seconds in the current mode" }
 speed = { type = "f32", default = 0.0, description = "m/s" }
 speed_kmh = { type = "f32", default = 0.0 }
 rpm = { type = "f32", default = 0.0, description = "0-1 within the current gear" }
 gear = { type = "i32", default = 1 }
 shifted = { type = "f32", default = 0.0, description = "total_time() of the last gear change" }
-throttle = { type = "f32", default = 0.0 }
-steer = { type = "f32", default = 0.0 }
+throttle = { type = "f32", default = 0.0, description = "0-1; drops to 0 for the power cut of an upshift" }
+shift_cut = { type = "f32", default = 0.0, description = "1 falling to 0 across an upshift's power cut" }
+brake = { type = "f32", default = 0.0, description = "0-1 foot brake" }
+handbrake = { type = "bool", default = false }
+steer = { type = "f32", default = 0.0, description = "-1..1 after the keyboard ramp / stick curve (+ = right)" }
+wheel_angle = { type = "f32", default = 0.0, description = "Front wheel angle, rad (+ = right): the driver's lock less the caster in a slide" }
+px = { type = "f32", default = 0.0, description = "Lateral offset from the road's centre line, m (+ = right; lanes at -4, 0, 4)" }
+yaw = { type = "f32", default = 0.0, description = "Heading: the nose's angle from the road tangent, rad (+ = right)" }
+travel = { type = "f32", default = 0.0, description = "Travel angle: the velocity's angle from the road tangent, rad" }
+slip = { type = "f32", default = 0.0, description = "yaw - travel, rad: how far the car points away from where it is going" }
+yaw_rate = { type = "f32", default = 0.0, description = "rad/s, inertial" }
+lat_g = { type = "f32", default = 0.0, description = "Lateral acceleration from the tyres, g (+ = right)" }
+long_g = { type = "f32", default = 0.0, description = "Longitudinal acceleration, g (+ = speeding up)" }
+load = { type = "f32", default = 1.0, description = "Vertical load on the tyres, 1 = level road; under 0.5 over a crest counts as air" }
+wheelspin = { type = "f32", default = 0.0, description = "0-1, the rear wheels spinning up past traction" }
+boost = { type = "f32", default = 0.0, description = "The boost meter, 0-1: filled by drifting, drafting, close passes and air" }
+boosting = { type = "bool", default = false, description = "Boost is burning this frame" }
+draft = { type = "f32", default = 0.0, description = "0-1, how deep in a slipstream the car is" }
+draft_time = { type = "f32", default = 0.0, description = "Seconds spent drafting this run (scoring hook)" }
+drift_score = { type = "f32", default = 0.0, description = "The slide in progress: degrees x m/s x seconds x 0.35; 0 when not sliding" }
+drift_banked = { type = "f32", default = 0.0, description = "The last drift banked (also the `drift` event's value)" }
+drift_total = { type = "f32", default = 0.0, description = "Drift points banked this run (scoring hook)" }
+drift_count = { type = "i32", default = 0, description = "Drifts banked this run" }
+airborne = { type = "bool", default = false }
+air_time = { type = "f32", default = 0.0, description = "Seconds off the ground in the jump in progress" }
+air_total = { type = "f32", default = 0.0, description = "Seconds of air this run (scoring hook)" }
 time_left = { type = "f32", default = 0.0 }
 score = { type = "f32", default = 0.0 }
 hi_score = { type = "f32", default = 0.0 }
@@ -27,9 +68,9 @@ run_progress = { type = "f32", default = 0.0, description = "0-1 through the who
 offroad = { type = "f32", default = 0.0, description = "0-1, smoothed" }
 skid = { type = "f32", default = 0.0, description = "0-1, how hard the tyres are sliding" }
 crash = { type = "f32", default = 0.0, description = "Seconds left in a spin-out" }
-event = { type = "string", default = "", description = "The last thing that happened: checkpoint | stage | crash | bump | near_miss | go | count | finish | over | start" }
+event = { type = "string", default = "", description = "The last thing that happened: checkpoint | stage | crash | spin | bump | near_miss | pass | drift | air | boost | go | count | finish | over | start | ui_move | ui_ok | ui_no" }
 event_time = { type = "f32", default = -100.0, description = "total_time() when `event` was set" }
-event_value = { type = "f32", default = 0.0, description = "Seconds added, bonus scored..." }
+event_value = { type = "f32", default = 0.0, description = "Seconds added, bonus scored, drift banked; for crash and spin the drift score that was lost" }
 countdown = { type = "i32", default = 0, description = "3, 2, 1 then 0 = go" }
 near_count = { type = "i32", default = 0, description = "Close overtakes this run" }
 accent_r = { type = "f32", default = 1.0, description = "The stage's edge-line colour, for the HUD" }
@@ -38,3 +79,32 @@ accent_b = { type = "f32", default = 0.7 }
 second_r = { type = "f32", default = 0.2, description = "The stage's grid colour, for the HUD" }
 second_g = { type = "f32", default = 0.8 }
 second_b = { type = "f32", default = 1.0 }
+
+# the game around the run (menus, events, results, the save)
+kind = { type = "string", default = "arcade", description = "arcade | event | endless: what the loaded road is for" }
+ev_idx = { type = "i32", default = -1, description = "The GRAND TOUR event loaded, 0-14 (scripts/lib/tour.rhai), or -1" }
+ev_type = { type = "string", default = "arcade", description = "arcade | sprint | race | drift | rush | endurance | endless" }
+n_stages = { type = "i32", default = 5, description = "Sections in the loaded road" }
+rules = { type = "bool", default = true, description = "False in rolling captures and handling tests: no clock, no results" }
+elapsed = { type = "f32", default = 0.0, description = "Seconds driven this run" }
+crashes = { type = "i32", default = 0, description = "Crashes and spin-outs this run" }
+top_speed = { type = "f32", default = 0.0, description = "m/s, this run" }
+race_pos = { type = "i32", default = 1, description = "Race: position, 1 = leading" }
+gap_ahead = { type = "f32", default = 0.0, description = "Race: seconds to the car ahead (0 = nobody)" }
+gap_behind = { type = "f32", default = 0.0, description = "Race: seconds back to the car behind (0 = nobody)" }
+name_ahead = { type = "string", default = "" }
+name_behind = { type = "string", default = "" }
+menu_title = { type = "i32", default = 0, description = "Title menu cursor: 0 ARCADE, 1 GRAND TOUR, 2 HORIZON" }
+menu_leg = { type = "i32", default = 0, description = "Tour screen cursor: leg 0-4" }
+menu_row = { type = "i32", default = 0, description = "Tour screen cursor: event 0-2 in the leg, 3 = the paint row" }
+menu_res = { type = "i32", default = 0, description = "Results cursor: 0 RETRY, 1 NEXT, 2 TOUR (HORIZON: 0 RETRY, 1 TITLE)" }
+paint = { type = "i32", default = 0, description = "Hero paint, an index into tour.rhai's paints()" }
+res_medal = { type = "i32", default = 0, description = "Results: 0 none, 1 bronze, 2 silver, 3 gold" }
+res_value = { type = "f32", default = 0.0, description = "Results: what the run is scored by (seconds left, position, drift points, close passes, score)" }
+res_best = { type = "bool", default = false, description = "Results: a new best" }
+res_fail = { type = "string", default = "", description = "Results: why the run failed (OUT OF TIME, TOO MANY CRASHES), or empty" }
+endless_best = { type = "f32", default = 0.0, description = "Best HORIZON score" }
+save_medals = { type = "string", default = "000000000000000", description = "The medal of each event as a digit, 0-3" }
+save_bests = { type = "string", default = "", description = "The best result of each event, `;`-terminated; -1 = none" }
+save_rev = { type = "i32", default = 0, description = "Counts up when the save changes" }
+dist_km = { type = "f32", default = 0.0, description = "Kilometres driven this run" }

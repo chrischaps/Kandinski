@@ -16,3 +16,6 @@ logs/
 
 # Windows artifact
 nul
+
+# Visual reference handed over at the start: third-party art, kept local
+reference/

@@ -281,8 +281,10 @@ def car_traffic_b():
 def palm():
     m = Model()
     m.material("trunk", (0.016, 0.007, 0.016))
-    m.material("frond", (0.003, 0.016, 0.012), double_sided=True)
-    m.material("trim", (0.25, 1.0, 0.7))
+    # Fronds are a dark silhouette; the script sets `trim` to the land's accent
+    # (drive.rhai, with the mountains' wire), so a palm belongs to its sky.
+    m.material("frond", (0.006, 0.003, 0.011), double_sided=True)
+    m.material("trim", (0.7, 0.12, 0.45))
     rng = random.Random(7)
     H = 8.2
     spine = lambda t: V([-1.1 * t * t + 0.25 * math.sin(t * 3.0), H * t, 0.35 * math.sin(t * 2.2)])
@@ -428,8 +430,10 @@ def sign():
 # ---------------------------------------------------------------- towers
 def tower_materials(m, window=(1.0, 0.75, 0.35), cap=(0.2, 0.85, 1.0)):
     m.material("wall", (0.006, 0.006, 0.014))
-    m.material("window", window)
-    m.material("cap", cap)
+    # Windows are lamps seen from far off, not floodlights: under the x3 ambient
+    # a colour near 1 blooms into one white slab and the skyline outshines the road.
+    m.material("window", tuple(c * 0.20 for c in window))
+    m.material("cap", tuple(c * 0.45 for c in cap))
 
 
 def block(m, rng, x0, x1, z0, z1, y0, y1, lit=0.5, pitch=3.2, floor=4.0, ww=1.5, wh=1.9, cap_r=0.16,

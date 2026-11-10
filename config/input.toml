@@ -38,10 +38,6 @@ type = "key"
 code = "ArrowUp"
 [[actions.accelerate.bindings]]
 type = "gamepad_button"
-button = "South"
-gamepad = "any"
-[[actions.accelerate.bindings]]
-type = "gamepad_button"
 button = "RightTrigger2"
 gamepad = "any"
 [[actions.accelerate.bindings]]
@@ -62,10 +58,6 @@ type = "key"
 code = "ArrowDown"
 [[actions.brake.bindings]]
 type = "gamepad_button"
-button = "West"
-gamepad = "any"
-[[actions.brake.bindings]]
-type = "gamepad_button"
 button = "LeftTrigger2"
 gamepad = "any"
 [[actions.brake.bindings]]
@@ -75,15 +67,38 @@ gamepad = "any"
 deadzone = 0.05
 scale = 1.0
 
-# --- Start / confirm ---
+# --- Handbrake: cuts rear grip, the tail steps out ---
+[actions.handbrake]
+kind = "button"
+[[actions.handbrake.bindings]]
+type = "key"
+code = "Space"
+[[actions.handbrake.bindings]]
+type = "gamepad_button"
+button = "South"
+gamepad = "any"
+
+# --- Boost: burns the meter ---
+[actions.boost]
+kind = "button"
+[[actions.boost.bindings]]
+type = "key"
+code = "ShiftLeft"
+[[actions.boost.bindings]]
+type = "gamepad_button"
+button = "West"
+gamepad = "any"
+[[actions.boost.bindings]]
+type = "gamepad_button"
+button = "RightTrigger"
+gamepad = "any"
+
+# --- Start / confirm (South only matters on the title) ---
 [actions.start]
 kind = "button"
 [[actions.start.bindings]]
 type = "key"
 code = "Enter"
-[[actions.start.bindings]]
-type = "key"
-code = "Space"
 [[actions.start.bindings]]
 type = "gamepad_button"
 button = "Start"
@@ -113,4 +128,110 @@ code = "KeyR"
 [[actions.restart.bindings]]
 type = "gamepad_button"
 button = "North"
+gamepad = "any"
+
+# --- Menus: title, tour screen, results, pause ---
+# Arrows / WASD / d-pad / left stick move, Enter / Start / A confirm,
+# Backspace / B go back. (Escape is the player's own: it closes the window.)
+[actions.confirm]
+kind = "button"
+[[actions.confirm.bindings]]
+type = "key"
+code = "Enter"
+[[actions.confirm.bindings]]
+type = "key"
+code = "NumpadEnter"
+[[actions.confirm.bindings]]
+type = "gamepad_button"
+button = "Start"
+gamepad = "any"
+[[actions.confirm.bindings]]
+type = "gamepad_button"
+button = "South"
+gamepad = "any"
+
+[actions.back]
+kind = "button"
+[[actions.back.bindings]]
+type = "key"
+code = "Backspace"
+[[actions.back.bindings]]
+type = "gamepad_button"
+button = "East"
+gamepad = "any"
+
+[actions.menu_up]
+kind = "button"
+[[actions.menu_up.bindings]]
+type = "key"
+code = "ArrowUp"
+[[actions.menu_up.bindings]]
+type = "key"
+code = "KeyW"
+[[actions.menu_up.bindings]]
+type = "gamepad_button"
+button = "DPadUp"
+gamepad = "any"
+[[actions.menu_up.bindings]]
+type = "gamepad_axis"
+axis = "LeftStickY"
+direction = "positive"
+threshold = 0.55
+gamepad = "any"
+
+[actions.menu_down]
+kind = "button"
+[[actions.menu_down.bindings]]
+type = "key"
+code = "ArrowDown"
+[[actions.menu_down.bindings]]
+type = "key"
+code = "KeyS"
+[[actions.menu_down.bindings]]
+type = "gamepad_button"
+button = "DPadDown"
+gamepad = "any"
+[[actions.menu_down.bindings]]
+type = "gamepad_axis"
+axis = "LeftStickY"
+direction = "negative"
+threshold = 0.55
+gamepad = "any"
+
+[actions.menu_left]
+kind = "button"
+[[actions.menu_left.bindings]]
+type = "key"
+code = "ArrowLeft"
+[[actions.menu_left.bindings]]
+type = "key"
+code = "KeyA"
+[[actions.menu_left.bindings]]
+type = "gamepad_button"
+button = "DPadLeft"
+gamepad = "any"
+[[actions.menu_left.bindings]]
+type = "gamepad_axis"
+axis = "LeftStickX"
+direction = "negative"
+threshold = 0.55
+gamepad = "any"
+
+[actions.menu_right]
+kind = "button"
+[[actions.menu_right.bindings]]
+type = "key"
+code = "ArrowRight"
+[[actions.menu_right.bindings]]
+type = "key"
+code = "KeyD"
+[[actions.menu_right.bindings]]
+type = "gamepad_button"
+button = "DPadRight"
+gamepad = "any"
+[[actions.menu_right.bindings]]
+type = "gamepad_axis"
+axis = "LeftStickX"
+direction = "positive"
+threshold = 0.55
 gamepad = "any"

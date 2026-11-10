@@ -1,0 +1,33 @@
+# What `flint bundle .` / `flint export web .` pack for the web player.
+# Flint's docs/design/web.md explains the format and the defaults
+# (reference/, snapshots/, tools/, engine/ but its schemas, Markdown and
+# scripts' sources in Python are already left out).
+name = "afterglow"
+scene = "scenes/kandinski.scene.toml"
+schemas = ["engine/schemas", "schemas"]
+exclude = [
+    # capture, test and calibration scenes: only the game's own scene ships
+    "scenes/_*.scene.toml",
+    "scenes/auto_*.scene.toml",
+    "scenes/tele_*.scene.toml",
+    "scenes/test_*.scene.toml",
+    "scenes/ev_*.scene.toml",
+    # captures and the presentation pages' media
+    "captures/**",
+    # a player's save is theirs
+    "save/**",
+    # launchers for the desktop build
+    "*.bat",
+    # the chooser card's picture on play.chaps.dev: served beside the bundle, not in it
+    "web/**",
+]
+
+[late]
+# Fetched first: the loops that sound from the title's first second.
+bed = ["audio/music_title.ogg", "audio/engine_low.ogg", "audio/engine_high.ogg", "audio/wind.ogg"]
+audio = ["**/*.ogg", "**/*.wav", "**/*.mp3", "**/*.flac"]
+
+[web]
+title = "AFTERGLOW"
+line = "Outrun the dark: a neon road, a clock, and fifteen events to win."
+controls = "sound on · WASD or arrows, or a pad · Space handbrake · Shift boost · Enter to choose"
