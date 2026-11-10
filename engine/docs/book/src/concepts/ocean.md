@@ -1,0 +1,392 @@
+# Ocean
+
+Flint renders an endless, physically-grounded ocean: a sum of Gerstner waves
+shaped by a JONSWAP wind-sea spectrum, drawn on a camera-following grid and
+shaded in hard cel bands. The waves are believable — real dispersion, real
+directional spread — while the *look* stays graphic.
+
+![The ocean at mid-morning](../images/ocean-hero.png)
+
+*Flat bold blues, hard-edged white foam. The wave physics is real; the shading
+is a woodblock print.*
+
+Add one `ocean` component to a scene and you have a horizon-to-horizon sea:
+
+```toml
+[entities.ocean]
+[entities.ocean.ocean]
+seed = 7
+num_waves = 12
+wavelength_min = 5.0
+wavelength_max = 70.0
+amplitude = 0.85
+choppiness = 0.7
+wind_speed = 7.0
+fetch_km = 60.0
+```
+
+One ocean per scene. The grid follows the camera, so there is no world size to
+configure and no edge to sail off.
+
+## The parity contract
+
+This is the single most important thing to know about the ocean.
+
+**`flint-core/src/ocean.rs` is the sole source of truth for wave math.** It
+builds the wave array on the CPU, and the GPU only *sums the array it is
+given* — `ocean_shader.wgsl` contains no spectrum logic of its own. That is
+what lets a script ask `ocean_height(x, z)` and get the same answer the
+renderer drew, which is what buoyancy, splash detection and camera work all
+depend on.
+
+If you change the wave math, CPU and GPU must move together. Two guards exist:
+
+- `gpu_packing_matches_cpu_evaluation` in `flint-core` asserts the packed GPU
+  layout evaluates to the CPU result.
+- A `wave_probe` script pinning a visible buoy to `ocean_height` will visibly
+  detach from the surface the moment parity breaks.
+
+A related trap: **wave phase is precomputed per frame in `f64` on the CPU and
+uploaded.** Never accumulate phase in `f32` in the shader — over a long
+session it drifts and the sea starts to shimmer.
+
+## The spectrum
+
+Waves are not chosen by hand. You describe a sea state and the spectrum
+generates the wave set.
+
+| Field | Meaning |
+|-------|---------|
+| `seed` | Spectrum RNG seed. Same seed, same ocean, forever. |
+| `num_waves` | 1–16 Gerstner waves summed. |
+| `wavelength_min` / `wavelength_max` | The band the spectrum samples, in meters. |
+| `amplitude` | Total wave amplitude (max crest height) in meters. |
+| `choppiness` | 0 = rolling swells, 1 = sharp trochoidal crests. |
+| `direction_deg` / `spread_deg` | Primary travel direction and directional spread. Short waves wander further off-axis than long ones. |
+| `speed_scale` | Time multiplier. 0 freezes the sea without flattening it. |
+| `wind_speed` | Wind in m/s — moves the JONSWAP energy peak. |
+| `fetch_km` | How far the wind has blown over open water. Longer fetch puts energy into longer swell. |
+| `peak_enhancement` | JONSWAP gamma. 1 = broad confused sea, 3.3 = typical, higher = one narrow dominant swell. |
+
+Each wave obeys the deep-water dispersion relation, so longer waves genuinely
+travel faster. `wind_speed` and `fetch_km` are the expressive controls: raising
+both moves energy into long swell and gives you an ocean that *feels* like it
+has weather behind it.
+
+### Phase-safe fields
+
+If you animate the ocean at runtime (a weather system, say), only some fields
+can change without visibly popping the sea:
+
+- **Safe to ramp:** `amplitude`, `choppiness`, `wind_speed`, `fetch_km`.
+  Regenerating the spectrum preserves existing wave phases.
+- **Load-time only:** `direction_deg`, `spread_deg`, `seed`, `speed_scale`, and
+  the wavelength band. Changing these re-rolls the wave set and the surface
+  jumps.
+
+Pick a wavelength band wide enough at load time to cover every sea state you
+intend to reach, then move energy *within* it with wind and fetch.
+
+## Shading
+
+The fragment shader is deliberately not a water shader in the photoreal sense.
+Lighting is quantized into `ramp_steps` hard bands, and foam is a hard-edged
+mask rather than a soft blend.
+
+| Field | Effect |
+|-------|--------|
+| `deep_color` / `shallow_color` | Water in wave shadow / in full light. |
+| `foam_color` | Crest foam. |
+| `sss_color` | Fake subsurface glow through backlit wave flanks. |
+| `foam_threshold` | Jacobian threshold — higher makes more foam. |
+| `foam_noise_scale` | World-space frequency of foam breakup. |
+| `ramp_steps` | Cel bands in the diffuse ramp (1–8). |
+| `specular_strength` | Sun glint. The glint is Fresnel-weighted, so it does not smear into a white disc under the camera. |
+| `band_wobble` | Noise on the band contours. 0 gives razor edges; a little wobble stops them reading as machine-made. |
+| `band_dither` / `band_dither_scale` | Halftone dot transition at band edges, in dots per meter. |
+
+Foam comes from the **Jacobian** of the Gerstner displacement — that is, from
+where the surface is actually compressing toward a breaking crest. It is a
+physical quantity, not a height threshold, which is why the foam sits where
+foam belongs even in a confused sea.
+
+The ocean **writes depth**, so scene fog applies to it like any other surface,
+with the scene's own `fog_density` and `fog_start`, all the way to the far
+plane (ADR 0078). Thin the fog and the water stays water-coloured further out.
+(It used to fog itself over a fixed 380–640 m, whatever the density, to hide the
+composite's old near-1.0 sky cut.)
+
+### Bioluminescence
+
+`foam_glow` (0 = off) makes foam emissive in `foam_glow_color`. Drive it from a
+time-of-day script to get plankton bloom nights where the wake lights up.
+
+### Contact foam
+
+Give any entity an `ocean_contact` component and the ocean grows a splash ring
+around its hull:
+
+```toml
+[entities.boat.ocean_contact]
+half_x = 1.2
+half_z = 1.15
+```
+
+The renderer tracks the hull's center, yaw and extents, differentiates its
+position for velocity, and the shader computes churn from *the water's orbital
+velocity relative to the hull, projected into the nearest hull face*. A flat
+sea stays quiet, the lee side stays quiet, and the windward face flares.
+
+| Field | Effect |
+|-------|--------|
+| `splash_strength` | Overall gain; 0 disables. |
+| `splash_width` | Max foam band width outward from the hull, in meters. |
+| `splash_baseline` | Churn floor on calm water. 0 makes foam vanish when flat. |
+| `splash_response` | Impact speed → churn gain (s/m). |
+| `splash_flicker_speed` / `splash_noise_scale` | Lapping rate and scalloped-edge frequency. |
+
+On genuinely glassy water, set `splash_baseline = 0` — a foam ring hugging a
+motionless hull on a mirror reads as a bug.
+
+### Shoreline foam
+
+Foam where the water meets anything solid: a harbour wall, a pier, a rock, a
+beach. Set a width and the ocean finds its own shores:
+
+```toml
+[entities.ocean.ocean]
+shore_foam_width = 0.3     # metres of water depth that foam (0 = off)
+shore_foam_strength = 0.9
+shore_foam_speed = 1.0
+shore_foam_color = [0.95, 0.88, 0.80, 1.0]
+```
+
+The ocean already reads the grab pass's depth for refraction. For each water
+pixel it takes the opaque point behind it on the same view ray and measures how
+far that point lies below the surface. Where it's within `shore_foam_width`, the
+pixel foams. A wall or a pier running down into the water is shallow right
+beside it, and a beach is shallow where it shelves up, so no mask is needed.
+The band is solid against the shore and laced toward its open edge, with the
+same lace noise as the crest foam. It laps three ways: the surface's own wave
+height raises and lowers it, a slow surge (`shore_foam_speed`) runs along the
+shore, and the foam noise breaks up its edge. It fades with distance like the
+crest foam (60 to 140 m).
+
+| Field | Effect |
+|-------|--------|
+| `shore_foam_width` | Depth below the surface that foams, in metres. 0 (the default) turns it off. |
+| `shore_foam_strength` | Opacity gain. |
+| `shore_foam_speed` | Lapping rate; 0 holds the band still (the waves still move it). |
+| `shore_foam_color` | Its own colour, so shore foam can be warmer or dirtier than crest foam. It is lit like the crest foam: the same sun, ambient and sky glow. |
+| `shore_foam_reach` | Turns on the shore search (below): a solid standing up to this many metres above the surface counts as the shore. 0 (the default) measures along the view ray only. |
+
+It needs the grab pass, so it's off without post-processing.
+
+Measured along the view ray alone, **a wall's band depends on the view.** Out
+from a wall the band is `shore_foam_width` over the tangent of the ray's
+elevation: broad from a low camera, a hairline from overhead. Worse, at the
+foot of the wall nearer the camera, the ray runs away from the wall to the bed,
+so that wall has no band at all.
+
+**The shore search fixes both.** Set `shore_foam_reach` and each water pixel
+also reads the depth at 24 pixels round it (8 directions, 3 steps out to the
+band's widest on screen). It rebuilds the scene point at each one, and the
+band is measured to the nearest one that is shore: the larger of its distance
+across the water and its depth below the surface. A wall is then measured
+across the water, so its band is `shore_foam_width` wide from any angle, and
+the near wall's band is found from the kerb above it. A gentle beach is still
+measured by its depth. Set the reach just above your walls' tops: solids
+higher than that, such as a bridge deck or someone standing on the quay, aren't
+shore, so they don't paint foam on the water under their edge. The search
+only finds what's on screen. That's where a band can show, though a wall
+cut off by the frame's edge doesn't foam the water beside it. It costs up to
+24 depth reads on water pixels within the foam's 140 m, and nothing when the
+band is under a pixel wide.
+
+Either way, keep the width to the waves' height plus a little, or a whole
+gentle shelf turns white.
+
+The scene's `foam_noise_scale` sets the size of the lace, for crest and shore
+foam alike. Shore foam counts toward `foam_glow` like flecks do.
+
+### Rain
+
+`rain_ripple` (0..1) scatters expanding impact rings across the surface,
+hashed on a world-space grid and scanned over a 3×3 cell neighborhood so rings
+crossing cell boundaries do not tile into visible squares. They fade out by
+~30 m. Drive it from the same weather signal that drives your rain particles.
+
+## Water clarity
+
+With post-processing enabled the ocean does a grab pass and refracts whatever
+is underwater:
+
+| Field | Effect |
+|-------|--------|
+| `turbidity` | 0 = glass-clear, high = murk within half a meter. |
+| `refraction_strength` | Screen-space distortion of submerged geometry. |
+| `absorption_color` | Per-channel absorption rate. Red dies first in seawater. |
+| `sky_reflection_strength` | Fresnel-weighted analytic sky reflection. Needs a `sky` component. |
+
+The sky reflection is a snapshot of the procedural sky's gradient, so
+reflections track the time of day for free. It deliberately contains **no sun
+disc** — the cel specular already *is* the sun's reflection, and including it
+here would draw two suns.
+
+Surfaces seen from below flip their normal and drop both sky reflection and
+specular, so the underside of the water reads as water rather than as an opaque
+mirror of the sky.
+
+## The grid
+
+| Field | Effect |
+|-------|--------|
+| `grid_scale` | Inner metric scale of the camera-following grid, in meters. |
+| `fade_start` / `fade_end` | Where wave displacement starts fading and where the ocean goes flat. |
+
+The mesh is a normalized grid, radially warped so the center has sub-meter
+cells and the rim reaches kilometers — past the geometric horizon at eye
+height, so the water's edge is never visible. It follows the camera snapped to
+inner-cell multiples, which keeps waves world-anchored instead of swimming
+with the view.
+
+## Water bodies
+
+The sea is one sheet at y = 0. A lake at its own level or a river falling
+down a valley is a **water body** (ADR 0094): a mesh of its own, shaded by
+the same shader (waves, Fresnel, refraction, the cel ramp, the shoreline
+band) with its own tint, wave height and flow. A scene can have as many as
+it likes, with or without an `ocean`.
+
+![A tarn above the sea, a river falling into it, its outflow falling on](../images/water-bodies.png)
+
+*`demo/water_bodies.scene.toml`: the tarn sits 6 m up, the river off the
+plateau falls into it, and the outflow falls on to the sea. Fast water foams
+white along its flow.*
+
+In a scene, a `water_body` component describes the mesh:
+
+```toml
+# A lake: still water filling an outline at a level.
+[entities.tarn.water_body]
+shape = "lake"
+level = 6.0
+outline = [[-18, -8], [18, -8], [18, -30], [-18, -30]]   # [x, z], either winding
+deep_color = [0.025, 0.17, 0.18, 1.0]
+shallow_color = [0.09, 0.40, 0.37, 1.0]
+wave_scale = 0.12
+
+# A river: a ribbon down a centre line, upstream first.
+[entities.falls.water_body]
+shape = "river"
+path = [[4, 12, -58], [4, 12, -31], [4, 6.1, -27.6], [4, 5.5, -26.4]]
+width = 5.4
+speed = 1.2          # m/s on the level; the banks run at 35%
+fall_speedup = 1.2   # × (1 + fall_speedup × slope) at the foot of a drop
+```
+
+From Rust, a `PlayerExtension` hands its own mesh to `ExtensionGpu`:
+
+```rust
+use flint_player::{river_points, WaterBodyLook, WaterBodyMesh};
+
+let mesh = WaterBodyMesh::river(&river_points(&path, 5.4, 1.2, 1.2))?;
+gpu.set_water_body("falls", &mesh, WaterBodyLook::default())?;
+```
+
+`WaterBodyMesh::lake` and `river` are builders; any mesh of `WaterVertex`es
+works (`position`, a rest `normal`, and an XZ `flow` in m/s).
+`set_water_body_look`, `remove_water_body` and `clear_water_bodies` do the
+rest.
+
+| `WaterBodyLook` | Meaning |
+|-------|---------|
+| `deep_color`, `shallow_color` | The body's tint. `None` takes the ocean's, as it stands this frame. |
+| `wave_scale` | The ocean's waves, scaled: 0 a mirror, 1 the open sea (default 0.3). |
+| `flow_foam` | White water where the flow is fast, from about 0.5 m/s and full by 3.5 (default 1). |
+| `flow_period` | Seconds between the flow's phase resets (default 2): longer pulses less, shorter stretches less. |
+| `shore_foam` | The shoreline band's width, as a share of the ocean's `shore_foam_width` (default 1; 0 none). |
+
+How it works:
+
+- **Same shader, second vertex stage.** `vs_body` displaces the mesh about its
+  rest surface with the ocean's wave array, scaled by `wave_scale`. The
+  fragment shader is the sea's. The sea binds a body block of its own (its
+  colours, full waves, no flow), so its look doesn't change.
+- **Flow is advected in two phases.** Waves and foam at a point are sampled
+  where the water was, `p − flow·age`, in two phases half a period apart, each
+  fading out as its age resets. A noise offset staggers the phase from place
+  to place, so a body never pulses all at once. Still water skips the second
+  evaluation.
+- **Falls tilt the waves.** The wave normal is added to the vertex's rest
+  normal, so water running down a step catches the light as a slope does.
+- **Draw order.** Bodies draw after the sea in the same pass, depth-tested
+  and depth-writing, so a lake above sea level hides the sea under it and the
+  composite fogs it. They refract through the same grab pass.
+- **Everything else is the ocean's.** Foam, refraction, turbidity, sky
+  reflection and the shoreline band come from the `ocean` component, or the
+  default ocean when the scene has none.
+- **The shoreline band scales per body** (ADR 0099). The band foams wherever
+  the bed is within `shore_foam_width` of the surface, so a stream or a
+  shallow river whose whole bed is that shallow foams from bank to bank.
+  `shore_foam` narrows the band on that body alone (0.2 leaves a hairline at
+  the banks; 0 turns it off) and keeps its colour, strength and pace.
+
+Limits: a body's waves move its vertices only as finely as it's tessellated
+(normals are per pixel, so the look holds on a coarse lake). `ocean_height`
+knows only the sea. A lake's outline has no holes: triangulate an island
+yourself and pass the mesh. Bodies aren't frustum-culled.
+
+## Querying the ocean from scripts
+
+```rhai
+let h  = ocean_height(x, z);        // Eulerian surface height (m)
+let v  = ocean_velocity_y(x, z);    // vertical surface velocity (m/s)
+let n  = ocean_normal(x, z);        // #{x, y, z} surface normal
+```
+
+`ocean_height` is what buoyancy is built on — sample it at a few points under a
+hull and drive the transform from the result:
+
+```rhai
+fn on_update() {
+    let me = entity();
+    let p = get_field(me, "transform", "position");
+    let h = ocean_height(p.x, p.z);
+    // ... ease the hull toward h, tilt from ocean_normal ...
+}
+```
+
+`ocean_velocity_y` is the analytic ∂h/∂t, not a finite difference, and it is
+the signal you want for impact cues: the *relative approach speed* between
+water and hull tells you how hard a wave struck, which is what separates a lap
+from a slam.
+
+Sampling is cheap enough for a handful of probes per frame. It is not cheap
+enough for thousands.
+
+## Debugging
+
+The **Ocean Debug** panel (`F3` in the player) exposes the whole component
+live — spectrum, colors, foam, contact foam, band edges, clarity, grid — and
+**Commit to File** writes your tuning back into the scene TOML.
+
+`show_probe` parks a bright buoy on the surface as a standing CPU/GPU parity
+check.
+
+Headless:
+
+```bash
+flint render scene.toml --schemas schemas --width 2560 --height 1440 --no-grid \
+  --distance 9 --pitch 18 --yaw 35 --target 0,0.4,0
+```
+
+Note that `flint render` runs **no scripts**. If your hull floats by script,
+it will render at its authored transform rather than on the water — frame
+around it, or bake a fixture scene with the values you want.
+
+## See also
+
+- [Sky](sky.md) — the procedural sky the ocean reflects
+- [Post-Processing](post-processing.md) — including underwater render mode 5
+- [Scripting](scripting.md) — the full Rhai API
