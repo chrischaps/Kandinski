@@ -9,6 +9,15 @@
 // draws them. The one exception is pause: on_draw_ui is the one callback
 // that still runs while the game state is "paused", so the pause menu's
 // cursor lives here and its choice goes to drive.rhai as game_state.cmd.
+//
+// Touch: the engine's stick and buttons (config/input.toml [touch_controls])
+// are out only in the countdown and the drive; every other screen is tapped.
+// A tap is tested against the rectangle its row was just drawn from, and what
+// it chose goes to drive.rhai as game_state.cmd too (title:n | ev:n | paint:n
+// | res:n | ok | back), since drive.rhai owns the cursors. Rows and buttons
+// are at least TOUCH_MIN points tall on any device (so nothing moves under the
+// first finger); while a finger was the last device (`touch`) the BACK and
+// START buttons appear and the hint lines speak of thumbs and taps.
 
 import "tour" as tour;
 
@@ -21,6 +30,9 @@ let msg_kind = "";
 let flash_t = -100.0;
 let ui_t = 0.0;
 let p_sel = 0;                // pause menu cursor
+let touch_mode = false;       // the last deliberate input was a finger (a mouse leaves it as it was)
+let tc_out = -1;              // the last set_touch_controls(): -1 not yet, 0 away, 1 out
+let TOUCH_MIN = 44.0;         // points: the least height of anything meant for a thumb
 let EVENTS = [];
 let LEGS = [];
 let PAINTS = [];
@@ -100,6 +112,19 @@ fn panel(x, y, w, h, c, fill_a, line_a, u) {
     draw_rect_outline_ex(x, y, w, h, c[0], c[1], c[2], line_a, 1.5 * u, 6.0 * u, 12);
 }
 
+// whether a tap landed in the rectangle r = [x, y, w, h] (points)
+fn hit(taps, r) {
+    for t in taps { if t[0] >= r[0] && t[0] < r[0] + r[2] && t[1] >= r[1] && t[1] < r[1] + r[3] { return true; } }
+    false
+}
+
+// a menu button: the rectangle r, its word centred in it
+fn button(r, s, size, c, line_a, text_a, sel, u) {
+    draw_rect_ex(r[0], r[1], r[2], r[3], 0.035, 0.012, 0.085, 0.92, 5.0 * u, 11);
+    draw_rect_outline_ex(r[0], r[1], r[2], r[3], c[0], c[1], c[2], line_a, (if sel { 2.0 } else { 1.0 }) * u, 5.0 * u, 12);
+    mtext(r[0] + r[2] * 0.5, r[1] + (r[3] - size * 1.2) * 0.5, s, size, "hud", c, text_a, "center");
+}
+
 fn ordinal(p) { if p == 1 { "1ST" } else if p == 2 { "2ND" } else if p == 3 { "3RD" } else { `${p}TH` } }
 
 fn traffic_word(n) { if n <= 0 { "NONE" } else if n <= 5 { "LIGHT" } else if n <= 8 { "MEDIUM" } else { "HEAVY" } }
@@ -130,6 +155,7 @@ fn on_init() {
     PAINTS = tour::paints();
     THEMES = tour::theme_names();
     for e in EVENTS { medals.push(0); bests.push(-1.0); }
+    set_touch_controls(false);          // the game opens on a menu
 }
 
 fn on_draw_ui() {
@@ -145,7 +171,14 @@ fn on_draw_ui() {
     let mode = gs.mode;
     let mt = gs.mode_time;
     let kind = gs.kind;
-    let pad = last_input_device() == "gamepad";
+    let dev = last_input_device();
+    let pad = dev == "gamepad";
+    if dev == "touch" { touch_mode = true; } else if dev == "keyboard" || pad { touch_mode = false; }
+    let touch = touch_mode || touch_controls_visible();
+    let tmin = TOUCH_MIN;         // on a small screen rows are a thumb high whatever the device, so nothing moves under the first finger
+    let taps = [];
+    for i in 0..tap_count() { taps.push([tap_x(i) * sw, tap_y(i) * sh]); }
+    let tap_cmd = "";
 
     // the save, as drive.rhai last published it
     let key = gs.save_medals + gs.save_bests;
@@ -185,6 +218,9 @@ fn on_draw_ui() {
             pop_state(); paused = false;
         }
     }
+    // the stick and buttons are out only while there is a car to drive
+    let want_tc = if (mode == "drive" || mode == "countdown") && !paused { 1 } else { 0 };
+    if want_tc != tc_out { set_touch_controls(want_tc == 1); tc_out = want_tc; }
 
     // ── events become words ─────────────────────────────────────
     if gs.event_time != seen_event_time {
@@ -236,10 +272,16 @@ fn on_draw_ui() {
             if !open { "LOCKED: WIN A MEDAL IN EVERY EVENT OF LEG 1" } else if gs.endless_best > 0.0 { `THE ROAD THAT DOES NOT END      BEST ${pad_int(gs.endless_best.to_int(), 8)}` } else { "THE ROAD THAT DOES NOT END" },
         ];
         let my = sh * 0.545;
+        let pitch = max(62.0 * u, tmin + 2.0);
+        let rw = max(600.0 * u, 6.5 * tmin);
         for i in 0..3 {
             let sel = gs.menu_title == i;
             let locked = i == 2 && !open;
-            let yy = my + i.to_float() * 62.0 * u;
+            // the row: what a tap is tested against, and where its words sit
+            let row = [cx - rw * 0.5, my + i.to_float() * pitch - 4.0 * u, rw, pitch - 2.0];
+            let yy = my + i.to_float() * pitch + (pitch - 62.0 * u) * 0.5;
+            if touch { draw_rect_outline_ex(row[0], row[1], row[2], row[3], 0.7, 0.8, 1.0, (if sel { 0.34 } else { 0.16 }) * a, 1.0, 5.0 * u, 4); }
+            if a > 0.3 && hit(taps, row) { tap_cmd = `title:${i}`; }
             let c = if locked { [0.5, 0.45, 0.65] } else if sel { [1.0, 0.9, 0.5] } else { [0.7, 0.8, 1.0] };
             let pulse = if sel { 0.85 + 0.15 * sin(ui_t * 6.0) } else { 0.62 };
             if sel {
@@ -254,11 +296,13 @@ fn on_draw_ui() {
             draw_text_opts(cx, yy + (if sel { 42.0 } else { 36.0 }) * u, subs[i], 12.0 * u,
                 #{ font: "mono", align: "center", color: [c[0], c[1], c[2], (if sel { 0.85 } else { 0.45 }) * a], layer: 5 });
         }
-        let hint1 = if pad { "STICK / D-PAD  CHOOSE     A / START  GO" } else { "UP DOWN  CHOOSE     ENTER  GO" };
-        let hint2 = if pad { "RT  ACCELERATE   LT  BRAKE   STICK  STEER   A  HANDBRAKE   X / RB  BOOST   BACK  PAUSE" }
+        let hint1 = if touch { "TAP  A  ROAD" } else if pad { "STICK / D-PAD  CHOOSE     A / START  GO" } else { "UP DOWN  CHOOSE     ENTER  GO     OR  TAP  A  ROAD" };
+        let hint2 = if touch { "LEFT THUMB  STEER     THE GAS IS AUTOMATIC     RIGHT THUMB  BRAKE  DRIFT  BOOST" } else if pad { "RT  ACCELERATE   LT  BRAKE   STICK  STEER   A  HANDBRAKE   X / RB  BOOST   BACK  PAUSE" }
             else { "W/UP  ACCELERATE   S/DOWN  BRAKE   A D  STEER   SPACE  HANDBRAKE   SHIFT  BOOST   P  PAUSE" };
-        draw_text_opts(cx, sh * 0.925, hint1, 13.0 * u, #{ font: "mono", align: "center", color: [1.0, 0.85, 0.55, 0.8 * a], layer: 5 });
-        draw_text_opts(cx, sh * 0.955, hint2, 12.0 * u, #{ font: "mono", align: "center", color: [0.75, 0.8, 1.0, 0.6 * a], layer: 5 });
+        let hs = max(12.0 * u, tmin * 0.21);
+        draw_text_opts(cx, sh * 0.925, hint1, max(13.0 * u, hs), #{ font: "mono", align: "center", color: [1.0, 0.85, 0.55, 0.8 * a], layer: 5 });
+        draw_text_opts(cx, sh * 0.955, hint2, hs, #{ font: "mono", align: "center", color: [0.75, 0.8, 1.0, 0.6 * a], layer: 5 });
+        if tap_cmd != "" { set_field(game, "game_state", "cmd", tap_cmd); }
         return;
     }
 
@@ -268,7 +312,18 @@ fn on_draw_ui() {
         draw_rect_ex(0.0, 0.0, sw, sh, 0.02, 0.0, 0.05, 0.80 * a, 0.0, 10);
         let x0 = 40.0 * u;
         let W = sw - 80.0 * u;
-        draw_text_opts(x0, 20.0 * u, "GRAND TOUR", 46.0 * u, #{ font: "title", layer: 13, color: [0.55, 0.97, 1.0, a] });
+        // a phone has no back gesture a game can hear: BACK is a button, beside the title
+        let back_w = 0.0;
+        if touch {
+            let bh = max(44.0 * u, tmin);
+            let rb = [x0, 54.0 * u - bh * 0.5, max(104.0 * u, 2.0 * tmin), bh];
+            button(rb, "BACK", max(14.0 * u, 11.0), PALE, 0.5 * a, a, false, u);
+            let bm = rb[1] + bh * 0.5;
+            draw_polygon([[rb[0] + 10.0 * u, bm], [rb[0] + 19.0 * u, bm - 6.0 * u], [rb[0] + 19.0 * u, bm + 6.0 * u]], PALE[0], PALE[1], PALE[2], a, 13);
+            if hit(taps, rb) { tap_cmd = "back"; }
+            back_w = rb[2] + 18.0 * u;
+        }
+        draw_text_opts(x0 + back_w, 20.0 * u, "GRAND TOUR", 46.0 * u, #{ font: "title", layer: 13, color: [0.55, 0.97, 1.0, a] });
         // medal tally
         let cnt = [0, 0, 0, 0];
         for m in medals { cnt[m] += 1; }
@@ -286,6 +341,8 @@ fn on_draw_ui() {
         let top = 104.0 * u;
         let ch = 78.0 * u;
         let sel_i = gs.menu_leg * 3 + (if gs.menu_row < 3 { gs.menu_row } else { 2 });
+        // a card's tap target: the card and, for a thumb, up to half the gap either side
+        let cg = clamp((tmin - ch) * 0.5, 0.0, 4.0 * u);
         for leg in 0..5 {
             let x = x0 + leg.to_float() * (cw + gap);
             let leg_open = tour::unlocked(leg * 3, medals);
@@ -302,6 +359,7 @@ fn on_draw_ui() {
                 let tc = type_rgb(e.type);
                 let dim = if open { 1.0 } else { 0.38 };
                 let line = if sel { [1.0, 0.9, 0.5] } else { tc };
+                if hit(taps, [x, y - cg, cw, ch + 2.0 * cg]) { tap_cmd = `ev:${i}`; }
                 draw_rect_ex(x, y, cw, ch, if sel { 0.10 } else { 0.035 }, if sel { 0.05 } else { 0.012 }, if sel { 0.16 } else { 0.085 }, 0.92 * a, 5.0 * u, 11);
                 draw_rect_outline_ex(x, y, cw, ch, line[0], line[1], line[2], (if sel { 0.75 + 0.25 * sin(ui_t * 6.0) } else { 0.35 * dim }) * a, (if sel { 2.0 } else { 1.0 }) * u, 5.0 * u, 12);
                 draw_rect_ex(x + 8.0 * u, y + 10.0 * u, 3.0 * u, ch - 20.0 * u, tc[0], tc[1], tc[2], 0.9 * dim * a, 0.0, 12);
@@ -353,7 +411,8 @@ fn on_draw_ui() {
         let py = dy + dh + 14.0 * u;
         let pfocus = gs.menu_row == 3;
         let have = cnt[1] + cnt[2] + cnt[3];
-        mtext(x0 + 2.0 * u, py + 8.0 * u, "PAINT", 13.0 * u, "hud", if pfocus { GOLD } else { PALE }, a, "left");
+        let ph = max(34.0 * u, tmin);
+        mtext(x0 + 2.0 * u, py + (ph - 18.0 * u) * 0.5, "PAINT", 13.0 * u, "hud", if pfocus { GOLD } else { PALE }, a, "left");
         let pw = 210.0 * u;
         for k in 0..PAINTS.len() {
             let P = PAINTS[k];
@@ -363,14 +422,16 @@ fn on_draw_ui() {
             let c = P.c;
             let mxc = max(max(c[0], c[1]), c[2]);
             let sc = [0.25 + 0.75 * c[0] / mxc, 0.25 + 0.75 * c[1] / mxc, 0.25 + 0.75 * c[2] / mxc];
-            draw_rect_ex(x, py, pw, 34.0 * u, 0.035, 0.012, 0.085, 0.92 * a, 5.0 * u, 11);
-            draw_rect_outline_ex(x, py, pw, 34.0 * u, if cur && pfocus { 1.0 } else { sc[0] }, if cur && pfocus { 0.9 } else { sc[1] }, if cur && pfocus { 0.5 } else { sc[2] },
+            if hit(taps, [x, py, pw, ph]) { tap_cmd = `paint:${k}`; }
+            draw_rect_ex(x, py, pw, ph, 0.035, 0.012, 0.085, 0.92 * a, 5.0 * u, 11);
+            draw_rect_outline_ex(x, py, pw, ph, if cur && pfocus { 1.0 } else { sc[0] }, if cur && pfocus { 0.9 } else { sc[1] }, if cur && pfocus { 0.5 } else { sc[2] },
                 (if cur { if pfocus { 0.75 + 0.25 * sin(ui_t * 6.0) } else { 0.8 } } else { 0.25 }) * a, (if cur { 2.0 } else { 1.0 }) * u, 5.0 * u, 12);
-            draw_rect_ex(x + 8.0 * u, y_mid(py, u), 18.0 * u, 18.0 * u, sc[0], sc[1], sc[2], (if got { 1.0 } else { 0.3 }) * a, 3.0 * u, 12);
-            mtext(x + 34.0 * u, py + 10.0 * u, if got { P.name } else { `${P.need} MEDALS` }, 11.0 * u, "hud", if got { WHITE } else { [0.6, 0.55, 0.75] }, (if got { 1.0 } else { 0.7 }) * a, "left");
+            draw_rect_ex(x + 8.0 * u, py + (ph - 18.0 * u) * 0.5, 18.0 * u, 18.0 * u, sc[0], sc[1], sc[2], (if got { 1.0 } else { 0.3 }) * a, 3.0 * u, 12);
+            mtext(x + 34.0 * u, py + (ph - 14.0 * u) * 0.5, if got { P.name } else { `${P.need} MEDALS` }, 11.0 * u, "hud", if got { WHITE } else { [0.6, 0.55, 0.75] }, (if got { 1.0 } else { 0.7 }) * a, "left");
         }
-        let hint = if pad { "STICK / D-PAD  CHOOSE     A  DRIVE     B  TITLE" } else { "ARROWS / WASD  CHOOSE     ENTER  DRIVE     BACKSPACE  TITLE" };
-        mtext(cx, sh - 26.0 * u, hint, 12.0 * u, "mono", GOLD, 0.75 * a, "center");
+        let hint = if touch { "TAP AN EVENT FOR ITS BRIEFING     TAP A PAINT TO WEAR IT" } else if pad { "STICK / D-PAD  CHOOSE     A  DRIVE     B  TITLE" } else { "ARROWS / WASD  CHOOSE     ENTER  DRIVE     BACKSPACE  TITLE" };
+        mtext(cx, max(sh - 26.0 * u, py + ph + 5.0 * u), hint, max(12.0 * u, tmin * 0.21), "mono", GOLD, 0.75 * a, "center");
+        if tap_cmd != "" { set_field(game, "game_state", "cmd", tap_cmd); }
         return;
     }
 
@@ -402,8 +463,21 @@ fn on_draw_ui() {
         let bt = if bests[ei] >= 0.0 { `YOUR BEST   ${tour::value_text(E, bests[ei])}` } else { "YOUR BEST   NOT YET DRIVEN" };
         mtext(cx, y + 346.0 * u, bt, 13.0 * u, "hud", if medals[ei] > 0 { medal_rgb(medals[ei]) } else { PALE }, 0.95 * a, "center");
         let blink = if (ui_t * 1.6).to_int() % 2 == 0 { 1.0 } else { 0.35 };
-        let pr = if pad { "A  START          B  BACK" } else { "ENTER  START          BACKSPACE  BACK" };
-        mtext(cx, y + h + 18.0 * u, pr, 16.0 * u, "hud", GOLD, blink * a, "center");
+        if touch {
+            // two buttons under the card: BACK on the left, START under the right thumb
+            let bh = max(44.0 * u, tmin);
+            let bw = max(220.0 * u, 3.0 * tmin);
+            let bs = max(16.0 * u, 12.0);
+            let rb = [cx - bw - 14.0 * u, y + h + 12.0 * u, bw, bh];
+            let rs = [cx + 14.0 * u, y + h + 12.0 * u, bw, bh];
+            button(rb, "BACK", bs, PALE, 0.5 * a, a, false, u);
+            button(rs, "START", bs, GOLD, (0.75 + 0.25 * sin(ui_t * 6.0)) * a, a, true, u);
+            if hit(taps, rs) { tap_cmd = "ok"; } else if hit(taps, rb) { tap_cmd = "back"; }
+            if tap_cmd != "" { set_field(game, "game_state", "cmd", tap_cmd); }
+        } else {
+            let pr = if pad { "A  START          B  BACK" } else { "ENTER  START          BACKSPACE  BACK" };
+            mtext(cx, y + h + 18.0 * u, pr, 16.0 * u, "hud", GOLD, blink * a, "center");
+        }
         return;
     }
 
@@ -536,9 +610,24 @@ fn on_draw_ui() {
         let fr = if burn { 1.0 } else { ar }; let fg = if burn { 0.97 } else { ag }; let fb = if burn { 0.75 } else { ab };
         draw_polygon([[bx0 + 3.0 * u, by0], [bx0 + fw + 3.0 * u, by0], [bx0 + fw, by0 + bh], [bx0, by0 + bh]], fr, fg, fb, pulse, 5);
     }
-    if !burn && bv > 0.06 {
+    if !burn && bv > 0.06 && !touch {
         let key = if pad { "X" } else { "SHIFT" };
         draw_text_opts(bx0 + bw2 + 12.0 * u, by0 - 2.0 * u, key, 9.0 * u, #{ font: "mono", color: [1.0, 0.9, 0.55, if full { 1.0 } else { 0.6 }], layer: 5 });
+    }
+
+    // touch: nobody holds a pedal, and the dash says so. The countdown spells the thumbs out.
+    if touch_controls_visible() {
+        let hs = max(11.0 * u, 9.0);
+        draw_text_opts(cx + dw - 6.0 * u, y0 - hs - 5.0 * u, "AUTO GAS", hs, #{ font: "mono", align: "right", color: [1.0, 0.9, 0.55, 0.75], layer: 5 });
+        if mode == "countdown" {
+            let ha = clamp(mt * 2.0 - 1.0, 0.0, 1.0);
+            let hy = sh * 0.50;
+            let ts = max(15.0 * u, 11.0);
+            draw_text_opts(cx, hy, "LEFT THUMB STEERS     THE GAS IS AUTOMATIC", ts, #{ font: "mono", align: "center", color: [1.0, 0.9, 0.55, 0.95 * ha], layer: 6,
+                shadow: [0.0, 1.0, 0.0, 0.0, 0.0, 0.7 * ha] });
+            draw_text_opts(cx, hy + ts * 1.5, "RIGHT THUMB     BRAKE     DRIFT     BOOST", ts, #{ font: "mono", align: "center", color: [0.75, 0.9, 1.0, 0.95 * ha], layer: 6,
+                shadow: [0.0, 1.0, 0.0, 0.0, 0.0, 0.7 * ha] });
+        }
     }
 
     // sliding: the score building, live, over the dash, and the angle on a
@@ -622,7 +711,8 @@ fn on_draw_ui() {
         draw_rect_ex(0.0, 0.0, sw, sh, 0.02, 0.0, 0.05, 0.45 * a, 0.0, 1);
         glow_text(cx, sh * 0.30, "GAME OVER", 84.0 * u, "hud", 1.0, 0.2, 0.45, a, "center", 8.0 * u);
         label(cx, sh * 0.30 + 104.0 * u, `STAGE ${gs.stage + 1}  ${gs.stage_name}`, 20.0 * u, 0.7, 0.85, 1.0, a, "center");
-        if mt > 1.5 { label(cx, sh * 0.30 + 150.0 * u, "ENTER  TO  CONTINUE", 16.0 * u, 1.0, 0.9, 0.5, 0.5 + 0.5 * sin(now * 5.0), "center"); }
+        if mt > 1.5 { label(cx, sh * 0.30 + 150.0 * u, if touch { "TAP  TO  CONTINUE" } else { "ENTER  TO  CONTINUE" }, max(16.0 * u, tmin * 0.27), 1.0, 0.9, 0.5, 0.5 + 0.5 * sin(now * 5.0), "center"); }
+        if mt > 1.5 && taps.len() > 0 { tap_cmd = "ok"; }           // anywhere
     } else if mode == "finish" {
         let a = clamp(mt / 0.6, 0.0, 1.0);
         glow_text(cx, sh * 0.22, "GOAL", 120.0 * u, "hud", 1.0, 0.9, 0.4, a, "center", 14.0 * u);
@@ -630,6 +720,8 @@ fn on_draw_ui() {
         if mt > 1.2 {
             label(cx, sh * 0.22 + 178.0 * u, `TIME BONUS  +${gs.event_value.to_int()}`, 18.0 * u, 1.0, 0.85, 0.5, clamp(mt - 1.2, 0.0, 1.0), "center");
         }
+        if mt > 1.5 && touch { label(cx, sh * 0.22 + 216.0 * u, "TAP  TO  CONTINUE", max(16.0 * u, tmin * 0.27), 1.0, 0.9, 0.5, 0.5 + 0.5 * sin(now * 5.0), "center"); }
+        if mt > 1.5 && taps.len() > 0 { tap_cmd = "ok"; }
     }
 
     // ── results ─────────────────────────────────────────────────
@@ -696,17 +788,18 @@ fn on_draw_ui() {
             let opts = if kind == "event" { ["RETRY", "NEXT EVENT", "TOUR"] } else { ["RETRY", "TITLE"] };
             let n = opts.len();
             let oy = y + h + 16.0 * u;
+            let rh = max(40.0 * u, tmin);
             for k in 0..n {
                 let ox = cx + (k.to_float() - (n - 1).to_float() * 0.5) * 230.0 * u;
                 let sel = gs.menu_res == k;
                 let dead = n == 3 && k == 1 && !has_next;
                 let c = if dead { [0.45, 0.42, 0.6] } else if sel { GOLD } else { PALE };
-                draw_rect_ex(ox - 100.0 * u, oy, 200.0 * u, 40.0 * u, 0.035, 0.012, 0.085, 0.92, 5.0 * u, 11);
-                draw_rect_outline_ex(ox - 100.0 * u, oy, 200.0 * u, 40.0 * u, c[0], c[1], c[2], if sel { 0.75 + 0.25 * sin(ui_t * 6.0) } else { 0.3 }, (if sel { 2.0 } else { 1.0 }) * u, 5.0 * u, 12);
-                mtext(ox, oy + 11.0 * u, opts[k], 15.0 * u, "hud", c, if dead { 0.6 } else { 1.0 }, "center");
+                let r = [ox - 100.0 * u, oy, 200.0 * u, rh];
+                button(r, opts[k], max(15.0 * u, tmin * 0.25), c, if sel { 0.75 + 0.25 * sin(ui_t * 6.0) } else { 0.3 }, if dead { 0.6 } else { 1.0 }, sel, u);
+                if hit(taps, r) { tap_cmd = `res:${k}`; }
             }
             if kind == "event" && rm == 0 && !has_next {
-                mtext(cx, oy + 50.0 * u, "A MEDAL OPENS THE NEXT EVENT", 11.0 * u, "mono", PALE, 0.7, "center");
+                mtext(cx, oy + rh + 10.0 * u, "A MEDAL OPENS THE NEXT EVENT", 11.0 * u, "mono", PALE, 0.7, "center");
             }
         }
     }
@@ -724,18 +817,23 @@ fn on_draw_ui() {
         draw_text_opts(cx, sh * 0.24, "PAUSED", 72.0 * u, #{ font: "hud", align: "center", layer: 13, spacing: 8.0 * u,
             color: [0.5, 0.95, 1.0, 1.0], stroke: [0.2, 0.8, 1.0, 0.3, 1.0] });
         let opts = ["RESUME", "RESTART", if kind == "event" { "QUIT TO TOUR" } else { "QUIT TO TITLE" }];
+        let rh = max(44.0 * u, tmin);
+        let pitch = rh + 12.0 * u;
+        let pick = -1;
         for k in 0..3 {
             let sel = p_sel == k;
-            let oy = sh * 0.24 + 130.0 * u + k.to_float() * 56.0 * u;
-            let c = if sel { GOLD } else { PALE };
-            draw_rect_ex(cx - 150.0 * u, oy, 300.0 * u, 44.0 * u, 0.035, 0.012, 0.085, 0.92, 5.0 * u, 11);
-            draw_rect_outline_ex(cx - 150.0 * u, oy, 300.0 * u, 44.0 * u, c[0], c[1], c[2], if sel { 0.75 + 0.25 * sin(ui_t * 6.0) } else { 0.3 }, (if sel { 2.0 } else { 1.0 }) * u, 5.0 * u, 12);
-            mtext(cx, oy + 12.0 * u, opts[k], 17.0 * u, "hud", c, 1.0, "center");
+            let r = [cx - max(150.0 * u, 2.4 * tmin), sh * 0.24 + 130.0 * u + k.to_float() * pitch, max(300.0 * u, 4.8 * tmin), rh];
+            button(r, opts[k], max(17.0 * u, tmin * 0.27), if sel { GOLD } else { PALE }, if sel { 0.75 + 0.25 * sin(ui_t * 6.0) } else { 0.3 }, 1.0, sel, u);
+            if hit(taps, r) { pick = k; }
         }
-        let hint = if pad { "D-PAD  CHOOSE     A  SELECT     B / BACK  RESUME" } else { "UP DOWN  CHOOSE     ENTER  SELECT     P  RESUME" };
-        mtext(cx, sh * 0.24 + 310.0 * u, hint, 12.0 * u, "mono", PALE, 0.7, "center");
+        let hint = if touch { "TAP  A  ROW" } else if pad { "D-PAD  CHOOSE     A  SELECT     B / BACK  RESUME" } else { "UP DOWN  CHOOSE     ENTER  SELECT     P  RESUME" };
+        mtext(cx, sh * 0.24 + 130.0 * u + 3.0 * pitch + 12.0 * u, hint, max(12.0 * u, tmin * 0.21), "mono", PALE, 0.7, "center");
+        // a tapped row is chosen and done in the one touch (this callback is the only one awake)
+        if pick >= 0 {
+            p_sel = pick;
+            if pick == 1 { tap_cmd = "restart"; } else if pick == 2 { tap_cmd = "quit"; }
+            pop_state();
+        }
     }
+    if tap_cmd != "" { set_field(game, "game_state", "cmd", tap_cmd); }
 }
-
-// the top of an 18-point swatch centred in a 34-point row
-fn y_mid(py, u) { py + 8.0 * u }

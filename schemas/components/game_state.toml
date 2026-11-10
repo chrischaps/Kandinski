@@ -22,7 +22,7 @@ ghost_rivals = { type = "bool", default = false, description = "Race calibration
 start_event = { type = "i32", default = -1, description = "Start in this GRAND TOUR event (0-14, the order of scripts/lib/tour.rhai; 100 = HORIZON) instead of the title. With start_speed 0 the event runs by its rules from the countdown (the autopilot drives if `autopilot`); with a start_speed it is a rolling capture in section `start_stage`" }
 no_clock = { type = "bool", default = false, description = "The event clock shows but never runs down (tools/tour_check.py --calibrate measures splits with it)" }
 persist = { type = "bool", default = true, description = "False: read and write no save (captures and tests, which may run side by side)" }
-cmd = { type = "string", default = "", description = "An order from the pause menu (hud.rhai writes it, drive.rhai takes it and clears it): restart | quit" }
+cmd = { type = "string", default = "", description = "An order from hud.rhai, which drive.rhai takes and clears. The pause menu: restart | quit. A tapped row (touch): title:n | ev:n | paint:n | res:n | ok | back" }
 
 # what drive.rhai writes
 mode = { type = "string", default = "title", description = "title | tour | brief | countdown | drive | results (an event or HORIZON ended) | over | finish (the arcade run ended)" }

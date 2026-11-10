@@ -31,3 +31,6 @@ audio = ["**/*.ogg", "**/*.wav", "**/*.mp3", "**/*.flac"]
 title = "AFTERGLOW"
 line = "Outrun the dark: a neon road, a clock, and fifteen events to win."
 controls = "sound on · WASD or arrows, or a pad · Space handbrake · Shift boost · Enter to choose"
+# a phone or tablet: the gate and the chooser card say this instead
+touch = "held sideways, sound on · left thumb steers, the gas is automatic · right thumb: BRAKE, DRIFT, BOOST · menus are tapped"
+orientation = "landscape"

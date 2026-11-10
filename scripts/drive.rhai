@@ -633,12 +633,20 @@ fn on_update() {
     if is_action_just_pressed("menu_left") { nav_x = -1; } else if is_action_just_pressed("menu_right") { nav_x = 1; }
     if is_action_just_pressed("menu_up") { nav_y = -1; } else if is_action_just_pressed("menu_down") { nav_y = 1; }
     // the pause menu's orders (hud.rhai writes them: it is the one script awake while paused)
+    // and a tap's: hud.rhai tests each tap against the row it drew and sends
+    // what was chosen (title:n | ev:n | paint:n | res:n | ok | back). A tapped
+    // row is chosen and confirmed in the one touch.
     let cmd = get_field(me, "game_state", "cmd");
     if cmd != "" { set_field(me, "game_state", "cmd", ""); }
+    let tap_k = ""; let tap_n = -1;
+    if cmd == "ok" { confirm = true; }
+    else if cmd == "back" { back = true; }
+    else if cmd.contains(":") { let parts = cmd.split(":"); tap_k = parts[0]; tap_n = parts[1].parse_int(); }
     let was_mode = mode;
     if mode == "title" {
         if mode_t > 0.4 {
             if nav_y != 0 { m_title = (m_title + nav_y + 3) % 3; ev = "ui_move"; dirty = true; }
+            if tap_k == "title" && tap_n >= 0 && tap_n < 3 { m_title = tap_n; confirm = true; dirty = true; }
             if confirm {
                 if m_title == 0 {
                     g_kind = "arcade"; rules = true;
@@ -658,15 +666,23 @@ fn on_update() {
             if m_row < 0 { m_row = 0; } else if m_row > 3 { m_row = 3; }
             ev = "ui_move"; dirty = true;
         }
-        if nav_x != 0 {
-            if m_row < 3 { m_leg = (m_leg + nav_x + 5) % 5; }
+        if tap_k == "ev" && tap_n >= 0 && tap_n < EVENTS.len() { m_leg = tap_n / 3; m_row = tap_n % 3; confirm = true; dirty = true; }
+        let tap_paint = tap_k == "paint" && tap_n >= 0 && tap_n < PAINTS.len();
+        if nav_x != 0 || tap_paint {
+            if m_row < 3 && !tap_paint { m_leg = (m_leg + nav_x + 5) % 5; }
             else {
-                // the paint row: step to the next paint that is earned
                 let have = tour::medal_count(medals);
                 let np = PAINTS.len();
-                for k in 1..np {
-                    let c = (paint + nav_x * k + np * k) % np;
-                    if have >= PAINTS[c].need { paint = c; break; }
+                if tap_paint {
+                    // a tapped paint: worn if it is earned
+                    m_row = 3;
+                    if have >= PAINTS[tap_n].need { paint = tap_n; }
+                } else {
+                    // the paint row: step to the next paint that is earned
+                    for k in 1..np {
+                        let c = (paint + nav_x * k + np * k) % np;
+                        if have >= PAINTS[c].need { paint = c; break; }
+                    }
                 }
                 let pc = PAINTS[paint].c;
                 set_material_override(id_body, "body", pc[0], pc[1], pc[2], 1.0);
@@ -674,7 +690,7 @@ fn on_update() {
                 set_material_override(id_body, "body_shade", pc[0] * 0.36, pc[1] * 0.36, pc[2] * 0.36, 1.0);
                 if do_persist { persist_set("paint", paint); persist_set("save_version", 2); }
             }
-            ev = "ui_move"; dirty = true;
+            ev = if tap_paint && paint != tap_n { "ui_no" } else { "ui_move" }; dirty = true;
         }
         if confirm && mode_t > 0.2 && m_row < 3 {
             let i = m_leg * 3 + m_row;
@@ -728,6 +744,10 @@ fn on_update() {
                 m_res = (m_res + nav_x + n_opt) % n_opt;
                 if n_opt == 3 && m_res == 1 && !has_next { m_res = (m_res + nav_x + 3) % 3; }
                 ev = "ui_move"; dirty = true;
+            }
+            if tap_k == "res" && tap_n >= 0 && tap_n < n_opt {
+                if n_opt == 3 && tap_n == 1 && !has_next { ev = "ui_no"; }
+                else { m_res = tap_n; confirm = true; dirty = true; }
             }
             if confirm {
                 if m_res == 0 {
@@ -977,7 +997,13 @@ fn on_update() {
         in_brake = clamp(action_value("brake"), 0.0, 1.0);
         if is_action_pressed("handbrake") { in_hb = 1.0; }
         in_boost = is_action_pressed("boost");
-        analog = last_input_device() == "gamepad" || (abs(in_steer) > 0.02 && abs(in_steer) < 0.98);
+        // touch (the on-screen stick and buttons are up): the stick is a stick
+        // even at full lock, and the gas is automatic, since a finger holds one
+        // control at a time and the right thumb has BRAKE, DRIFT and BOOST to
+        // press. Lift nothing: BRAKE is the only way to slow.
+        let touch = touch_controls_visible();
+        if touch && in_brake == 0.0 { in_gas = 1.0; }
+        analog = last_input_device() == "gamepad" || touch || (abs(in_steer) > 0.02 && abs(in_steer) < 0.98);
         if cruise > 0.0 && in_gas == 0.0 && in_brake == 0.0 { in_gas = clamp((cruise - speed) * 0.8 + 0.3, 0.0, 1.0); }
     }
     if crash_t > 0.0 { in_steer = 0.0; in_gas = 0.0; in_brake = 0.0; in_hb = 0.0; in_boost = false; }

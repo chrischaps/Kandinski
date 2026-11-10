@@ -15,6 +15,9 @@ after, whatever happens.
   --shots a,b,c           frames at exactly these times (one run each: the player takes one --screenshot-at)
   --every S [--at T]      or a frame every S seconds from T (one run)
   --size WxH              default 1280x720
+  --player "flags"        extra flint-player flags, e.g. "--touch-controls always" (a touch path: its
+                          input script is `touch` / `drag` / `lift` lines, and ap_assist=False lets
+                          the fingers drive)
   key=value ...           extra scene keywords (tools/build_scene.py `build`), e.g. ap_skill=0.8 ap_style=3
 
 Frames land in snapshots/tour/flow/<name>_*.png; the log's script lines are printed.
@@ -34,11 +37,11 @@ SAVE = os.path.join(ROOT, "save", "persist.toml")
 OUT = os.path.join(ROOT, "snapshots", "tour", "flow")
 
 
-def play(name, scene, inputs, until, size, shot_args):
+def play(name, scene, inputs, until, size, shot_args, extra=()):
     w, h = size.split("x")
     cmd = [PLAYER, scene, "--schemas", "engine/schemas", "--schemas", "schemas", "--no-activate",
            "--width", w, "--height", h, "--pixels-per-point", "1", "--frame-step", "0.0166667",
-           "--exit-after", str(until), "--music-volume", "0", "--sfx-volume", "0", "--input-script", inputs, *shot_args]
+           "--exit-after", str(until), "--music-volume", "0", "--sfx-volume", "0", "--input-script", inputs, *shot_args, *extra]
     env = dict(os.environ, RUST_LOG="warn,script=info", FLINT_VSYNC="0", FLINT_PACING="0")
     p = subprocess.run(cmd, cwd=ROOT, env=env, capture_output=True, text=True, encoding="utf-8", errors="replace")
     return [l for l in (p.stdout + p.stderr).splitlines()
@@ -47,7 +50,7 @@ def play(name, scene, inputs, until, size, shot_args):
 
 
 def main(argv):
-    opts = {"--save": "clean", "--inputs": "", "--until": "20", "--every": "", "--at": "0", "--size": "1280x720", "--shots": ""}
+    opts = {"--save": "clean", "--inputs": "", "--until": "20", "--every": "", "--at": "0", "--size": "1280x720", "--shots": "", "--player": ""}
     for k in list(opts):
         if k in argv:
             i = argv.index(k)
@@ -63,7 +66,7 @@ def main(argv):
         shutil.copyfile(SAVE, aside)
     scene = os.path.join(ROOT, "scenes", f"_flow_{name}.scene.toml")
     with open(scene, "w", newline="\n", encoding="utf-8") as f:
-        f.write(build_scene.build(ap_assist=True, persist=True, **kw))
+        f.write(build_scene.build(**{"ap_assist": True, "persist": True, **kw}))
     try:
         runs = []
         if opts["--shots"]:
@@ -81,7 +84,7 @@ def main(argv):
                     os.remove(SAVE)
             else:
                 shutil.copyfile(os.path.join(ROOT, opts["--save"]), SAVE)
-            lines = play(name, scene, os.path.join(ROOT, opts["--inputs"]), until, opts["--size"], shot_args)
+            lines = play(name, scene, os.path.join(ROOT, opts["--inputs"]), until, opts["--size"], shot_args, opts["--player"].split())
         for l in lines:
             print(l[-260:])
         left = os.path.join(OUT, f"{name}_save.toml")

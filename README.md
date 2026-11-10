@@ -68,18 +68,26 @@ play.bat             # fullscreen
 play_windowed.bat    # 1600 x 900
 ```
 
-| | Keyboard | Gamepad |
-|---|---|---|
-| Steer | A D / Left Right | left stick |
-| Accelerate | W / Up | RT |
-| Brake | S / Down | LT |
-| Handbrake | Space | A |
-| Boost | Shift | X / RB |
-| Menus | arrows / WASD, Enter, Backspace | stick / d-pad, A or Start, B |
-| Pause (resume, restart, quit) | P | Back |
-| Restart the event (arcade: back to the title) | R | Y |
+| | Keyboard | Gamepad | Touch (a phone or tablet, held sideways) |
+|---|---|---|---|
+| Steer | A D / Left Right | left stick | left thumb: a stick that lands where the thumb does |
+| Accelerate | W / Up | RT | automatic: nobody holds a pedal |
+| Brake | S / Down | LT | BRAKE, under the right thumb |
+| Handbrake | Space | A | DRIFT |
+| Boost | Shift | X / RB | BOOST |
+| Menus | arrows / WASD, Enter, Backspace | stick / d-pad, A or Start, B | tap a row, a card, a paint or a button (BACK is a button) |
+| Pause (resume, restart, quit) | P | Back | the three-bar button beside the clock |
+| Restart the event (arcade: back to the title) | R | Y | pause, then RESTART |
 
 Escape closes the window (it is the player's key, not the game's).
+
+**By touch.** The stick and buttons come up at the first touch of a drive
+and go away when a key or a pad is used; menus have none, they are tapped.
+A finger holds the one control it landed on, so the gas is automatic while
+they are up: the left thumb steers, the right comes down on BRAKE, DRIFT or
+BOOST (the dash says AUTO GAS). A drift is the stick held into the bend and
+a tap of DRIFT. In the browser the game is at play.chaps.dev; a mouse click
+taps a menu row too.
 
 Leave the road and you slow to a crawl; hit a palm or rear-end traffic at
 speed and you spin. A handbrake entry with the wheel held into the bend is a

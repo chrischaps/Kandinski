@@ -235,3 +235,61 @@ axis = "LeftStickX"
 direction = "positive"
 threshold = 0.55
 gamepad = "any"
+
+# --- Touch: a phone or tablet held sideways ---
+# The engine draws these once a finger touches the screen and puts them away
+# when a key or a pad is used (engine/docs/book/src/concepts/touch-controls.md).
+# hud.rhai has them out only in the countdown and the drive
+# (set_touch_controls): every menu is tapped instead.
+#
+# Offsets and radii are points in from the anchor, inside the safe area.
+# A finger holds the one control it landed on until it lifts, so no thumb can
+# hold a pedal and press another button. The gas is therefore automatic while
+# these are on screen (drive.rhai, "auto gas"): the left thumb steers, the
+# right thumb rests on nothing and comes down on BRAKE, DRIFT or BOOST.
+[touch_controls]
+opacity = 0.85
+
+# Steering: lands wherever the left thumb does (left half, below the
+# readouts). Only x is read; 56 pt of travel is full lock.
+[[touch_controls.sticks]]
+anchor = "bottom_left"
+offset = [112, 112]
+radius = 56
+mode = "floating"
+deadzone = 0.12
+x = "steer"
+region = [0.0, 0.22, 0.5, 0.78]
+
+# The right thumb's arc, pivoting on the bottom-right corner: BRAKE under it,
+# DRIFT a roll up and to the left, BOOST a reach straight up. The dash grows
+# with the screen's height and these do not, so DRIFT sits above where the
+# dash's corner comes on a 4:3 tablet (1024 x 768: 111 pt high, 192 pt in).
+[[touch_controls.buttons]]
+action = "brake"
+label = "brake"
+anchor = "bottom_right"
+offset = [88, 92]
+radius = 48
+
+[[touch_controls.buttons]]
+action = "handbrake"
+label = "drift"
+anchor = "bottom_right"
+offset = [190, 150]
+radius = 38
+
+[[touch_controls.buttons]]
+action = "boost"
+label = "boost"
+anchor = "bottom_right"
+offset = [84, 204]
+radius = 36
+
+# Pause: beside the clock, between it and the stage readout (the top corners
+# belong to the HUD, and to a phone's notch).
+[touch_controls.menu]
+action = "pause"
+anchor = "top"
+offset = [150, 36]
+radius = 22
