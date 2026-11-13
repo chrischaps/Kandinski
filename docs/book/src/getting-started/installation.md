@@ -57,7 +57,7 @@ Every command is still there. `flint render`, `gen`, `bundle`, `validate`, `rend
 | Feature | Off means |
 |---------|-----------|
 | `audio` | `flint play` runs silent, as on a machine with no sound card (sounds still load, scripts still play them). `calibrate` and `play-chart` won't start. `render-suite` renders offline either way. |
-| `gamepad` | No pads are seen; `spike-rumble` says the build left them out. Keyboard, mouse, touch and `--input-script` still work. |
+| `gamepad` | No pads are seen and a script's `rumble()` does nothing; `spike-rumble` says the build left them out. Keyboard, mouse, touch and `--input-script` still work. |
 | `dialogs` | The editors' Save As, Export and Browse buttons open no dialog and say why on stderr. |
 
 Put back any one of them with `--features`, for example `--no-default-features --features audio`. `bash scripts/headless-check.sh` checks that no device crate has crept back into the headless build's dependency tree, and CI builds it on a Linux runner with the ALSA and libudev headers removed.
@@ -81,7 +81,7 @@ Caused by:
     Failed to get adapter: with no GPU, install a software Vulkan driver (lavapipe): `sudo apt-get install mesa-vulkan-drivers` on Debian/Ubuntu, then `flint render --list-gpus` should list "llvmpipe"
 ```
 
-Lavapipe is slow but works: a debug build drew `demo/pbr_test.scene.toml` at 960x540 in about 14 s in that container, and #220's three ~22k-vertex trees took about 6 s. Debug builds also log `InstanceFlags::VALIDATION requested, but unable to find layer: VK_LAYER_KHRONOS_validation`; that warning is harmless. Lavapipe's renders are byte-identical from run to run. Pass `--no-grid`, though: lavapipe draws the editor grid with stray triangles across the near ground, where a GPU draws clean lines. Without the grid, that frame matched an RTX's in all but 0.99% of its pixels, and only 4 of those were off by more than 8 levels. Goldens still want a per-adapter variant (`.lavapipe.png`).
+Lavapipe is slow but works: a debug build drew `examples/pbr_test.scene.toml` at 960x540 in about 14 s in that container, and #220's three ~22k-vertex trees took about 6 s. Debug builds also log `InstanceFlags::VALIDATION requested, but unable to find layer: VK_LAYER_KHRONOS_validation`; that warning is harmless. Lavapipe's renders are byte-identical from run to run. Pass `--no-grid`, though: lavapipe draws the editor grid with stray triangles across the near ground, where a GPU draws clean lines. Without the grid, that frame matched an RTX's in all but 0.99% of its pixels, and only 4 of those were off by more than 8 levels. Goldens still want a per-adapter variant (`.lavapipe.png`).
 
 On Windows the software adapter is WARP, which every Windows ships: `WGPU_BACKEND=dx12 WGPU_ADAPTER_NAME="Microsoft Basic Render Driver"`. wgpu only offers it on a machine with no GPU, which is how CI runs the GPU tests and render goldens ([Golden Suites](../guides/headless-rendering.md#golden-suites)).
 
@@ -105,7 +105,7 @@ For example:
 
 ```bash
 cargo run --bin flint -- init my-game
-cargo run --bin flint -- serve demo/showcase.scene.toml --watch
+cargo run --bin flint -- serve examples/showcase.scene.toml --watch
 ```
 
 ## Running Tests

@@ -2,6 +2,8 @@
 resolver = "2"
 members = [
     "crates/flint-core",
+    "crates/flint-wooze",
+    "crates/flint-geometry",
     "crates/flint-schema",
     "crates/flint-ecs",
     "crates/flint-scene",
@@ -11,6 +13,7 @@ members = [
     "crates/flint-asset",
     "crates/flint-asset-gen",
     "crates/flint-import",
+    "crates/flint-pixels",
     "crates/flint-viewer",
     "crates/flint-runtime",
     "crates/flint-physics",
@@ -18,6 +21,7 @@ members = [
     "crates/flint-audio",
     "crates/flint-audio-worklet",
     "crates/flint-music",
+    "crates/flint-rhythm",
     "crates/flint-input-capture",
     "crates/flint-animation",
     "crates/flint-script",
@@ -34,6 +38,8 @@ members = [
 # Exclude it from default `cargo build`; build with `cargo ndk -p flint-android`.
 default-members = [
     "crates/flint-core",
+    "crates/flint-wooze",
+    "crates/flint-geometry",
     "crates/flint-schema",
     "crates/flint-ecs",
     "crates/flint-scene",
@@ -43,6 +49,7 @@ default-members = [
     "crates/flint-asset",
     "crates/flint-asset-gen",
     "crates/flint-import",
+    "crates/flint-pixels",
     "crates/flint-viewer",
     "crates/flint-runtime",
     "crates/flint-physics",
@@ -50,6 +57,7 @@ default-members = [
     "crates/flint-audio",
     "crates/flint-audio-worklet",
     "crates/flint-music",
+    "crates/flint-rhythm",
     "crates/flint-input-capture",
     "crates/flint-animation",
     "crates/flint-script",
@@ -175,6 +183,8 @@ egui-snarl = "0.6.0"
 
 # Internal crates
 flint-core = { path = "crates/flint-core" }
+flint-wooze = { path = "crates/flint-wooze" }
+flint-geometry = { path = "crates/flint-geometry" }
 flint-schema = { path = "crates/flint-schema" }
 flint-ecs = { path = "crates/flint-ecs" }
 flint-scene = { path = "crates/flint-scene" }
@@ -183,16 +193,18 @@ flint-render = { path = "crates/flint-render" }
 flint-constraint = { path = "crates/flint-constraint" }
 flint-asset = { path = "crates/flint-asset" }
 flint-import = { path = "crates/flint-import" }
+flint-pixels = { path = "crates/flint-pixels" }
 flint-viewer = { path = "crates/flint-viewer" }
 flint-runtime = { path = "crates/flint-runtime" }
 flint-physics = { path = "crates/flint-physics" }
 # The crates that open devices take default-features = false here, so a
 # dependent says which devices it wants (#221): `device` (sound) on
-# flint-audio and flint-music, `gamepad` on flint-input-capture, and
+# flint-audio, flint-music and flint-rhythm, `gamepad` on flint-input-capture, and
 # `audio` / `gamepad` / `debug-hud` on flint-player.
 flint-audio = { path = "crates/flint-audio", default-features = false }
 flint-audio-worklet = { path = "crates/flint-audio-worklet" }
 flint-music = { path = "crates/flint-music", default-features = false }
+flint-rhythm = { path = "crates/flint-rhythm", default-features = false }
 flint-input-capture = { path = "crates/flint-input-capture", default-features = false }
 flint-animation = { path = "crates/flint-animation" }
 flint-script = { path = "crates/flint-script" }
@@ -201,9 +213,64 @@ flint-particles = { path = "crates/flint-particles" }
 flint-terrain = { path = "crates/flint-terrain" }
 flint-procgen = { path = "crates/flint-procgen" }
 flint-procgen-ai = { path = "crates/flint-procgen-ai" }
-flint-debug-ui = { path = "crates/flint-debug-ui" }
+flint-debug-ui = { path = "crates/flint-debug-ui", default-features = false }
 flint-player = { path = "crates/flint-player", default-features = false }
 flint-android = { path = "crates/flint-android" }
+
+# Debug builds (and tests, which inherit dev) keep only line tables for the
+# workspace crates and no debug info for dependencies (#762): a backtrace's
+# Flint frames still name file and line, a dependency's frames their function,
+# and a debugger sees no locals.
+# Measured on the 24-thread machine, a cold worktree `cargo build` plus
+# `cargo test --no-run` went from 17.1 GB and 229 s to 6.6 GB and 150 s; most
+# of the 17 GB was .pdb files. Stepping through one crate in a debugger with
+# its locals: `CARGO_PROFILE_DEV_DEBUG=full cargo build` (workspace crates),
+# or a `[profile.dev.package.<dep>] debug = "full"` you don't commit.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
+
+# A debug build optimizes what loads a texture (#326), so that `flint render`
+# of a scene with a big model takes seconds, not a minute. A debug render of
+# examples/style_mask.scene.toml (a 32 MB bench with three 4K textures, a
+# 9.5 MB lantern) spent 18.6 of its 21 s loading models: 11.5 s box-filtering
+# mip chains, 2.1 s widening RGB to RGBA, 4 s decoding PNG and JPEG, 0.8 s
+# hashing the files. The first two moved out of flint-render into
+# flint-pixels, a leaf with no dependencies, so the crate agents edit most
+# stays unoptimized and quick to rebuild. Below it: the image decoders and
+# their inflate and checksum crates, and SHA-256. Not gltf or gltf-json:
+# optimized they took 37 s of a cold build, one after the other, and parsing
+# and walking a document costs under 0.1 s unoptimized. Optimizing changes no
+# pixel: Rust reorders no float maths at any opt-level. After: models load in
+# 2.2 s and the render takes 2.6 s against release's 2.1 s, its PNG identical.
+# Anything else that walks every texel of a big image on load goes in
+# flint-pixels, or a dependency it uses goes on this list.
+[profile.dev.package.flint-pixels]
+opt-level = 3
+[profile.dev.package.image]
+opt-level = 3
+[profile.dev.package.png]
+opt-level = 3
+[profile.dev.package.zune-jpeg]
+opt-level = 3
+[profile.dev.package.zune-core]
+opt-level = 3
+[profile.dev.package.fdeflate]
+opt-level = 3
+[profile.dev.package.miniz_oxide]
+opt-level = 3
+[profile.dev.package.flate2]
+opt-level = 3
+[profile.dev.package.simd-adler32]
+opt-level = 3
+[profile.dev.package.adler2]
+opt-level = 3
+[profile.dev.package.crc32fast]
+opt-level = 3
+[profile.dev.package.sha2]
+opt-level = 3
 
 # The web player's build (#123): `trunk build --release --cargo-profile
 # web-release` in crates/flint-player, as .github/workflows/play.yml does.

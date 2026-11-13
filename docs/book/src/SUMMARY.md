@@ -35,6 +35,7 @@
 - [Post-Processing](concepts/post-processing.md)
 - [Quality Settings](concepts/quality-settings.md)
 - [Stylize Passes](concepts/stylize-passes.md)
+- [Comic Panels](concepts/comic-panels.md)
 - [Glyph Atlas](concepts/glyph-atlas.md)
 - [Audio](concepts/audio.md)
 - [Music Sessions](concepts/music-sessions.md)
@@ -71,6 +72,7 @@
 
 # Reference
 
+- [Script API Reference](reference/script-api.md)
 - [CLI Reference](cli-reference/overview.md)
   - [Music and Rhythm Commands](cli-reference/music.md)
 - [File Formats](formats/overview.md)

@@ -178,6 +178,12 @@ impl RenderDebugPanel {
         self.styles_editor.set_scene_dir(scene_dir);
     }
 
+    /// [`set_scene_dir`](Self::set_scene_dir) for a host that holds the
+    /// scene's project (ADR 0114): the choices are searched from `assets`.
+    pub fn set_asset_scope(&mut self, assets: Option<flint_core::project::AssetScope>) {
+        self.styles_editor.set_asset_scope(assets);
+    }
+
     /// The looks to offer (#356; `flint_render::look::list` of the
     /// scene) and the one in use, set by the host on scene load and after
     /// a script or the picker changes it.
@@ -487,7 +493,15 @@ impl RenderDebugPanel {
         });
 
         section(ui, "Render mode", false, |ui| {
-            let labels = ["None", "Matrix", "Blood", "Drunk", "Tron", "Underwater"];
+            let labels = [
+                "None",
+                "Matrix",
+                "Blood",
+                "Drunk",
+                "Tron",
+                "Underwater",
+                "Tear (props)",
+            ];
             let cur = (self.pp.render_mode as usize).min(labels.len() - 1);
             egui::ComboBox::from_label("Mode")
                 .selected_text(labels[cur])
@@ -500,8 +514,8 @@ impl RenderDebugPanel {
                     }
                 });
             f.pp_changed |= slider(ui, "Mix", &mut self.pp.mode_mix, 0.0..=1.0);
-            let hover = "Tears (1-4): x = mask scale, y = mask style (0 fbm / 1 iris), \
-                         z = rate, w = spare. Underwater (5): x = signed eye depth m, \
+            let hover = "Tears (1-4, 6): x = mask scale (0 = 3), y = mask style (0 fbm / 1 iris), \
+                         z = rate (0 = 6), w = spare. Underwater (5): x = signed eye depth m, \
                          y = sea energy, z = daylight, w = biolum.";
             let r = ui.horizontal(|ui| {
                 ui.label("Params");
@@ -706,7 +720,7 @@ fn fov_label(fov_deg: f32) -> &'static str {
 
 /// What the wooze field is telling the boil here and now. Its sliders are shares
 /// of this, so a scene with no field needs to say why they do nothing.
-fn boil_status(boil: &flint_core::wooze::BoilFrame) -> String {
+fn boil_status(boil: &flint_wooze::BoilFrame) -> String {
     if boil.step <= 0.0 {
         "No [wooze] table here, so nothing boils.".to_string()
     } else {

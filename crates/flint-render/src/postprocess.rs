@@ -17,6 +17,33 @@ const BLOOM_SLOT_STRIDE: u64 = crate::bind_cache::SLOT_STRIDE;
 /// HDR texture format used for the intermediate scene buffer and bloom chain.
 pub const HDR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 
+/// The reality tear's mask and the noise under it (#397), shared by the
+/// composite and the style mask so a `blend_source = "tear"` prop turns
+/// exactly where the composite tears. Prepended to each: WGSL has no include.
+pub const TEAR_MASK_WGSL: &str = include_str!("tear_mask.wgsl");
+
+/// The composite's source: [`TEAR_MASK_WGSL`], then `composite_shader.wgsl`.
+pub const COMPOSITE_WGSL: &str = concat!(
+    include_str!("tear_mask.wgsl"),
+    include_str!("composite_shader.wgsl")
+);
+
+/// The render modes with a reality tear (#397): Matrix (1), blood (2),
+/// drunk (3, which tears nothing it draws), Tron (4) and the tear alone (6),
+/// whose only look is the styled props that follow it. Underwater (5) masks
+/// by its waterline instead.
+pub fn tears(render_mode: u32) -> bool {
+    matches!(render_mode, 1..=4 | 6)
+}
+
+/// Whether `config` draws a reality tear this frame, as the composite sees
+/// it: post-processing on, a tearing mode, and a mix above the composite's
+/// own cut-off. While it doesn't, a `blend_source = "tear"` entity is at
+/// blend 0 everywhere.
+pub fn tear_active(config: &PostProcessConfig) -> bool {
+    config.enabled && tears(config.render_mode) && config.mode_mix > 0.001
+}
+
 /// Post-processing configuration (runtime-adjustable parameters).
 #[derive(Debug, Clone)]
 pub struct PostProcessConfig {
@@ -100,14 +127,20 @@ pub struct PostProcessConfig {
     /// or 3. Shared by the boils of the `kuwahara` and `contour` styles,
     /// whose amounts are their own `boil` parameters (#599).
     pub boil_on: u32,
+    /// Motion on twos for the whole frame (#405): entities that name no
+    /// `motion_hold` rate of their own are drawn on ticks, this many a
+    /// second, and the post time styles, grain and the tear read holds to
+    /// the start of each tick. 0 = off. See [`crate::motion_hold`].
+    pub motion_hold: f32,
     /// This frame's drawing, from the wooze field. Whoever owns the clock stamps
     /// it each frame with `SceneRenderer::set_boil`; a scene with no field never
     /// does, and its amount of 0 turns both boils off.
-    pub boil: flint_core::wooze::BoilFrame,
+    pub boil: flint_wooze::BoilFrame,
     /// Stylized render mode: 0 = none, 1 = Matrix code, 2 = blood ocean
     /// grade, 3 = drunk, 4 = Tron wireframe (reality tears), 5 = underwater
     /// (submerged-eye moments; masks by a per-pixel waterline, not the
-    /// tear mask).
+    /// tear mask), 6 = the tear alone (#397: no look of its own, so only
+    /// styled props with `blend_source = "tear"` show where it tears).
     pub render_mode: u32,
     /// Blend strength for the active render mode (0 = normal view).
     pub mode_mix: f32,
@@ -187,6 +220,7 @@ impl Default for PostProcessConfig {
             edge_depth: 0.6,
             edge_normal: 2.5,
             boil_on: 2,
+            motion_hold: 0.0,
             boil: Default::default(),
             render_mode: 0,
             mode_mix: 0.0,
@@ -279,6 +313,7 @@ pub fn post_process_config_from_def(pp_def: &flint_scene::PostProcessDef) -> Pos
     config.edge_depth = pp_def.edge_depth;
     config.edge_normal = pp_def.edge_normal;
     config.boil_on = pp_def.boil_on;
+    config.motion_hold = pp_def.motion_hold;
     config.film_grain = pp_def.film_grain;
     config.grade_lift = pp_def.grade_lift;
     config.grade_gamma = pp_def.grade_gamma;
@@ -700,7 +735,7 @@ impl PostProcessPipeline {
         // --- Composite pipeline ---
         let composite_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Composite Shader"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("composite_shader.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(COMPOSITE_WGSL.into()),
         });
 
         // Group 0: PostProcessUniforms

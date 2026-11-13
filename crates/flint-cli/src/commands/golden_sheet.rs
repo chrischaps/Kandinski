@@ -361,7 +361,7 @@ footer {{ color: var(--dim); font-size: 12px; margin-top: 30px; }}
 <body>
 <main>
 <section class="top">
-  <h1><small>flint render-suite &middot; contact sheet</small>{suite}</h1>
+  <h1><small>flint goldens &middot; contact sheet</small>{suite}</h1>
   <p class="verdict">{verdict}</p>
   <p>{total} case(s) in {seconds:.1} s, {mode} &middot; <code>{manifest}</code></p>
   {bless_note}
@@ -434,7 +434,7 @@ mod tests {
     fn case(name: &str, status: &'static str, changed: usize) -> CaseReport {
         CaseReport {
             name: name.into(),
-            scene: "demo/x.scene.toml".into(),
+            scene: "examples/x.scene.toml".into(),
             args: vec!["--style".into(), "ascii".into()],
             status,
             drift: status == "pass" && changed > 0,

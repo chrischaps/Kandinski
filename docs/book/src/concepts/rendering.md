@@ -40,13 +40,13 @@ They're drawn after the composite and FXAA, straight onto the final target, befo
 
 ### World text
 
-World text (`draw_world_text`, ADR 0104) is the player's, not the renderer's, because it's egui's text. Inside the HUD's egui pass the player lays each label out with egui's fonts, so the glyphs it needs go up with that pass's font atlas. After the pass it tessellates each label on its own and moves the vertices into clip space. A billboard keeps its screen layout at its anchor's depth, with the anchor snapped to a whole pixel. Text on a plane is laid in the plane and projected corner by corner, with its true `w`, so its glyphs are sampled in perspective. The labels are drawn onto the HUD's target before the HUD, in one pass against the context's depth view (`LessEqual`, no depth write), with egui's blend and colour maths and its font atlas's bind group. Its pipeline's texture layout has the same entries as egui-wgpu's, and wgpu pools layouts by their entries, so egui's bind groups fit it. `SceneRenderer::frame_depth_ready()` says whether the depth view holds the frame's depth once `render` returns. It doesn't with MSAA and no HDR chain, and then world text isn't drawn.
+World text (`draw_world_text`, [ADR 0104](https://github.com/chrischaps/Flint/blob/main/docs/adr/0104-depth-tested-world-text.md)) is the player's, not the renderer's, because it's egui's text. Inside the HUD's egui pass the player lays each label out with egui's fonts, so the glyphs it needs go up with that pass's font atlas. After the pass it tessellates each label on its own and moves the vertices into clip space. A billboard keeps its screen layout at its anchor's depth, with the anchor snapped to a whole pixel. Text on a plane is laid in the plane and projected corner by corner, with its true `w`, so its glyphs are sampled in perspective. The labels are drawn onto the HUD's target before the HUD, in one pass against the context's depth view (`LessEqual`, no depth write), with egui's blend and colour maths and its font atlas's bind group. Its pipeline's texture layout has the same entries as egui-wgpu's, and wgpu pools layouts by their entries, so egui's bind groups fit it. `SceneRenderer::frame_depth_ready()` says whether the depth view holds the frame's depth once `render` returns. It doesn't with MSAA and no HDR chain, and then world text isn't drawn.
 
 ### Picking the ground
 
 `Camera::screen_to_ground(x, y, width, height, plane_y)` returns the `[x, z]` point on the plane `y = plane_y` under a screen point, or `None` where the view doesn't reach it. Screen points start at the top-left with y down. Any unit works as long as the cursor and the viewport size use the same one, so logical points or physical pixels both give the right answer on a HiDPI display. Scripts get the same function as `screen_to_ground(x, y, plane_y)`.
 
-To pick what's drawn rather than the ground, a wall or a roof, make it a ray target (see [Runtime meshes](#runtime-meshes)) and use `screen_to_mesh(x, y)` (ADR 0105).
+To pick what's drawn rather than the ground, a wall or a roof, make it a ray target (see [Runtime meshes](#runtime-meshes)) and use `screen_to_mesh(x, y)` ([ADR 0105](https://github.com/chrischaps/Flint/blob/main/docs/adr/0105-rays-against-drawn-meshes.md)).
 
 It is built on `Camera::unproject_ray(ndc_x, ndc_y)`. That returns a ray whose origin is on the near plane, so the same code serves perspective cameras (rays fan out from the eye) and orthographic ones (parallel rays). It honours `ndc_offset`. The arithmetic is in `flint_core::projection` and runs in `f64`, because an `f32` inverse of a projection whose far plane is thousands of times its near plane would let distant hits drift off the cursor.
 
@@ -60,7 +60,8 @@ Imported glTF models are rendered with their full mesh geometry and materials. T
 
 Two ECS components tint an imported model without touching the GLB:
 
-- `material.base_color_r/g/b[/a]` on the entity (or its direct parent) replaces the base colour of **every** primitive the entity draws. Scripts write it with `set_material_color`.
+- `material.color = [r, g, b]` or `[r, g, b, a]`, the same key that colours a box drawn from bounds, replaces the base colour of **every** primitive the entity draws. A texture is still multiplied in. Expanded child nodes take their model root's `color`. A model under a bounds-drawn parent does not take that parent's box colour.
+- `material.base_color_r/g/b[/a]` on the entity (or its direct parent) does the same, and wins over `color`. Scripts write it with `set_material_color`, so a script can recolour a model whatever its scene gave it.
 - `material_overrides` maps glTF **material names** to colours: `Frame = [0.9, 0.3, 0.1]`, `Capsule = [0.2, 0.6, 1.0, 0.5]`. The renderer looks it up on the drawn entity and then on each ancestor, so a single component on a model's root entity recolours the matching materials on all of its expanded child nodes, including meshes that mix several materials. A three-component value keeps the material's own alpha. It takes precedence over `material.base_color_*` for the named material. Scripts write it with `set_material_override(id, name, r, g, b, a)`. A value can also be a table that recolours the material's glow: see [Recolouring an imported model's glow](#recolouring-an-imported-models-glow).
 
 Both are re-read whenever the renderer re-extracts the world (every frame in the player), so colour changes are live. A vertex-coloured mesh ignores both: tint it with `material.vertex_tint_*` ([Tinting vertex colours per entity](#tinting-vertex-colours-per-entity)).
@@ -84,7 +85,7 @@ Code can build meshes while the game runs and draw them like imported models. A 
 
 **Vertex colours.** `ImportedMaterial::vertex_colored(name)` makes a material that takes its colour from each vertex. One mesh can then carry many colours without one material per colour. Vertex colours are **linear**, so convert sRGB values such as hex codes with `flint_render::srgb_to_linear`, or they wash out.
 
-**Ray targets.** A runtime mesh can also be something rays meet (ADR 0105), so a game describes a building once, to draw it, and a camera keeping out of walls or a click picking a roof meets the same triangles. `SceneRenderer::set_ray_mesh(name, Some(mesh))` hands over a `flint_core::ray_mesh::RayMesh` built from the positions and indices the mesh was uploaded with: its triangles under a bounding volume hierarchy, kept on the CPU. Each `update_from_world` then places it, for every entity drawing the mesh, at that entity's world matrix, in a new `RayScene`, which `SceneRenderer::ray_scene()` hands out. Uploading the mesh again or removing it stops it being a target, so set it after each upload. A player extension does both at once with `ExtensionGpu::upload_mesh_with(.., MeshOptions { ray_target: true })`.
+**Ray targets.** A runtime mesh can also be something rays meet ([ADR 0105](https://github.com/chrischaps/Flint/blob/main/docs/adr/0105-rays-against-drawn-meshes.md)), so a game describes a building once, to draw it, and a camera keeping out of walls or a click picking a roof meets the same triangles. `SceneRenderer::set_ray_mesh(name, Some(mesh))` hands over a `flint_geometry::ray_mesh::RayMesh` built from the positions and indices the mesh was uploaded with: its triangles under a bounding volume hierarchy, kept on the CPU. Each `update_from_world` then places it, for every entity drawing the mesh, at that entity's world matrix, in a new `RayScene`, which `SceneRenderer::ray_scene()` hands out. Uploading the mesh again or removing it stops it being a target, so set it after each upload. A player extension does both at once with `ExtensionGpu::upload_mesh_with(.., MeshOptions { ray_target: true })`.
 
 The scene is made while the frame's draws are gathered, before culling, so a target off screen or behind the camera is still met, and the player hands it to scripts after each update: a ray cast during a frame meets things where the last frame drew them. `RayScene::cast(origin, dir, max)` and `segment(from, to)` answer with a `RayHit`: the entity, the distance in world units, the point, the normal (turned to face the ray's origin) and the triangle's index in the mesh's `indices`. Triangles are two-sided, so a ray from inside a box meets its far wall. The scene tests each placed mesh's world box and casts into the mesh's own space, so a scale or a turn on the entity is honoured; it walks the placed meshes one by one, so make targets of what rays need to meet (the buildings, not the lamps on them), and merge many small meshes into a few.
 
@@ -107,7 +108,7 @@ Keep a model's levels as primitives of **one mesh on one node**. A GLB with seve
 
 An entity's `lod` component caps a whole model: `draw_distance = 300` stops drawing it (and its shadow) when the camera is 300 m from its bounds. It applies to a multi-node model's nodes too.
 
-Two runtime scales serve quality settings: the **LOD scale** multiplies every `near`/`far`, so 0.5 drops models to their simpler levels at half the distance, and the **draw-distance scale** multiplies every `draw_distance`. Scripts call `set_lod_scale(s)` and `set_draw_distance_scale(s)` (applied after the frame's scripts, kept across scenes) and read them with `lod_scale()` and `draw_distance_scale()`; Rust calls `SceneRenderer::set_lod_settings`. They start at 1, or at `FLINT_LOD_SCALE` and `FLINT_DRAW_DISTANCE_SCALE`, and are clamped to 0.05 and up. `FLINT_LOD_SCALE=1000` holds every model at its first level, for comparisons. `RenderStats::lod_culled_draws` counts the draws set aside by level or distance (they're also in `culled_draws`), and `--exit-after` prints it.
+Two runtime scales serve quality settings: the **LOD scale** multiplies every `near`/`far`, so 0.5 drops models to their simpler levels at half the distance, and the **draw-distance scale** multiplies every `draw_distance`. Scripts call `set_lod_scale(s)` and `set_draw_distance_scale(s)` (applied after the frame's scripts, kept across scenes) and read them with `get_lod_scale()` and `get_draw_distance_scale()`; Rust calls `SceneRenderer::set_lod_settings`. They start at 1, or at `FLINT_LOD_SCALE` and `FLINT_DRAW_DISTANCE_SCALE`, and are clamped to 0.05 and up. `FLINT_LOD_SCALE=1000` holds every model at its first level, for comparisons. `RenderStats::lod_culled_draws` counts the draws set aside by level or distance (they're also in `culled_draws`), and `--exit-after` prints it.
 
 ## Skinned Mesh Pipeline
 
@@ -163,7 +164,7 @@ fullbright = true
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `texture` | string | `""` | Sprite sheet texture name (from `sprites/` directory) |
+| `texture` | string | `""` | Sprite sheet texture, found as a [texture](assets.md#where-the-engine-looks-for-a-file) is: beside the scene or in `textures/`, then the same up to the project root |
 | `width` | f32 | `1.0` | World-space width of the quad |
 | `height` | f32 | `1.0` | World-space height of the quad |
 | `frame` | i32 | `0` | Current frame index in the sprite sheet |
@@ -179,7 +180,7 @@ Billboard sprites use a **separate pipeline** rather than extending the PBR pipe
 
 ## MSAA
 
-Every scene pipeline (PBR, skinned, sky, skybox, ocean, terrain, grass, particles, billboards, 2D sprites) takes a sample count, so the scene passes can run at 4x MSAA (ADR 0058). Post-processing, shadow and blit passes stay single-sample, and depth-reading effects consume a sample-0 depth resolve. Enable it with `flint render --msaa 4` or `flint-player --msaa 4`; the default is 1 so headless pixel gates stay single-sample.
+Every scene pipeline (PBR, skinned, sky, skybox, ocean, terrain, grass, particles, billboards, 2D sprites) takes a sample count, so the scene passes can run at 4x MSAA ([ADR 0058](https://github.com/chrischaps/Flint/blob/main/docs/adr/0058-opt-in-4x-msaa-for-scene-passes.md)). Post-processing, shadow and blit passes stay single-sample, and depth-reading effects consume a sample-0 depth resolve. Enable it with `flint render --msaa 4` or `flint-player --msaa 4`; the default is 1 so headless pixel gates stay single-sample.
 
 ## Post-Processing
 
@@ -201,7 +202,7 @@ A glTF material with `"doubleSided": true` is drawn from both sides (#623). That
 
 ![Two palms built alike, their fronds single cards seen from below: the left palm's material is doubleSided](../images/double-sided-palms.png)
 
-*`demo/double_sided.scene.toml`: the same palm twice, each frond one strip of cards wound with its face up, seen from under the crowns. The left palm's frond material is `doubleSided`, so every underside draws. The right palm's isn't, so only the fronds that face the camera are left.*
+*`examples/double_sided.scene.toml`: the same palm twice, each frond one strip of cards wound with its face up, seen from under the crowns. The left palm's frond material is `doubleSided`, so every underside draws. The right palm's isn't, so only the fronds that face the camera are left.*
 
 A double-sided material:
 
@@ -214,7 +215,7 @@ For a runtime mesh, set `ImportedMaterial::double_sided`. Single-sided is the ch
 
 ### Emission
 
-A material can give off light of its own (ADR 0076): lamps, lit windows, embers, a glowing crown. Emission is added after lighting and before tonemapping, so it doesn't depend on facing, the sun or the ambient, and with post-processing on, bloom picks up anything brighter than its threshold. It lights only its own surface. To light the things around it, put a point light beside it.
+A material can give off light of its own ([ADR 0076](https://github.com/chrischaps/Flint/blob/main/docs/adr/0076-emissive-materials.md)): lamps, lit windows, embers, a glowing crown. Emission is added after lighting and before tonemapping, so it doesn't depend on facing, the sun or the ambient, and with post-processing on, bloom picks up anything brighter than its threshold. It lights only its own surface. To light the things around it, put a point light beside it.
 
 - **`ImportedMaterial::emissive`** is the light, as linear RGB. It defaults to zero.
 - **`emissive_strength`** multiplies it, so radiance can go past 1. It defaults to 1.
@@ -242,7 +243,7 @@ Vertex RGB may go past 1 for bright lights. In this mode vertex alpha is no long
 
 #### Changing the glow after upload
 
-A mesh's emission is set when it's uploaded, but an entity can scale it every frame with **`material.emissive_scale`** (ADR 0090). It multiplies all of the mesh's emission: the material's own `emissive` and the per-vertex kind. The default is 1, which is the mesh as uploaded. Nothing is re-uploaded, so a city's worth of windows can come on with the evening as one number per entity.
+A mesh's emission is set when it's uploaded, but an entity can scale it every frame with **`material.emissive_scale`** ([ADR 0090](https://github.com/chrischaps/Flint/blob/main/docs/adr/0090-emission-scale-after-upload.md)). It multiplies all of the mesh's emission: the material's own `emissive` and the per-vertex kind. The default is 1, which is the mesh as uploaded. Nothing is re-uploaded, so a city's worth of windows can come on with the evening as one number per entity.
 
 ```toml
 [entities.lamp_post.material]
@@ -302,13 +303,13 @@ fn on_update() {
 }
 ```
 
-`demo/emissive_recolor.scene.toml` is five figures of one skinned GLB, whose joints have no emission of their own, and two lanterns whose glass glows through a texture, all walking one palette a stage every 2.5 s under a moon that still lights them (`flint render demo/emissive_recolor.scene.toml --scripts --time 0..10 --fps 12 -o glow.gif`).
+`examples/emissive_recolor.scene.toml` is five figures of one skinned GLB, whose joints have no emission of their own, and two lanterns whose glass glows through a texture, all walking one palette a stage every 2.5 s under a moon that still lights them (`flint render examples/emissive_recolor.scene.toml --scripts --time 0..10 --fps 12 -o glow.gif`).
 
 ![Five figures from one GLB, their joints glowing magenta to cyan along the row, under moonlight](../images/emissive-recolor.png)
 
 #### Lighting the glow as surface too
 
-**`material.glow_surface`** (ADR 0096), 0 to 1, says how much of each per-vertex light part is also an ordinary lit surface of its colour. It adds the surface and takes none of the light away, so `emissive_scale` and `glow_surface` set a light face's two halves apart: how much light it gives off, and how much paint the sun and sky can light. The default is 0, the mesh as uploaded. Surface vertices (alpha 1) don't change, so a mesh can mix plain faces with ones that slide.
+**`material.glow_surface`** ([ADR 0096](https://github.com/chrischaps/Flint/blob/main/docs/adr/0096-glow-surface-after-upload.md)), 0 to 1, says how much of each per-vertex light part is also an ordinary lit surface of its colour. It adds the surface and takes none of the light away, so `emissive_scale` and `glow_surface` set a light face's two halves apart: how much light it gives off, and how much paint the sun and sky can light. The default is 0, the mesh as uploaded. Surface vertices (alpha 1) don't change, so a mesh can mix plain faces with ones that slide.
 
 Upload the sliding faces as pure light (alpha 0) at the colour you want, once. Then, every frame:
 
@@ -322,7 +323,7 @@ A vertex of alpha `a` is lit as surface by `a + (1 − a) × glow_surface` of it
 
 #### Tinting vertex colours per entity
 
-**`material.vertex_tint_r/g/b`** (ADR 0102) multiplies every vertex colour of the entity's meshes, as surface and as per-vertex light alike, every frame. Leave it unset for white, the mesh as uploaded. Set all three or none. An entity with no tint of its own takes its parent's, as with `emissive_scale`, and a new tint costs the same. Negative values count as 0, and values over 1 brighten.
+**`material.vertex_tint_r/g/b`** ([ADR 0102](https://github.com/chrischaps/Flint/blob/main/docs/adr/0102-per-entity-vertex-tint.md)) multiplies every vertex colour of the entity's meshes, as surface and as per-vertex light alike, every frame. Leave it unset for white, the mesh as uploaded. Set all three or none. An entity with no tint of its own takes its parent's, as with `emissive_scale`, and a new tint costs the same. Negative values count as 0, and values over 1 brighten.
 
 It's separate from `material.base_color_*`, which a vertex-coloured mesh ignores: many meshes are uploaded with a material colour equal to their vertices', and multiplying the two would darken them. A glTF's `COLOR_0` isn't read yet (see the roadmap), so nothing imported changes either.
 
@@ -343,7 +344,7 @@ The renderer provides eight shading modes, selected from the **Shading** combo i
 | Mode | `--debug-mode` | Description |
 |------|----------------|-------------|
 | **PBR** | (default) | Standard Cook-Torrance shading |
-| **Wireframe overlay** | `--wireframe-overlay` | Edge lines drawn over solid PBR shading |
+| **Wireframe overlay** | `wireframe-overlay` (or `--wireframe-overlay`) | Edge lines drawn over solid PBR shading |
 | **Wireframe** | `wireframe` | Edge lines only, no fill |
 | **Normals** | `normals` | World-space surface normals mapped to RGB |
 | **Depth** | `depth` | Linearized depth as grayscale |

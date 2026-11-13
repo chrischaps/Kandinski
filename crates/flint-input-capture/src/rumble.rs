@@ -259,14 +259,14 @@ impl RumbleEngine {
 }
 
 /// The standard sink adapter for [`crate::spawn_with_rumble`] callers: maps
-/// flint-music's [`flint_music::HapticEvent`]s (already raw-clock addressed
+/// flint-rhythm's [`flint_rhythm::HapticEvent`]s (already raw-clock addressed
 /// by `ChartSession`) onto the rumble channel. Send failures are ignored —
 /// the capture thread being gone means the session is tearing down, and its
 /// exit path has already silenced the motors.
 pub fn haptic_sink(
     tx: std::sync::mpsc::Sender<RumbleCommand>,
-) -> Box<dyn FnMut(flint_music::HapticEvent) + Send> {
-    use flint_music::HapticEvent;
+) -> Box<dyn FnMut(flint_rhythm::HapticEvent) + Send> {
+    use flint_rhythm::HapticEvent;
     Box::new(move |ev| {
         let _ = match ev {
             HapticEvent::Burst {
@@ -546,8 +546,8 @@ pub fn spike_rumble(feel: bool) -> flint_core::Result<RumbleSpikeReport> {
 
 #[cfg(all(feature = "gamepad", not(target_arch = "wasm32")))]
 fn time_effect_play() -> flint_core::Result<CallStats> {
-    use gilrs::ff::{BaseEffect, BaseEffectType, EffectBuilder, Replay, Ticks};
-    let mut gilrs = gilrs::Gilrs::new().map_err(|e| {
+    use crate::pad::ff::{BaseEffect, BaseEffectType, EffectBuilder, Replay, Ticks};
+    let mut gilrs = crate::pad::Gilrs::new().map_err(|e| {
         flint_core::FlintError::InputError(format!("gamepad backend unavailable: {e}"))
     })?;
     let ids: Vec<_> = gilrs

@@ -39,7 +39,11 @@ fn gpu_override() -> Option<String> {
 }
 
 fn name_filter() -> Option<String> {
-    gpu_override().or_else(|| std::env::var("WGPU_ADAPTER_NAME").ok().filter(|s| !s.is_empty()))
+    gpu_override().or_else(|| {
+        std::env::var("WGPU_ADAPTER_NAME")
+            .ok()
+            .filter(|s| !s.is_empty())
+    })
 }
 
 /// Backends to enumerate: `WGPU_BACKEND` env var, else all.
@@ -221,7 +225,7 @@ pub fn list_adapters() -> Vec<String> {
 mod tests {
     use crate::context::RenderError;
 
-    // `render-suite` tells "no GPU" from a failed case by these words
+    // `flint goldens` tells "no GPU" from a failed case by these words
     // (`looks_like_no_gpu`), so the hint goes after them
     #[test]
     fn no_adapter_error_keeps_its_words_and_names_the_fix() {
