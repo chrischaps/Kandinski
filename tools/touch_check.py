@@ -19,9 +19,9 @@ telemetry line and what the screen showed from frames.
           the menu button -> RESUME -> the menu button -> QUIT -> tour BACK ->
           title -> ARCADE -> drive. A frame every 0.5 s.
 
-Frames land in snapshots/touch/<size>/, logs beside them. The player's own
-save (save/persist.toml) is put aside for the flow and put back after,
-whatever happens, as tools/menu_flow.py does.
+Frames land in snapshots/touch/<size>/, logs beside them. Every run keeps its
+save in a scratch folder of its own (`--save-dir`, Flint #726), so the flow
+starts clean and the player's real save is never read or touched.
 
 Where the fingers land is computed here from the same layout numbers
 scripts/hud.rhai draws from (see `Layout`): if a menu moves, change both.
@@ -31,13 +31,13 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 
 ROOT = os.path.normpath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, os.path.dirname(__file__))
 import build_scene  # noqa: E402
 
 PLAYER = os.path.join(ROOT, "engine", "target", "release", "flint-player.exe")
-SAVE = os.path.join(ROOT, "save", "persist.toml")
 OUT = os.path.join(ROOT, "snapshots", "touch")
 SIZES = {"phone": (844, 390), "tablet": (1180, 820)}
 TMIN = 44.0
@@ -59,8 +59,9 @@ class Layout:
         self.boost = (w - 84, h - 204)
         self.menu = (cx + 150, 36)
         # hud.rhai: the title's rows
-        pitch = max(62 * u, TMIN + 2)
-        self.title = [(cx, h * 0.545 + i * pitch - 4 * u + (pitch - 2) * 0.5) for i in range(3)]
+        pitch = max(59 * u, TMIN + 2)
+        my = min(h * 0.50, h * 0.905 - 4 * pitch)
+        self.title = [(cx, my + i * pitch - 4 * u + (pitch - 2) * 0.5) for i in range(4)]     # the fourth is SETTINGS
         # the tour screen
         x0 = 40 * u
         W = w - 80 * u
@@ -83,7 +84,7 @@ class Layout:
         self.brief_start = (cx + 14 * u + bw * 0.5, by + bh * 0.5)
         # the pause menu's rows
         rh = max(44 * u, TMIN)
-        self.pause = [(cx, h * 0.24 + 130 * u + k * (rh + 12 * u) + rh * 0.5) for k in range(3)]
+        self.pause = [(cx, h * 0.21 + 110 * u + k * (rh + 12 * u) + rh * 0.5) for k in range(4)]   # RESUME, RESTART, SETTINGS, QUIT
 
     def stick_dx(self, value):
         """Finger travel from the stick's base for a deflection of `value`."""
@@ -101,7 +102,8 @@ def run(scene_kw, script, seconds, size, tag, shots=None):
         f.write(build_scene.build(**scene_kw))
     with open(inp, "w", newline="\n") as f:
         f.write(script.strip() + "\n")
-    cmd = [PLAYER, scene, "--schemas", "engine/schemas", "--schemas", "schemas", "--no-activate",
+    save_dir = tempfile.mkdtemp(prefix="kandinski_touch_")
+    cmd = [PLAYER, scene, "--save-dir", save_dir, "--schemas", "engine/schemas", "--schemas", "schemas", "--no-activate",
            "--width", str(w), "--height", str(h), "--pixels-per-point", "1", "--frame-step", "0.0166667",
            "--exit-after", str(seconds), "--music-volume", "0", "--sfx-volume", "0",
            "--touch-controls", "always", "--input-script", inp]
@@ -115,6 +117,10 @@ def run(scene_kw, script, seconds, size, tag, shots=None):
         p = subprocess.run(cmd, cwd=ROOT, env=env, capture_output=True, text=True, encoding="utf-8", errors="replace")
     finally:
         os.remove(scene)
+        save = os.path.join(save_dir, "default.toml")
+        if os.path.exists(save):
+            shutil.copyfile(save, os.path.join(out, f"{tag}_save.toml"))
+        shutil.rmtree(save_dir, ignore_errors=True)
     lines = (p.stdout + p.stderr).splitlines()
     with open(os.path.join(out, f"{tag}.log"), "w", encoding="utf-8") as f:
         f.write("\n".join(lines))
@@ -264,7 +270,7 @@ def flow(size):
     tap(L.pause[0], 1.0, "RESUME")
     t[0] += 1.5
     out += [f"{t[0]:.2f} touch 2 {L.menu[0]:.0f} {L.menu[1]}     # the menu button again", f"{t[0] + 0.1:.2f} lift 2"]
-    tap(L.pause[2], 1.0, "QUIT TO TOUR")
+    tap(L.pause[3], 1.0, "QUIT TO TOUR")
     tap(L.tour_back, 1.2, "tour BACK -> title")
     tap(L.title[0], 1.2, "ARCADE")
     go = t[0] + 2.8
@@ -273,21 +279,7 @@ def flow(size):
             f"{go + 3.0:.2f} drag 1 {sx} {sy} 0.2",
             f"{go + 4.0:.2f} lift 1"]
     end = go + 5.0
-    os.makedirs(os.path.dirname(SAVE), exist_ok=True)
-    aside = SAVE + ".aside"
-    had = os.path.exists(SAVE)
-    if had:
-        shutil.copyfile(SAVE, aside)
-        os.remove(SAVE)
-    try:
-        lines = run(dict(persist=True, telemetry=True, telemetry_hz=2.0), "\n".join(out), end, size, "flow", shots=(0.5, 0.5))
-    finally:
-        if os.path.exists(SAVE):
-            shutil.copyfile(SAVE, os.path.join(OUT, size, "flow_save.toml"))
-            os.remove(SAVE)
-        if had:
-            shutil.copyfile(aside, SAVE)
-            os.remove(aside)
+    lines = run(dict(persist=True, telemetry=True, telemetry_hz=2.0), "\n".join(out), end, size, "flow", shots=(0.5, 0.5))
     tm = telemetry(lines)
     bad = problems(lines)
     v = max((r["v"] for r in tm), default=0.0)

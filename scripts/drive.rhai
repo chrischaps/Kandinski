@@ -35,6 +35,7 @@
 
 import "pools" as pl;
 import "tour" as tour;
+import "beat" as bt;
 
 // ── tuning: the world ───────────────────────────────────────────
 let SEG = 8.0;               // tile length (tools/gen_tiles.py L)
@@ -297,9 +298,33 @@ let gates = [];
 let n_seg = 0;
 
 // ── entities ────────────────────────────────────────────────────
-let id_seg = [];
 let id_tile = [];
 let tile_seg = [];
+
+// ── the pulse: the world moves with the music ──
+// The two music loops start with the scene and never stop (audio.rhai only
+// moves their volume), so the music's place is the time this script has
+// run. scripts/lib/beat.rhai (tools/gen_beat.py, measured from the OGGs)
+// says what each sixteenth holds. Flint has no playback clock to ask, so
+// this is two clocks agreeing, not one: PULSE_LAG is the trim between them.
+const PULSE_LAG = 0.03;      // s the picture waits for the sound card
+const WAVE_V = 170.0;        // m/s: how fast a hit's light runs down the road, away from the car
+const GRID_GAIN = 2.4;       // grid radiance added at the crest of a full kick
+// what the roadside shows of it: windows (tools/gen_models.py's tower
+// colours) and the trees' trim lines, each at rest and x (1 + gain) on a hit
+const WINDOW_RGB = [[0.20, 0.15, 0.07], [0.11, 0.17, 0.20], [0.20, 0.11, 0.16]];
+const WINDOW_GAIN = 1.6;
+const PINE_TRIM = [0.3, 1.0, 0.85];
+const TRIM_GAIN = 1.1;
+let beat_drive = #{};
+let beat_title = #{};
+let mus_t = 0.0;             // seconds the loops have played
+let pulse_amt = 1.0;         // 0 off to 1 full: game_state.pulse, a setting hud.rhai owns
+let echo_s = 0.0;            // how much kick there has been lately: the sun's rings
+let tile_grid = [];          // each tile's grid colour before the pulse
+let palm_trim = [0.5, 0.1, 0.4];   // the palms' ring colour at rest (the theme's accent)
+let pulse_lit = false;       // the roadside is wearing pulse colours
+let pulse_ok = true;         // false on the web: its music starts when its late bundle lands, a moment no script can see
 let id_pool = [];
 let pool_size = [];
 let used_prev = [];
@@ -506,9 +531,9 @@ fn on_init() {
 
     // ---- entities -------------------------------------------------
     for i in 0..NT {
-        id_seg.push(get_entity(`seg_${i}`));
         id_tile.push(get_entity(`tile_${i}`));
         tile_seg.push(-1);
+        tile_grid.push([0.0, 0.0, 0.0]);
         vis_x.push(0.0); vis_dx.push(0.0); vis_y.push(0.0);
     }
     let sizes = pl::pools();
@@ -547,7 +572,7 @@ fn on_init() {
     id_body = get_entity("car_body");
     for n in ["wheel_fl", "wheel_fr", "wheel_rl", "wheel_rr"] { id_wheel.push(get_entity(n)); }
     // nothing here casts a shadow, and thin neon lines want every sample
-    set_quality(#{ shadows: false, msaa: 4 });
+    // (render quality is a setting: hud.rhai applies it)
     set_material_override(id_body, "tail", 0.55, 0.012, 0.03, 1.0);
     for i in 0..pl::N_TRAFFIC { set_material_override(id_traffic[i], "tail", 0.50, 0.01, 0.02, 1.0); }
 
@@ -573,6 +598,11 @@ fn on_init() {
     boot_speed = get_field(me, "game_state", "start_speed");
     no_clock = get_field(me, "game_state", "no_clock");
     do_persist = get_field(me, "game_state", "persist");
+
+    beat_drive = bt::drive();
+    beat_title = bt::title();
+    pulse_amt = get_field(me, "game_state", "pulse");
+    pulse_ok = gpu_info().platform != "web";
 
     // ---- the save: version 2, every key optional ------------------
     //   save_version, hi_score (arcade), endless_best, paint,
@@ -612,6 +642,7 @@ fn on_init() {
 }
 
 fn on_update() {
+    mus_t += delta_time();       // the loops play from the scene's first frame
     if !ready { return; }
     let me = self_entity();
     let dt = min(delta_time(), 0.05);
@@ -632,6 +663,15 @@ fn on_update() {
     let nav_x = 0; let nav_y = 0;
     if is_action_just_pressed("menu_left") { nav_x = -1; } else if is_action_just_pressed("menu_right") { nav_x = 1; }
     if is_action_just_pressed("menu_up") { nav_y = -1; } else if is_action_just_pressed("menu_down") { nav_y = 1; }
+    // the settings (hud.rhai owns them: the Settings screen, the save, the M key)
+    let pulse_set = if pulse_ok { get_field(me, "game_state", "pulse") } else { 0.0 };
+    if pulse_set <= 0.0 && pulse_amt > 0.0 {
+        // switched off: every tile takes its own colour back
+        for j in 0..NT { tile_seg[j] = -1; }
+    }
+    pulse_amt = pulse_set;
+    let shake_amt = get_field(me, "game_state", "shake_amt");
+    let fx_amt = get_field(me, "game_state", "fx_amt");
     // the pause menu's orders (hud.rhai writes them: it is the one script awake while paused)
     // and a tap's: hud.rhai tests each tap against the row it drew and sends
     // what was chosen (title:n | ev:n | paint:n | res:n | ok | back). A tapped
@@ -639,16 +679,29 @@ fn on_update() {
     let cmd = get_field(me, "game_state", "cmd");
     if cmd != "" { set_field(me, "game_state", "cmd", ""); }
     let tap_k = ""; let tap_n = -1;
+    if cmd == "erase" {
+        // Settings' RESET PROGRESS (hud.rhai has already emptied the save)
+        for i in 0..medals.len() { medals[i] = 0; bests[i] = -1.0; }
+        hi_score = 0.0; endless_best = 0.0; paint = 0; m_title = 0;
+        let pc = PAINTS[0].c;
+        set_material_override(id_body, "body", pc[0], pc[1], pc[2], 1.0);
+        set_material_override(id_body, "body_hi", pc[0] * 2.0, pc[1] * 2.0, pc[2] * 2.0, 1.0);
+        set_material_override(id_body, "body_shade", pc[0] * 0.36, pc[1] * 0.36, pc[2] * 0.36, 1.0);
+        mode = "title"; mode_t = 1.2; ev = "ui_no"; dirty = true;
+    }
     if cmd == "ok" { confirm = true; }
     else if cmd == "back" { back = true; }
     else if cmd.contains(":") { let parts = cmd.split(":"); tap_k = parts[0]; tap_n = parts[1].parse_int(); }
     let was_mode = mode;
     if mode == "title" {
         if mode_t > 0.4 {
-            if nav_y != 0 { m_title = (m_title + nav_y + 3) % 3; ev = "ui_move"; dirty = true; }
-            if tap_k == "title" && tap_n >= 0 && tap_n < 3 { m_title = tap_n; confirm = true; dirty = true; }
+            if nav_y != 0 { m_title = (m_title + nav_y + 4) % 4; ev = "ui_move"; dirty = true; }
+            if tap_k == "title" && tap_n >= 0 && tap_n < 4 { m_title = tap_n; confirm = true; dirty = true; }
             if confirm {
-                if m_title == 0 {
+                if m_title == 3 {
+                    // the Settings screen is hud.rhai's; it sends "back" when it is closed
+                    mode = "settings"; mode_t = 0.0; ev = "ui_ok";
+                } else if m_title == 0 {
                     g_kind = "arcade"; rules = true;
                     if road_id != "arcade" { cur = tour::arcade(); req_load = true; } else { req_reset = true; }
                     mode = "countdown"; mode_t = 0.0; count_n = 4; ev = "start";
@@ -660,6 +713,8 @@ fn on_update() {
                 } else { ev = "ui_no"; }
             }
         }
+    } else if mode == "settings" {
+        if back { mode = "title"; mode_t = 1.2; ev = "ui_move"; }
     } else if mode == "tour" {
         if nav_y != 0 {
             m_row += nav_y;
@@ -877,7 +932,7 @@ fn on_update() {
     }
     if mode != was_mode { dirty = true; }
     let driving = mode == "drive";
-    let attract = mode == "title" || mode == "tour";
+    let attract = mode == "title" || mode == "tour" || mode == "settings";
     let self_drive = auto || attract || assist;
     let stage_c = if stage < n_sec { stage } else { n_sec - 1 };   // the section the car is in
 
@@ -1321,6 +1376,29 @@ fn on_update() {
     let py = yb + 0.5 * f * ((yc - ya) + f * ((2.0 * ya - 5.0 * yb + 4.0 * yc - yd) + f * (3.0 * (yb - yc) + yd - ya)));
     let slope0 = 0.5 * ((yc - ya) + f * (2.0 * (2.0 * ya - 5.0 * yb + 4.0 * yc - yd) + 3.0 * f * (3.0 * (yb - yc) + yd - ya))) / SEG;
 
+    // ═══ the pulse ══════════════════════════════════════════════
+    // where the music is, and what this sixteenth and the two before it
+    // hold: a hit is full at its start and dies away over the next few
+    let p_title = mode == "title" || mode == "tour" || mode == "brief" || mode == "settings";
+    let p_stp = if p_title { beat_title.step } else { beat_drive.step };
+    let p_n = if p_title { beat_title.n } else { beat_drive.n };
+    let p_kick = if p_title { beat_title.kick } else { beat_drive.kick };
+    let p_high = if p_title { beat_title.high } else { beat_drive.high };
+    let p_mt = mus_t - PULSE_LAG;
+    let p_sf = p_mt / p_stp + p_n.to_float() * 8.0;
+    let p_si = floor(p_sf).to_int();
+    let p_fr = p_sf - p_si.to_float();
+    let kick_now = 0.0; let high_now = 0.0;
+    for b in 0..3 {
+        let x = p_fr + b.to_float();
+        let fall = 1.0 / (1.0 + 1.1 * x + 0.6 * x * x);
+        let i = (p_si - b) % p_n;
+        kick_now = max(kick_now, p_kick[i].to_float() * fall);
+        high_now = max(high_now, p_high[i].to_float() * fall);
+    }
+    kick_now *= pulse_amt / 9.0; high_now *= pulse_amt / 9.0;
+    echo_s += (kick_now - echo_s) * ease(if kick_now > echo_s { 14.0 } else { 0.6 }, dt);
+
     // ═══ lay the road ═══════════════════════════════════════════
     let cb = t_curve[base];
     let dx = -f * cb;
@@ -1338,25 +1416,17 @@ fn on_update() {
         x += dx;
         dx += t_curve[sg];
     }
+    let vis_w = [];      // the kick's wave at each tile, 0-1, and the bright sixteenths'
+    let vis_h = [];
     for kk in 0..NT {
         let k = kk - BACK;
         let sg = base + k;
         let j = sg % NT;
-        let s = vis_dx[kk] / SEG;
-        // shear [[1,-s],[0,1]] = Rot(phi) * diag(sx, sz) * Rot(theta)
-        let q = sqrt(1.0 + s * s * 0.25);
-        let r = abs(s) * 0.5;
-        let a1 = if s > 0.0 { -0.5 * PI() } else if s < 0.0 { 0.5 * PI() } else { 0.0 };
-        let a2 = atan2(s * 0.5, 1.0);
-        let theta = (a2 - a1) * 0.5;
-        let phi = (a2 + a1) * 0.5;
-        let seg_id = id_seg[j];
-        set_position(seg_id, vis_x[kk], vis_y[kk], -(k.to_float() - f) * SEG);
-        set_rotation(seg_id, 0.0, rad_to_deg(-phi), 0.0);
-        set_field(seg_id, "transform", "scale", [q + r, 1.0, q - r]);
-        let pitch = atan2(t_y[sg + 1] - t_y[sg], SEG);
-        let hb = -theta * 0.5; let hp = pitch * 0.5;
-        set_rotation_quat(id_tile[j], cos(hb) * sin(hp), sin(hb) * cos(hp), -sin(hb) * sin(hp), cos(hb) * cos(hp));
+        // one sheared entity (Flint #625): x follows the bend and y the hill,
+        // both per metre of z, so every joint meets exactly
+        let tile_id = id_tile[j];
+        set_position(tile_id, vis_x[kk], vis_y[kk], -(k.to_float() - f) * SEG);
+        set_shear(tile_id, #{ xz: -vis_dx[kk] / SEG, yz: -(t_y[sg + 1] - t_y[sg]) / SEG });
 
         // a tile that just came round to the horizon takes the colours of
         // the stage it now lies in: a new stage arrives from the distance
@@ -1373,12 +1443,33 @@ fn on_update() {
             }
             let tid = id_tile[j];
             let c = mix3(P_GRID[s0], P_GRID[s1], t);     set_material_override(tid, "grid", c[0], c[1], c[2], 1.0);
+            tile_grid[j] = c;
             c = mix3(P_EDGE[s0], P_EDGE[s1], t);         set_material_override(tid, "edge", c[0], c[1], c[2], 1.0);
             c = mix3(P_LANE[s0], P_LANE[s1], t);         set_material_override(tid, "lane", c[0], c[1], c[2], 1.0);
             c = mix3(P_SHOULDER[s0], P_SHOULDER[s1], t); set_material_override(tid, "shoulder", c[0], c[1], c[2], 1.0);
             c = mix3(P_ROAD[s0], P_ROAD[s1], t);         set_material_override(tid, "road", c[0], c[1], c[2], 1.0);
             c = mix3(P_GROUND[s0], P_GROUND[s1], t);     set_material_override(tid, "ground", c[0], c[1], c[2], 1.0);
         }
+        // each hit sends a crest of light down the road, away from the car:
+        // a tile shows the music as it was d / WAVE_V seconds ago
+        let w = 0.0; let wh = 0.0;
+        if pulse_amt > 0.0 {
+            let d = max(k.to_float() - f, 0.0) * SEG;
+            let sf = p_sf - d / (WAVE_V * p_stp);
+            let si = floor(sf).to_int();
+            let x0 = sf - si.to_float(); let x1 = x0 + 1.0; let x2 = x0 + 2.0;
+            let f0 = 1.0 / (1.0 + 1.1 * x0 + 0.6 * x0 * x0);
+            let f1 = 1.0 / (1.0 + 1.1 * x1 + 0.6 * x1 * x1);
+            let f2 = 1.0 / (1.0 + 1.1 * x2 + 0.6 * x2 * x2);
+            let i0 = si % p_n; let i1 = (si - 1) % p_n; let i2 = (si - 2) % p_n;
+            let far = pulse_amt / 9.0 * (1.0 - 0.45 * min(d / 450.0, 1.0));
+            w = max(p_kick[i0].to_float() * f0, max(p_kick[i1].to_float() * f1, p_kick[i2].to_float() * f2)) * far;
+            wh = max(p_high[i0].to_float() * f0, max(p_high[i1].to_float() * f1, p_high[i2].to_float() * f2)) * far;
+            let m = 1.0 + GRID_GAIN * w;
+            let g = tile_grid[j];
+            set_material_override(tile_id, "grid", g[0] * m, g[1] * m, g[2] * m, 1.0);
+        }
+        vis_w.push(w); vis_h.push(wh);
     }
 
     // ═══ scenery ════════════════════════════════════════════════
@@ -1404,6 +1495,23 @@ fn on_update() {
                     if ty >= 5 && ty <= 7 { yaw = (hash01(sg, 4) * 3.99).to_int().to_float() * 90.0; }
                     set_rotation(id, 0.0, yaw, 0.0);
                     used[ty] = n + 1;
+                    // the roadside keeps time as the wave passes it: a city's
+                    // windows are its equaliser (one building in three follows
+                    // the bright sixteenths, the rest the kick), trees their trim
+                    if pulse_lit || pulse_amt > 0.0 {
+                        if ty >= 5 && ty <= 7 {
+                            let e = if (sg + side) % 3 == 0 { vis_h[kk] } else { vis_w[kk] };
+                            let m = 1.0 + WINDOW_GAIN * e;
+                            let c = WINDOW_RGB[ty - 5];
+                            set_material_override(id, "window", c[0] * m, c[1] * m, c[2] * m, 1.0);
+                        } else if ty == 1 {
+                            let m = 1.0 + TRIM_GAIN * vis_w[kk];
+                            set_material_override(id, "trim", palm_trim[0] * m, palm_trim[1] * m, palm_trim[2] * m, 1.0);
+                        } else if ty == 2 {
+                            let m = 1.0 + TRIM_GAIN * vis_w[kk];
+                            set_material_override(id, "trim", PINE_TRIM[0] * m, PINE_TRIM[1] * m, PINE_TRIM[2] * m, 1.0);
+                        }
+                    }
                     if k <= 1 && abs(z) < 2.4 && ty != 3 && ty < 5 && abs(px - wx) < 1.5 { hit_prop = true; }
                     if k <= 1 && abs(z) < 2.4 && ty >= 8 && abs(px - wx) < 1.0 { hit_prop = true; }
                     if k <= 1 && abs(z) < 2.4 && ty == 3 && abs(px - wx) < 0.9 { hit_prop = true; }
@@ -1412,9 +1520,12 @@ fn on_update() {
         }
     }
     for t in 1..TYPE_NAMES.len() {
-        for n in used[t]..used_prev[t] { set_position(id_pool[t][n], 0.0, -1000.0, 0.0); }
+        // a pool entity the road does not need is hidden (Flint #628), not parked
+        for n in used[t]..used_prev[t] { set_visible(id_pool[t][n], false); }
+        for n in used_prev[t]..used[t] { set_visible(id_pool[t][n], true); }
         used_prev[t] = used[t];
     }
+    pulse_lit = pulse_amt > 0.0;
     // gates
     let gn = 0;
     for g in gates {
@@ -1426,7 +1537,7 @@ fn on_update() {
             gn += 1;
         }
     }
-    for n in gn..id_gate.len() { set_position(id_gate[n], 0.0, -1000.0, 0.0); }
+    for n in 0..id_gate.len() { set_visible(id_gate[n], n < gn); }
 
     // ═══ rivals ═════════════════════════════════════════════════
     // Five cars on a cheap kinematic model: the speed the road allows
@@ -1522,7 +1633,7 @@ fn on_update() {
         let solid = !(rival && ghost);
         if (rival && !race_on) || (!rival && t >= n_act) {
             tr_pos[t] = pos + 5000.0;
-            if tr_shown[t] { tr_shown[t] = false; set_position(id, 0.0, -1000.0, 0.0); }
+            if tr_shown[t] { tr_shown[t] = false; set_visible(id, false); }
             continue;
         }
         tr_pos[t] += tr_v[t] * dt;
@@ -1561,7 +1672,7 @@ fn on_update() {
             let kk = k + BACK;
             let wx = vis_x[kk] + vis_dx[kk] * fr + tr_x[t];
             let wy = vis_y[kk] + (vis_y[kk + 1] - vis_y[kk]) * fr;
-            tr_shown[t] = true;
+            if !tr_shown[t] { tr_shown[t] = true; set_visible(id, true); }
             set_position(id, wx, wy, -rel);
             // heading and pitch are blended toward the next tile's, not stepped at the joint
             let tdx = vis_dx[kk] + (vis_dx[kk + 1] - vis_dx[kk]) * fr;
@@ -1615,7 +1726,7 @@ fn on_update() {
             }
         } else if tr_shown[t] {
             tr_shown[t] = false;
-            set_position(id, 0.0, -1000.0, 0.0);
+            set_visible(id, false);
         }
     }
     draft += (draft_t - draft) * ease(if draft_t > draft { 3.0 } else { 5.0 }, dt);
@@ -1702,12 +1813,20 @@ fn on_update() {
         rise = 0.12 * clamp((base - stage_start[q0]).to_float() / (stage_start[q0 + 1] - stage_start[q0]).to_float(), 0.0, 1.0);
     }
     set_post_style_param("horizon", "sun_y", na[0] + (nb[0] - na[0]) * kt + rise - slope0 * 0.0);
-    set_post_style_param("horizon", "sun_size", na[1] + (nb[1] - na[1]) * kt);
+    // the sky keeps time: the kick swells the sun and its bed of light and
+    // lifts the horizon band, the bright sixteenths wake the stars, and a
+    // ring leaves the sun on each beat while there is a kick to count
+    set_post_style_param("horizon", "sun_size", (na[1] + (nb[1] - na[1]) * kt) * (1.0 + 0.035 * kick_now));
+    set_post_style_param("horizon", "halo", 1.0 + 1.5 * kick_now);
+    set_post_style_param("horizon", "echo", 0.55 * echo_s);
+    let p_beat = p_sf / 4.0;
+    set_post_style_param("horizon", "echo_phase", p_beat - floor(p_beat));
+    set_bloom_intensity(0.22 * (1.0 + 0.25 * kick_now));
     set_post_style_param("horizon", "sun_gain", na[2] + (nb[2] - na[2]) * kt);
     set_post_style_param("horizon", "stripes", na[3] + (nb[3] - na[3]) * kt);
     set_post_style_param("horizon", "rings", na[4] + (nb[4] - na[4]) * kt);
-    set_post_style_param("horizon", "stars", na[5] + (nb[5] - na[5]) * kt);
-    set_post_style_param("horizon", "glow_gain", na[6] + (nb[6] - na[6]) * kt);
+    set_post_style_param("horizon", "stars", (na[5] + (nb[5] - na[5]) * kt) * (1.0 + 1.2 * high_now));
+    set_post_style_param("horizon", "glow_gain", (na[6] + (nb[6] - na[6]) * kt) * (1.0 + 0.45 * kick_now));
     set_post_style_param("horizon", "haze", na[7] + (nb[7] - na[7]) * kt);
     set_post_style_param("horizon", "sun_x", sun_lean);
     set_post_style_param("horizon", "stripe_phase", now * 0.10);
@@ -1721,7 +1840,8 @@ fn on_update() {
         last_sky_key = sky_key;
         let w = mix3(P_WIRE[k0], P_WIRE[k1], kt);
         for id in id_mount { set_material_override(id, "wire", w[0], w[1], w[2], 1.0); }
-        for id in id_pool[1] { set_material_override(id, "trim", accent[0] * 0.7, accent[1] * 0.7, accent[2] * 0.7, 1.0); }
+        palm_trim = [accent[0] * 0.7, accent[1] * 0.7, accent[2] * 0.7];
+        for id in id_pool[1] { set_material_override(id, "trim", palm_trim[0], palm_trim[1], palm_trim[2], 1.0); }
         set_material_override(id_body, "under", accent[0] * 0.035, accent[1] * 0.035, accent[2] * 0.035, 1.0);
         set_material_override(id_body, "trim", accent[0] * 0.6, accent[1] * 0.6, accent[2] * 0.6, 1.0);
         for id in id_gate { set_material_override(id, "neon", accent[0], accent[1], accent[2], 1.0); }
@@ -1741,8 +1861,8 @@ fn on_update() {
     cam_kick -= cam_kick * ease(8.0, dt);
     boost_s += ((if boosting { 1.0 } else { 0.0 }) - boost_s) * ease(4.5, dt);
     cam_a += (clamp(dir * 0.85, -0.30, 0.30) - cam_a) * ease(3.2, dt);
-    let jx = (shake * 0.30 + offroad * sp1 * 0.07) * sin(now * 47.0);
-    let jy = (shake * 0.24 + offroad * sp1 * 0.09) * sin(now * 59.0 + 1.3);
+    let jx = (shake * 0.30 + offroad * sp1 * 0.07) * shake_amt * sin(now * 47.0);
+    let jy = (shake * 0.24 + offroad * sp1 * 0.09) * shake_amt * sin(now * 59.0 + 1.3);
     // The road ahead is read at FIXED DISTANCES, interpolated between tile
     // starts. Reading it at a tile index makes the sample slide 8 m toward
     // the car and snap back at every joint: the picture pumps on any slope
@@ -1766,7 +1886,7 @@ fn on_update() {
         set_camera_roll(clamp(-roll * 0.30 - c0 * 0.10 * sp1, -0.035, 0.035));
     }
     set_radial_blur(clamp((sp1 - 0.6) * 0.3 + boost_s * 0.07, 0.0, 0.18));
-    set_post_style_param("crt", "aberration", 0.5 + 1.6 * sp1 * sp1 + shake * 3.0 + boost_s * 2.0);
+    set_post_style_param("crt", "aberration", (0.5 + 1.6 * sp1 * sp1 + shake * shake_amt * 3.0 + boost_s * 2.0) * fx_amt);
 
     // ═══ telemetry ══════════════════════════════════════════════
     if telemetry {

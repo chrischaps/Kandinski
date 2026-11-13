@@ -78,6 +78,8 @@ play_windowed.bat    # 1600 x 900
 | Menus | arrows / WASD, Enter, Backspace | stick / d-pad, A or Start, B | tap a row, a card, a paint or a button (BACK is a button) |
 | Pause (resume, restart, quit) | P | Back | the three-bar button beside the clock |
 | Restart the event (arcade: back to the title) | R | Y | pause, then RESTART |
+| The pulse: how much the world moves with the music (off, half, full) | M | | Settings |
+| Settings (volumes, the pulse, screen glass, camera shake, quality, km/h or mph) | on the title and in the pause menu | the same | the same |
 
 Escape closes the window (it is the player's key, not the game's).
 
@@ -95,16 +97,18 @@ drift, scored by angle x speed x time and banked when it ends cleanly.
 Overtaking close is a **close pass**. Drifts, close passes, slipstreams and
 air over a crest all fill the boost meter.
 
-The save is `save/persist.toml` (medals, bests, paint, the arcade and HORIZON
-high scores); delete it to start again.
+The save is `%APPDATA%\kandinski\saves\default.toml` (medals, bests, paint,
+the arcade and HORIZON high scores, the settings); delete it, or press RESET
+PROGRESS twice in Settings, to start again. An older `save/persist.toml` in
+the game's folder is read once, on the first launch after the move.
 
 ## How it works
 
 - **The road is a treadmill.** The car stays at the origin; `scripts/drive.rhai`
   lays 64 pooled road tiles ahead of it every frame from per-segment curve and
   height arrays, exactly as a scanline racer lays out its strips. Curves shear
-  each tile sideways (Flint has no shear, so a tile is two entities: the SVD of
-  the shear), hills pitch it.
+  each tile sideways and hills shear it upward (`set_shear`), so every joint
+  meets exactly.
 - **Every road is generated.** One generator turns a seed and a list of
   sections (land, length, how hard the bends, how high the hills) into a road.
   The arcade run, the fifteen events and HORIZON's unending road are all rows
@@ -120,6 +124,12 @@ high scores); delete it to start again.
 - **The sky is a shader.** `styles/horizon.*` is a Flint user style at the HDR
   stage that paints the gradient, stars, horizon band and the sun, and feeds
   bloom. A land is a row of its numbers. `styles/crt.*` adds the glass.
+- **The world keeps time.** `tools/gen_beat.py` measures the two music loops
+  into a table of what each sixteenth holds. On each kick a crest of light
+  runs down the road grid away from the car, city windows and the trees' trim
+  lines take it as it passes, the sun swells and a ring leaves its rim on the
+  beat; the bright sixteenths wake the stars. Desktop only for now: the web
+  player cannot yet tell a script where its music is.
 - **Scenery is type.** Palms, pines, towers and mountains carry Flint's
   per-entity ASCII style with edge glyphs; `display_bloom` makes them tubes.
 - **Everything else is generated**: models by `tools/gen_models.py` and

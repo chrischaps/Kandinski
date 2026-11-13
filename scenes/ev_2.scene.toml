@@ -15,6 +15,7 @@
 #  S / Down    brake               Space              handbrake
 #  Shift       boost               Enter              confirm
 #  P           pause               R                  restart the event (arcade: title)
+#  M           the pulse: how much the world moves with the music (off / soft / full)
 #  Menus: arrows / WASD, Enter, Backspace
 #  Gamepad: stick steers, RT accelerates, LT brakes, A handbrake,
 #           X / RB boost, Start / A confirm, B back, Back pauses
@@ -33,9 +34,12 @@ fov = 62.0
 near = 0.3
 far = 4000.0
 
-# The world is unlit: a flat ambient of 3 and no sun, so a material's colour
-# is its radiance. Colour 1 is radiance 3, which blooms; the road is ~0.005.
+# The world is unlit: a flat ambient of 3, no lights and no shadow pass
+# (Flint #627), so a material's colour is its radiance. Colour 1 is radiance
+# 3, which blooms; the road is ~0.005.
 [environment]
+shadows = false
+default_lights = false
 ambient_sky = [3.0, 3.0, 3.0]
 ambient_ground = [3.0, 3.0, 3.0]
 
@@ -75,13 +79,6 @@ levels = 5
 # The glass (styles/crt.*).
 [post_process.styles.crt]
 
-[entities.sun]
-[entities.sun.light]
-type = "directional"
-direction = [0.0, 1.0, 0.0]
-color = [1.0, 1.0, 1.0]
-intensity = 0.0
-
 # ── Game ────────────────────────────────────────────────────────
 [entities.game]
 [entities.game.game_state]
@@ -103,6 +100,7 @@ ap_assist = false
 ghost_rivals = false
 start_event = 2
 no_clock = false
+pulse = 1.0
 persist = false
 [entities.game.script]
 source = "drive.rhai"
@@ -219,644 +217,388 @@ position = [0.8, 0.33, 1.28]
 [entities.wheel_rr.model]
 asset = "car_wheel"
 
-# ── Road tiles: seg_i shears, tile_i (its child) pitches ──
-[entities.seg_0]
-[entities.seg_0.transform]
-position = [0, -1000, 0]
+# ── Road tiles: one entity each, sheared sideways for a bend and upward for a hill ──
 [entities.tile_0]
-parent = "seg_0"
 [entities.tile_0.transform]
-position = [0, 0, 0]
+position = [0, -1000, 0]
 [entities.tile_0.model]
 asset = "tile_a"
 
-[entities.seg_1]
-[entities.seg_1.transform]
-position = [0, -1000, 0]
 [entities.tile_1]
-parent = "seg_1"
 [entities.tile_1.transform]
-position = [0, 0, 0]
+position = [0, -1000, 0]
 [entities.tile_1.model]
 asset = "tile_b"
 
-[entities.seg_2]
-[entities.seg_2.transform]
-position = [0, -1000, 0]
 [entities.tile_2]
-parent = "seg_2"
 [entities.tile_2.transform]
-position = [0, 0, 0]
+position = [0, -1000, 0]
 [entities.tile_2.model]
 asset = "tile_a"
 
-[entities.seg_3]
-[entities.seg_3.transform]
-position = [0, -1000, 0]
 [entities.tile_3]
-parent = "seg_3"
 [entities.tile_3.transform]
-position = [0, 0, 0]
+position = [0, -1000, 0]
 [entities.tile_3.model]
 asset = "tile_b"
 
-[entities.seg_4]
-[entities.seg_4.transform]
-position = [0, -1000, 0]
 [entities.tile_4]
-parent = "seg_4"
 [entities.tile_4.transform]
-position = [0, 0, 0]
+position = [0, -1000, 0]
 [entities.tile_4.model]
 asset = "tile_a"
 
-[entities.seg_5]
-[entities.seg_5.transform]
-position = [0, -1000, 0]
 [entities.tile_5]
-parent = "seg_5"
 [entities.tile_5.transform]
-position = [0, 0, 0]
+position = [0, -1000, 0]
 [entities.tile_5.model]
 asset = "tile_b"
 
-[entities.seg_6]
-[entities.seg_6.transform]
-position = [0, -1000, 0]
 [entities.tile_6]
-parent = "seg_6"
 [entities.tile_6.transform]
-position = [0, 0, 0]
+position = [0, -1000, 0]
 [entities.tile_6.model]
 asset = "tile_a"
 
-[entities.seg_7]
-[entities.seg_7.transform]
-position = [0, -1000, 0]
 [entities.tile_7]
-parent = "seg_7"
 [entities.tile_7.transform]
-position = [0, 0, 0]
+position = [0, -1000, 0]
 [entities.tile_7.model]
 asset = "tile_b"
 
-[entities.seg_8]
-[entities.seg_8.transform]
-position = [0, -1000, 0]
 [entities.tile_8]
-parent = "seg_8"
 [entities.tile_8.transform]
-position = [0, 0, 0]
+position = [0, -1000, 0]
 [entities.tile_8.model]
 asset = "tile_a"
 
-[entities.seg_9]
-[entities.seg_9.transform]
-position = [0, -1000, 0]
 [entities.tile_9]
-parent = "seg_9"
 [entities.tile_9.transform]
-position = [0, 0, 0]
+position = [0, -1000, 0]
 [entities.tile_9.model]
 asset = "tile_b"
 
-[entities.seg_10]
-[entities.seg_10.transform]
-position = [0, -1000, 0]
 [entities.tile_10]
-parent = "seg_10"
 [entities.tile_10.transform]
-position = [0, 0, 0]
+position = [0, -1000, 0]
 [entities.tile_10.model]
 asset = "tile_a"
 
-[entities.seg_11]
-[entities.seg_11.transform]
-position = [0, -1000, 0]
 [entities.tile_11]
-parent = "seg_11"
 [entities.tile_11.transform]
-position = [0, 0, 0]
+position = [0, -1000, 0]
 [entities.tile_11.model]
 asset = "tile_b"
 
-[entities.seg_12]
-[entities.seg_12.transform]
-position = [0, -1000, 0]
 [entities.tile_12]
-parent = "seg_12"
 [entities.tile_12.transform]
-position = [0, 0, 0]
+position = [0, -1000, 0]
 [entities.tile_12.model]
 asset = "tile_a"
 
-[entities.seg_13]
-[entities.seg_13.transform]
-position = [0, -1000, 0]
 [entities.tile_13]
-parent = "seg_13"
 [entities.tile_13.transform]
-position = [0, 0, 0]
+position = [0, -1000, 0]
 [entities.tile_13.model]
 asset = "tile_b"
 
-[entities.seg_14]
-[entities.seg_14.transform]
-position = [0, -1000, 0]
 [entities.tile_14]
-parent = "seg_14"
 [entities.tile_14.transform]
-position = [0, 0, 0]
+position = [0, -1000, 0]
 [entities.tile_14.model]
 asset = "tile_a"
 
-[entities.seg_15]
-[entities.seg_15.transform]
-position = [0, -1000, 0]
 [entities.tile_15]
-parent = "seg_15"
 [entities.tile_15.transform]
-position = [0, 0, 0]
+position = [0, -1000, 0]
 [entities.tile_15.model]
 asset = "tile_b"
 
-[entities.seg_16]
-[entities.seg_16.transform]
-position = [0, -1000, 0]
 [entities.tile_16]
-parent = "seg_16"
 [entities.tile_16.transform]
-position = [0, 0, 0]
+position = [0, -1000, 0]
 [entities.tile_16.model]
 asset = "tile_a"
 
-[entities.seg_17]
-[entities.seg_17.transform]
-position = [0, -1000, 0]
 [entities.tile_17]
-parent = "seg_17"
 [entities.tile_17.transform]
-position = [0, 0, 0]
+position = [0, -1000, 0]
 [entities.tile_17.model]
 asset = "tile_b"
 
-[entities.seg_18]
-[entities.seg_18.transform]
-position = [0, -1000, 0]
 [entities.tile_18]
-parent = "seg_18"
 [entities.tile_18.transform]
-position = [0, 0, 0]
+position = [0, -1000, 0]
 [entities.tile_18.model]
 asset = "tile_a"
 
-[entities.seg_19]
-[entities.seg_19.transform]
-position = [0, -1000, 0]
 [entities.tile_19]
-parent = "seg_19"
 [entities.tile_19.transform]
-position = [0, 0, 0]
+position = [0, -1000, 0]
 [entities.tile_19.model]
 asset = "tile_b"
 
-[entities.seg_20]
-[entities.seg_20.transform]
-position = [0, -1000, 0]
 [entities.tile_20]
-parent = "seg_20"
 [entities.tile_20.transform]
-position = [0, 0, 0]
+position = [0, -1000, 0]
 [entities.tile_20.model]
 asset = "tile_a"
 
-[entities.seg_21]
-[entities.seg_21.transform]
-position = [0, -1000, 0]
 [entities.tile_21]
-parent = "seg_21"
 [entities.tile_21.transform]
-position = [0, 0, 0]
+position = [0, -1000, 0]
 [entities.tile_21.model]
 asset = "tile_b"
 
-[entities.seg_22]
-[entities.seg_22.transform]
-position = [0, -1000, 0]
 [entities.tile_22]
-parent = "seg_22"
 [entities.tile_22.transform]
-position = [0, 0, 0]
+position = [0, -1000, 0]
 [entities.tile_22.model]
 asset = "tile_a"
 
-[entities.seg_23]
-[entities.seg_23.transform]
-position = [0, -1000, 0]
 [entities.tile_23]
-parent = "seg_23"
 [entities.tile_23.transform]
-position = [0, 0, 0]
+position = [0, -1000, 0]
 [entities.tile_23.model]
 asset = "tile_b"
 
-[entities.seg_24]
-[entities.seg_24.transform]
-position = [0, -1000, 0]
 [entities.tile_24]
-parent = "seg_24"
 [entities.tile_24.transform]
-position = [0, 0, 0]
+position = [0, -1000, 0]
 [entities.tile_24.model]
 asset = "tile_a"
 
-[entities.seg_25]
-[entities.seg_25.transform]
-position = [0, -1000, 0]
 [entities.tile_25]
-parent = "seg_25"
 [entities.tile_25.transform]
-position = [0, 0, 0]
+position = [0, -1000, 0]
 [entities.tile_25.model]
 asset = "tile_b"
 
-[entities.seg_26]
-[entities.seg_26.transform]
-position = [0, -1000, 0]
 [entities.tile_26]
-parent = "seg_26"
 [entities.tile_26.transform]
-position = [0, 0, 0]
+position = [0, -1000, 0]
 [entities.tile_26.model]
 asset = "tile_a"
 
-[entities.seg_27]
-[entities.seg_27.transform]
-position = [0, -1000, 0]
 [entities.tile_27]
-parent = "seg_27"
 [entities.tile_27.transform]
-position = [0, 0, 0]
+position = [0, -1000, 0]
 [entities.tile_27.model]
 asset = "tile_b"
 
-[entities.seg_28]
-[entities.seg_28.transform]
-position = [0, -1000, 0]
 [entities.tile_28]
-parent = "seg_28"
 [entities.tile_28.transform]
-position = [0, 0, 0]
+position = [0, -1000, 0]
 [entities.tile_28.model]
 asset = "tile_a"
 
-[entities.seg_29]
-[entities.seg_29.transform]
-position = [0, -1000, 0]
 [entities.tile_29]
-parent = "seg_29"
 [entities.tile_29.transform]
-position = [0, 0, 0]
+position = [0, -1000, 0]
 [entities.tile_29.model]
 asset = "tile_b"
 
-[entities.seg_30]
-[entities.seg_30.transform]
-position = [0, -1000, 0]
 [entities.tile_30]
-parent = "seg_30"
 [entities.tile_30.transform]
-position = [0, 0, 0]
+position = [0, -1000, 0]
 [entities.tile_30.model]
 asset = "tile_a"
 
-[entities.seg_31]
-[entities.seg_31.transform]
-position = [0, -1000, 0]
 [entities.tile_31]
-parent = "seg_31"
 [entities.tile_31.transform]
-position = [0, 0, 0]
+position = [0, -1000, 0]
 [entities.tile_31.model]
 asset = "tile_b"
 
-[entities.seg_32]
-[entities.seg_32.transform]
-position = [0, -1000, 0]
 [entities.tile_32]
-parent = "seg_32"
 [entities.tile_32.transform]
-position = [0, 0, 0]
+position = [0, -1000, 0]
 [entities.tile_32.model]
 asset = "tile_a"
 
-[entities.seg_33]
-[entities.seg_33.transform]
-position = [0, -1000, 0]
 [entities.tile_33]
-parent = "seg_33"
 [entities.tile_33.transform]
-position = [0, 0, 0]
+position = [0, -1000, 0]
 [entities.tile_33.model]
 asset = "tile_b"
 
-[entities.seg_34]
-[entities.seg_34.transform]
-position = [0, -1000, 0]
 [entities.tile_34]
-parent = "seg_34"
 [entities.tile_34.transform]
-position = [0, 0, 0]
+position = [0, -1000, 0]
 [entities.tile_34.model]
 asset = "tile_a"
 
-[entities.seg_35]
-[entities.seg_35.transform]
-position = [0, -1000, 0]
 [entities.tile_35]
-parent = "seg_35"
 [entities.tile_35.transform]
-position = [0, 0, 0]
+position = [0, -1000, 0]
 [entities.tile_35.model]
 asset = "tile_b"
 
-[entities.seg_36]
-[entities.seg_36.transform]
-position = [0, -1000, 0]
 [entities.tile_36]
-parent = "seg_36"
 [entities.tile_36.transform]
-position = [0, 0, 0]
+position = [0, -1000, 0]
 [entities.tile_36.model]
 asset = "tile_a"
 
-[entities.seg_37]
-[entities.seg_37.transform]
-position = [0, -1000, 0]
 [entities.tile_37]
-parent = "seg_37"
 [entities.tile_37.transform]
-position = [0, 0, 0]
+position = [0, -1000, 0]
 [entities.tile_37.model]
 asset = "tile_b"
 
-[entities.seg_38]
-[entities.seg_38.transform]
-position = [0, -1000, 0]
 [entities.tile_38]
-parent = "seg_38"
 [entities.tile_38.transform]
-position = [0, 0, 0]
+position = [0, -1000, 0]
 [entities.tile_38.model]
 asset = "tile_a"
 
-[entities.seg_39]
-[entities.seg_39.transform]
-position = [0, -1000, 0]
 [entities.tile_39]
-parent = "seg_39"
 [entities.tile_39.transform]
-position = [0, 0, 0]
+position = [0, -1000, 0]
 [entities.tile_39.model]
 asset = "tile_b"
 
-[entities.seg_40]
-[entities.seg_40.transform]
-position = [0, -1000, 0]
 [entities.tile_40]
-parent = "seg_40"
 [entities.tile_40.transform]
-position = [0, 0, 0]
+position = [0, -1000, 0]
 [entities.tile_40.model]
 asset = "tile_a"
 
-[entities.seg_41]
-[entities.seg_41.transform]
-position = [0, -1000, 0]
 [entities.tile_41]
-parent = "seg_41"
 [entities.tile_41.transform]
-position = [0, 0, 0]
+position = [0, -1000, 0]
 [entities.tile_41.model]
 asset = "tile_b"
 
-[entities.seg_42]
-[entities.seg_42.transform]
-position = [0, -1000, 0]
 [entities.tile_42]
-parent = "seg_42"
 [entities.tile_42.transform]
-position = [0, 0, 0]
+position = [0, -1000, 0]
 [entities.tile_42.model]
 asset = "tile_a"
 
-[entities.seg_43]
-[entities.seg_43.transform]
-position = [0, -1000, 0]
 [entities.tile_43]
-parent = "seg_43"
 [entities.tile_43.transform]
-position = [0, 0, 0]
+position = [0, -1000, 0]
 [entities.tile_43.model]
 asset = "tile_b"
 
-[entities.seg_44]
-[entities.seg_44.transform]
-position = [0, -1000, 0]
 [entities.tile_44]
-parent = "seg_44"
 [entities.tile_44.transform]
-position = [0, 0, 0]
+position = [0, -1000, 0]
 [entities.tile_44.model]
 asset = "tile_a"
 
-[entities.seg_45]
-[entities.seg_45.transform]
-position = [0, -1000, 0]
 [entities.tile_45]
-parent = "seg_45"
 [entities.tile_45.transform]
-position = [0, 0, 0]
+position = [0, -1000, 0]
 [entities.tile_45.model]
 asset = "tile_b"
 
-[entities.seg_46]
-[entities.seg_46.transform]
-position = [0, -1000, 0]
 [entities.tile_46]
-parent = "seg_46"
 [entities.tile_46.transform]
-position = [0, 0, 0]
+position = [0, -1000, 0]
 [entities.tile_46.model]
 asset = "tile_a"
 
-[entities.seg_47]
-[entities.seg_47.transform]
-position = [0, -1000, 0]
 [entities.tile_47]
-parent = "seg_47"
 [entities.tile_47.transform]
-position = [0, 0, 0]
+position = [0, -1000, 0]
 [entities.tile_47.model]
 asset = "tile_b"
 
-[entities.seg_48]
-[entities.seg_48.transform]
-position = [0, -1000, 0]
 [entities.tile_48]
-parent = "seg_48"
 [entities.tile_48.transform]
-position = [0, 0, 0]
+position = [0, -1000, 0]
 [entities.tile_48.model]
 asset = "tile_a"
 
-[entities.seg_49]
-[entities.seg_49.transform]
-position = [0, -1000, 0]
 [entities.tile_49]
-parent = "seg_49"
 [entities.tile_49.transform]
-position = [0, 0, 0]
+position = [0, -1000, 0]
 [entities.tile_49.model]
 asset = "tile_b"
 
-[entities.seg_50]
-[entities.seg_50.transform]
-position = [0, -1000, 0]
 [entities.tile_50]
-parent = "seg_50"
 [entities.tile_50.transform]
-position = [0, 0, 0]
+position = [0, -1000, 0]
 [entities.tile_50.model]
 asset = "tile_a"
 
-[entities.seg_51]
-[entities.seg_51.transform]
-position = [0, -1000, 0]
 [entities.tile_51]
-parent = "seg_51"
 [entities.tile_51.transform]
-position = [0, 0, 0]
+position = [0, -1000, 0]
 [entities.tile_51.model]
 asset = "tile_b"
 
-[entities.seg_52]
-[entities.seg_52.transform]
-position = [0, -1000, 0]
 [entities.tile_52]
-parent = "seg_52"
 [entities.tile_52.transform]
-position = [0, 0, 0]
+position = [0, -1000, 0]
 [entities.tile_52.model]
 asset = "tile_a"
 
-[entities.seg_53]
-[entities.seg_53.transform]
-position = [0, -1000, 0]
 [entities.tile_53]
-parent = "seg_53"
 [entities.tile_53.transform]
-position = [0, 0, 0]
+position = [0, -1000, 0]
 [entities.tile_53.model]
 asset = "tile_b"
 
-[entities.seg_54]
-[entities.seg_54.transform]
-position = [0, -1000, 0]
 [entities.tile_54]
-parent = "seg_54"
 [entities.tile_54.transform]
-position = [0, 0, 0]
+position = [0, -1000, 0]
 [entities.tile_54.model]
 asset = "tile_a"
 
-[entities.seg_55]
-[entities.seg_55.transform]
-position = [0, -1000, 0]
 [entities.tile_55]
-parent = "seg_55"
 [entities.tile_55.transform]
-position = [0, 0, 0]
+position = [0, -1000, 0]
 [entities.tile_55.model]
 asset = "tile_b"
 
-[entities.seg_56]
-[entities.seg_56.transform]
-position = [0, -1000, 0]
 [entities.tile_56]
-parent = "seg_56"
 [entities.tile_56.transform]
-position = [0, 0, 0]
+position = [0, -1000, 0]
 [entities.tile_56.model]
 asset = "tile_a"
 
-[entities.seg_57]
-[entities.seg_57.transform]
-position = [0, -1000, 0]
 [entities.tile_57]
-parent = "seg_57"
 [entities.tile_57.transform]
-position = [0, 0, 0]
+position = [0, -1000, 0]
 [entities.tile_57.model]
 asset = "tile_b"
 
-[entities.seg_58]
-[entities.seg_58.transform]
-position = [0, -1000, 0]
 [entities.tile_58]
-parent = "seg_58"
 [entities.tile_58.transform]
-position = [0, 0, 0]
+position = [0, -1000, 0]
 [entities.tile_58.model]
 asset = "tile_a"
 
-[entities.seg_59]
-[entities.seg_59.transform]
-position = [0, -1000, 0]
 [entities.tile_59]
-parent = "seg_59"
 [entities.tile_59.transform]
-position = [0, 0, 0]
+position = [0, -1000, 0]
 [entities.tile_59.model]
 asset = "tile_b"
 
-[entities.seg_60]
-[entities.seg_60.transform]
-position = [0, -1000, 0]
 [entities.tile_60]
-parent = "seg_60"
 [entities.tile_60.transform]
-position = [0, 0, 0]
+position = [0, -1000, 0]
 [entities.tile_60.model]
 asset = "tile_a"
 
-[entities.seg_61]
-[entities.seg_61.transform]
-position = [0, -1000, 0]
 [entities.tile_61]
-parent = "seg_61"
 [entities.tile_61.transform]
-position = [0, 0, 0]
+position = [0, -1000, 0]
 [entities.tile_61.model]
 asset = "tile_b"
 
-[entities.seg_62]
-[entities.seg_62.transform]
-position = [0, -1000, 0]
 [entities.tile_62]
-parent = "seg_62"
 [entities.tile_62.transform]
-position = [0, 0, 0]
+position = [0, -1000, 0]
 [entities.tile_62.model]
 asset = "tile_a"
 
-[entities.seg_63]
-[entities.seg_63.transform]
-position = [0, -1000, 0]
 [entities.tile_63]
-parent = "seg_63"
 [entities.tile_63.transform]
-position = [0, 0, 0]
+position = [0, -1000, 0]
 [entities.tile_63.model]
 asset = "tile_b"
 

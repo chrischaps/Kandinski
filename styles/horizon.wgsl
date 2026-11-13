@@ -75,7 +75,18 @@ fn style(p: StylePixel) -> vec4<f32> {
     let sun_mask = disc * (1.0 - cut * (1.0 - params.rings));
     // halo: a soft bed of light the disc sits in
     let halo = sun_lo * exp(-r * r * 0.9) * 0.28 + sun_lo * exp(-r * 0.9) * 0.10;
-    col += halo;
+    col += halo * params.halo;
+    // echoes: thin rings that leave the sun's rim on each beat and fade as
+    // they widen (drive.rhai's pulse block gives the beat's phase)
+    var echo = 0.0;
+    for (var n = 0; n < 3; n = n + 1) {
+        let age = params.echo_phase + f32(n);
+        let rr = 1.0 + age * 0.5;
+        let line = 1.0 - smoothstep(0.0, aa * 2.0 + 0.012, abs(r - rr));
+        let fade = 1.0 - age / 3.0;
+        echo += line * fade * fade;
+    }
+    col += mix(sun_lo, sun_hi, 0.35) * echo * params.echo;
     col = mix(col, sun * params.sun_gain, sun_mask);
 
     // ---- horizon --------------------------------------------------

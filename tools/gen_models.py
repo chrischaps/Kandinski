@@ -45,13 +45,10 @@ def face(m, mat, pts, n, lift=0.0):
 
 
 def both_sides(m, *mats):
-    """Add a reversed copy of every triangle of the given materials.
-
-    Flint's importer ignores glTF doubleSided (everything is back-face culled),
-    so thin cards carry their own back faces.
-    """
+    """Mark the given materials glTF doubleSided: thin cards are one layer of
+    triangles that Flint draws from both sides (#623)."""
     for mat in mats:
-        m._tris[mat] = m._tris[mat] + [(a, c, b) for a, b, c in m._tris[mat]]
+        m._mats[mat]["double_sided"] = True
     return m
 
 

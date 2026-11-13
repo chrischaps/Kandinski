@@ -20,6 +20,9 @@ NUMS = [
     ("stars", 0.8, 0.0, 2.0, "Star brightness"),
     ("glow_gain", 1.3, 0.0, 8.0, "Horizon band radiance"),
     ("haze", 0.07, 0.01, 0.6, "Horizon band height (rad)"),
+    ("halo", 1.0, 0.0, 6.0, "The soft bed of light round the sun; the music's kick swells it"),
+    ("echo", 0.0, 0.0, 2.0, "Rings of light leaving the sun on the beat: their strength"),
+    ("echo_phase", 0.0, 0.0, 1.0, "Where in the beat the music is: how far the newest ring has travelled"),
 ]
 
 HEAD = """# The whole sky of Kandinski, painted where nothing was drawn: a vertical

@@ -167,3 +167,21 @@ default = 0.07
 min = 0.01
 max = 0.6
 help = "Horizon band height (rad)"
+
+[params.halo]
+default = 1.0
+min = 0.0
+max = 6.0
+help = "The soft bed of light round the sun; the music's kick swells it"
+
+[params.echo]
+default = 0.0
+min = 0.0
+max = 2.0
+help = "Rings of light leaving the sun on the beat: their strength"
+
+[params.echo_phase]
+default = 0.0
+min = 0.0
+max = 1.0
+help = "Where in the beat the music is: how far the newest ring has travelled"

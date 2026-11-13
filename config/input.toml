@@ -130,6 +130,13 @@ type = "gamepad_button"
 button = "North"
 gamepad = "any"
 
+# --- The pulse: how much the world moves with the music (off / soft / full) ---
+[actions.pulse]
+kind = "button"
+[[actions.pulse.bindings]]
+type = "key"
+code = "KeyM"
+
 # --- Menus: title, tour screen, results, pause ---
 # Arrows / WASD / d-pad / left stick move, Enter / Start / A confirm,
 # Backspace / B go back. (Escape is the player's own: it closes the window.)

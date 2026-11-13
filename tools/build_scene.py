@@ -55,6 +55,7 @@ HEADER = '''# ================================================================
 #  S / Down    brake               Space              handbrake
 #  Shift       boost               Enter              confirm
 #  P           pause               R                  restart the event (arcade: title)
+#  M           the pulse: how much the world moves with the music (off / soft / full)
 #  Menus: arrows / WASD, Enter, Backspace
 #  Gamepad: stick steers, RT accelerates, LT brakes, A handbrake,
 #           X / RB boost, Start / A confirm, B back, Back pauses
@@ -73,9 +74,12 @@ fov = 62.0
 near = 0.3
 far = 4000.0
 
-# The world is unlit: a flat ambient of 3 and no sun, so a material's colour
-# is its radiance. Colour 1 is radiance 3, which blooms; the road is ~0.005.
+# The world is unlit: a flat ambient of 3, no lights and no shadow pass
+# (Flint #627), so a material's colour is its radiance. Colour 1 is radiance
+# 3, which blooms; the road is ~0.005.
 [environment]
+shadows = false
+default_lights = false
 ambient_sky = [3.0, 3.0, 3.0]
 ambient_ground = [3.0, 3.0, 3.0]
 
@@ -115,13 +119,6 @@ levels = 5
 # The glass (styles/crt.*).
 [post_process.styles.crt]
 
-[entities.sun]
-[entities.sun.light]
-type = "directional"
-direction = [0.0, 1.0, 0.0]
-color = [1.0, 1.0, 1.0]
-intensity = 0.0
-
 # ── Game ────────────────────────────────────────────────────────
 [entities.game]
 [entities.game.game_state]
@@ -143,6 +140,7 @@ ap_assist = {ap_assist}
 ghost_rivals = {ghost_rivals}
 start_event = {start_event}
 no_clock = {no_clock}
+pulse = {pulse}
 persist = {persist}
 [entities.game.script]
 source = "{script}"
@@ -202,7 +200,7 @@ def wheel_asset():
 def build(autopilot=False, start_stage=0, start_speed=0.0, manual=False, telemetry=False,
           test_track=False, test_curve=0.0, traffic=True, start_boost=0.0, ap_skill=1.0,
           script="drive.rhai", telemetry_hz=10.0, test_wide=False, cruise=0.0,
-          start_event=-1, ap_style=0, no_clock=False, persist=None, ap_assist=False, ghost_rivals=False):
+          start_event=-1, ap_style=0, no_clock=False, persist=None, ap_assist=False, ghost_rivals=False, pulse=1.0):
     """Scene text. Keywords are game_state fields (schemas/components/game_state.toml).
     `start_event` 0-14 starts in that GRAND TOUR event (100 = HORIZON): with the
     autopilot and no start_speed it plays by the rules to the results screen.
@@ -217,7 +215,8 @@ def build(autopilot=False, start_stage=0, start_speed=0.0, manual=False, telemet
                        start_boost=float(start_boost), ap_skill=float(ap_skill), script=script,
                        telemetry_hz=float(telemetry_hz), test_wide=b(test_wide), cruise=float(cruise),
                        start_event=int(start_event), ap_style=int(ap_style), no_clock=b(no_clock),
-                       persist=b(persist), ap_assist=b(ap_assist), ghost_rivals=b(ghost_rivals))]
+                       persist=b(persist), ap_assist=b(ap_assist), ghost_rivals=b(ghost_rivals),
+                       pulse=float(pulse))]
     o.append("# ── Audio loops: autoplay at volume 0, scripts/audio.rhai fades them ──")
     for ent, f, bus in LOOPS:
         o.append(f'[entities.{ent}]\n[entities.{ent}.audio_source]\nfile = "audio/{f}.ogg"\nloop = true\n'
@@ -232,11 +231,10 @@ def build(autopilot=False, start_stage=0, start_speed=0.0, manual=False, telemet
         o.append(f'[entities.{name}]\nparent = "car"\n[entities.{name}.transform]\nposition = [{x}, {y}, {z}]\n'
                  f'[entities.{name}.model]\nasset = "{wa}"\n')
 
-    o.append("# ── Road tiles: seg_i shears, tile_i (its child) pitches ──")
+    o.append("# ── Road tiles: one entity each, sheared sideways for a bend and upward for a hill ──")
     for i in range(N_TILES):
         v = "a" if i % 2 == 0 else "b"
-        o.append(f'[entities.seg_{i}]\n[entities.seg_{i}.transform]\nposition = [0, -1000, 0]\n'
-                 f'[entities.tile_{i}]\nparent = "seg_{i}"\n[entities.tile_{i}.transform]\nposition = [0, 0, 0]\n'
+        o.append(f'[entities.tile_{i}]\n[entities.tile_{i}.transform]\nposition = [0, -1000, 0]\n'
                  f'[entities.tile_{i}.model]\nasset = "tile_{v}"\n')
 
     o.append("# ── Traffic ──")

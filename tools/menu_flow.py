@@ -4,8 +4,9 @@ Plays the real game scene (title first, the save on) from a timed input
 script, with `ap_assist` so the autopilot drives once an event starts and a
 scripted path can reach a results screen. Frames are written every `--every`
 seconds from `--at`; the save the run leaves behind is copied next to them.
-The player's own save (save/persist.toml) is put aside first and put back
-after, whatever happens.
+Each run keeps its save in a scratch folder of its own (`--save-dir`, Flint
+#726), so the player's real save (%APPDATA%/kandinski/saves/) is never read
+or touched.
 
     python tools/menu_flow.py first --save clean --inputs snapshots/tour/flow_first.txt --until 20 --every 0.5
     python tools/menu_flow.py second --save snapshots/tour/flow/first_save.toml --inputs ... --until 12
@@ -26,6 +27,7 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 
 ROOT = os.path.normpath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, os.path.dirname(__file__))
@@ -33,13 +35,12 @@ import build_scene  # noqa: E402
 from capture import parse  # noqa: E402
 
 PLAYER = os.path.join(ROOT, "engine", "target", "release", "flint-player.exe")
-SAVE = os.path.join(ROOT, "save", "persist.toml")
 OUT = os.path.join(ROOT, "snapshots", "tour", "flow")
 
 
-def play(name, scene, inputs, until, size, shot_args, extra=()):
+def play(name, scene, inputs, until, size, shot_args, save_dir, extra=()):
     w, h = size.split("x")
-    cmd = [PLAYER, scene, "--schemas", "engine/schemas", "--schemas", "schemas", "--no-activate",
+    cmd = [PLAYER, scene, "--save-dir", save_dir, "--schemas", "engine/schemas", "--schemas", "schemas", "--no-activate",
            "--width", w, "--height", h, "--pixels-per-point", "1", "--frame-step", "0.0166667",
            "--exit-after", str(until), "--music-volume", "0", "--sfx-volume", "0", "--input-script", inputs, *shot_args, *extra]
     env = dict(os.environ, RUST_LOG="warn,script=info", FLINT_VSYNC="0", FLINT_PACING="0")
@@ -59,11 +60,8 @@ def main(argv):
     name = argv[0]
     kw = {k: parse(v) for k, v in (x.split("=", 1) for x in argv[1:])}
     os.makedirs(OUT, exist_ok=True)
-    os.makedirs(os.path.dirname(SAVE), exist_ok=True)
-    aside = SAVE + ".aside"
-    had = os.path.exists(SAVE)
-    if had:
-        shutil.copyfile(SAVE, aside)
+    save_dir = tempfile.mkdtemp(prefix="kandinski_flow_")
+    save = os.path.join(save_dir, "default.toml")
     scene = os.path.join(ROOT, "scenes", f"_flow_{name}.scene.toml")
     with open(scene, "w", newline="\n", encoding="utf-8") as f:
         f.write(build_scene.build(**{"ap_assist": True, "persist": True, **kw}))
@@ -79,28 +77,24 @@ def main(argv):
             runs.append((float(opts["--until"]), []))
         for until, shot_args in runs:
             # every run starts from the same save
-            if opts["--save"] == "clean":
-                if os.path.exists(SAVE):
-                    os.remove(SAVE)
-            else:
-                shutil.copyfile(os.path.join(ROOT, opts["--save"]), SAVE)
-            lines = play(name, scene, os.path.join(ROOT, opts["--inputs"]), until, opts["--size"], shot_args, opts["--player"].split())
+            if os.path.exists(save):
+                os.remove(save)
+            if opts["--save"] != "clean":
+                shutil.copyfile(os.path.join(ROOT, opts["--save"]), save)
+            lines = play(name, scene, os.path.join(ROOT, opts["--inputs"]), until, opts["--size"], shot_args, save_dir,
+                         opts["--player"].split())
         for l in lines:
             print(l[-260:])
         left = os.path.join(OUT, f"{name}_save.toml")
-        if os.path.exists(SAVE):
-            shutil.copyfile(SAVE, left)
+        if os.path.exists(save):
+            shutil.copyfile(save, left)
             print("save left by the run ->", left)
             print(open(left, encoding="utf-8").read())
         else:
             print("the run left no save")
     finally:
         os.remove(scene)
-        if had:
-            shutil.copyfile(aside, SAVE)
-            os.remove(aside)
-        elif os.path.exists(SAVE):
-            os.remove(SAVE)
+        shutil.rmtree(save_dir, ignore_errors=True)
 
 
 if __name__ == "__main__":
