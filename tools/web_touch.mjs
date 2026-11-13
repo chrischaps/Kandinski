@@ -128,14 +128,14 @@ const w = rect[2], h = rect[3];
 
 // the layout, from hud.rhai's numbers (points; the canvas is points wide)
 const u = h / 720, cx = w / 2, TMIN = 44;
-const pitch = Math.max(62 * u, TMIN + 2);
-const title = (i) => [cx, h * 0.545 + i * pitch - 4 * u + (pitch - 2) / 2];
+const pitch = Math.max(59 * u, TMIN + 2), my = Math.min(h * 0.50, h * 0.905 - 4 * pitch);
+const title = (i) => [cx, my + i * pitch - 4 * u + (pitch - 2) / 2];   // ARCADE, GRAND TOUR, HORIZON, SETTINGS
 const x0 = 40 * u, W = w - 80 * u, gap = 10 * u, cw = (W - 4 * gap) / 5, top = 104 * u, ch = 78 * u;
 const card = (leg, row) => [x0 + leg * (cw + gap) + cw / 2, top + 48 * u + row * (ch + 8 * u) + ch / 2];
 const tourBack = [x0 + Math.max(104 * u, 2 * TMIN) / 2, 54 * u];
 const by = h / 2 - 220 * u + 400 * u + 12 * u, bh = Math.max(44 * u, TMIN), bw = Math.max(220 * u, 3 * TMIN);
 const briefBack = [cx - 14 * u - bw / 2, by + bh / 2], briefStart = [cx + 14 * u + bw / 2, by + bh / 2];
-const pause = (k) => [cx, h * 0.24 + 130 * u + k * (bh + 12 * u) + bh / 2];
+const pause = (k) => [cx, h * 0.21 + 110 * u + k * (bh + 12 * u) + bh / 2];   // RESUME, RESTART, SETTINGS, QUIT
 // config/input.toml [touch_controls] (the page's safe-area insets are 0 here)
 const stick = [112, h - 112], brake = [w - 88, h - 92], drift = [w - 190, h - 150], boost = [w - 84, h - 204], menu = [cx + 150, 36];
 const full = (0.12 + 0.88) * 56 + 20;
@@ -178,7 +178,7 @@ await shot('pause');
 await tap(pause(0), 'pause_resume', 1200);
 await down(2, menu); await sleep(90); await up(2); await sleep(900);
 await shot('pause_again');
-await tap(pause(2), 'pause_quit_to_tour', 1300);
+await tap(pause(3), 'pause_quit_to_tour', 1300);
 await tap(tourBack, 'tour_back_to_title', 1300);
 await tap(title(0), 'arcade_countdown', 2200);
 await sleep(2600);
