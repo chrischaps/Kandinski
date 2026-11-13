@@ -580,7 +580,7 @@ fn shade_skinned(in: VertexOutput) -> vec4<f32> {
         color = albedo * material.unlit.y + emission;
     }
 
-    let final_alpha = alpha * material.opacity;
+    let final_alpha = alpha * material.opacity * edge_feather(in);
 
     // Output stays LINEAR — the sRGB render target applies gamma encoding.
     if (material.enable_tonemapping == 1u) {
@@ -609,5 +609,41 @@ fn fs_veil(in: VertexOutput) -> @location(0) vec4<f32> {
     if (material.has_base_color_tex == 1u) {
         alpha = textureSample(base_color_texture, material_sampler, scaled_uv).a * alpha;
     }
-    return vec4<f32>(clamp(alpha * material.opacity, 0.0, 1.0));
+    return vec4<f32>(clamp(alpha * material.opacity * edge_feather(in), 0.0, 1.0));
+}
+
+// The style albedo (#869): the surface's own colour before any light, as
+// shade_skinned builds it; shader.wgsl's fs_albedo says what reads it.
+@fragment
+fn fs_albedo(in: VertexOutput) -> @location(0) vec4<f32> {
+    let scaled_uv = in.uv * material.texture_scale;
+    var albedo = material.base_color.rgb;
+    if (material.use_vertex_color == 1u) {
+        albedo = in.color.rgb * material.vertex_tint.rgb;
+        if (material.vertex_emission == 1u) {
+            let glow = clamp(1.0 - in.color.a, 0.0, 1.0);
+            albedo = albedo * (1.0 - glow * (1.0 - material.glow_surface));
+        }
+    }
+    if (material.has_base_color_tex == 1u) {
+        albedo = textureSample(base_color_texture, material_sampler, scaled_uv).rgb * albedo;
+    }
+    return vec4<f32>(clamp(albedo, vec3<f32>(0.0), vec3<f32>(1.0)), 1.0);
+}
+
+// A soft silhouette (#582: a living prop's `softness`, in `unlit.z`): how
+// much of the surface is left where it turns away from the eye. Facing the
+// eye it's whole; at the outline, where the surface runs along the line of
+// sight, it's gone, eased between over the first `softness` of |N.V|. So the
+// edge feathers into what's behind it, still, at rest. The surface's own
+// normal, not a normal map's, so the outline is the shape's. 0 is a hard edge
+// and returns exactly 1.
+fn edge_feather(in: VertexOutput) -> f32 {
+    let softness = material.unlit.z;
+    if (softness <= 0.0) {
+        return 1.0;
+    }
+    let V = normalize(transform.camera_pos - in.world_pos);
+    let facing_eye = abs(dot(normalize(in.normal), V));
+    return smoothstep(0.0, softness, facing_eye);
 }

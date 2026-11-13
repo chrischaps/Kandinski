@@ -21,6 +21,9 @@ pub struct SkinnedPipeline {
     /// Living props' echoes that may only add light (`[living] echo_blend =
     /// "lighten"`): front faces, no depth write, a max blend.
     pub echo_lighten_pipeline: wgpu::RenderPipeline,
+    /// A body translucent only for its soft edge (#582): front faces, alpha
+    /// blended, depth written.
+    pub soft_edge_pipeline: wgpu::RenderPipeline,
     pub bone_bind_group_layout: wgpu::BindGroupLayout,
     /// What shallow wooze's skinned pipelines build on (#215).
     pub(crate) shader: wgpu::ShaderModule,
@@ -73,52 +76,51 @@ impl SkinnedPipeline {
         });
 
         let make_opaque = |label: &str, cull_mode: Option<wgpu::Face>| {
-        device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some(label),
-            layout: Some(&pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: Some("vs_skinned"),
-                buffers: &[SkinnedVertex::desc()],
-                compilation_options: Default::default(),
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: Some("fs_skinned"),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format,
-                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-                compilation_options: Default::default(),
-            }),
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleList,
-                strip_index_format: None,
-                front_face: wgpu::FrontFace::Ccw,
-                cull_mode,
-                polygon_mode: wgpu::PolygonMode::Fill,
-                unclipped_depth: false,
-                conservative: false,
-            },
-            depth_stencil: Some(wgpu::DepthStencilState {
-                format: wgpu::TextureFormat::Depth32Float,
-                depth_write_enabled: true,
-                depth_compare: wgpu::CompareFunction::Less,
-                stencil: wgpu::StencilState::default(),
-                bias: wgpu::DepthBiasState::default(),
-            }),
-            multisample: wgpu::MultisampleState {
-                count: sample_count,
-                ..Default::default()
-            },
-            multiview: None,
-            cache: None,
-        })
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some(label),
+                layout: Some(&pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &shader,
+                    entry_point: Some("vs_skinned"),
+                    buffers: &[SkinnedVertex::desc()],
+                    compilation_options: Default::default(),
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &shader,
+                    entry_point: Some("fs_skinned"),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format,
+                        blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                    compilation_options: Default::default(),
+                }),
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    strip_index_format: None,
+                    front_face: wgpu::FrontFace::Ccw,
+                    cull_mode,
+                    polygon_mode: wgpu::PolygonMode::Fill,
+                    unclipped_depth: false,
+                    conservative: false,
+                },
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: wgpu::TextureFormat::Depth32Float,
+                    depth_write_enabled: true,
+                    depth_compare: wgpu::CompareFunction::Less,
+                    stencil: wgpu::StencilState::default(),
+                    bias: wgpu::DepthBiasState::default(),
+                }),
+                multisample: wgpu::MultisampleState {
+                    count: sample_count,
+                    ..Default::default()
+                },
+                multiview: None,
+                cache: None,
+            })
         };
         let pipeline = make_opaque("Skinned PBR Render Pipeline", Some(wgpu::Face::Back));
-        let pipeline_double_sided =
-            make_opaque("Skinned PBR Render Pipeline (double-sided)", None);
+        let pipeline_double_sided = make_opaque("Skinned PBR Render Pipeline (double-sided)", None);
 
         // The skinned wireframe's vertex and fragment stages (#602: what is
         // left of the old outline shader)
@@ -135,7 +137,8 @@ impl SkinnedPipeline {
         let make_transparent = |label: &str,
                                 cull_mode: Option<wgpu::Face>,
                                 fragment: &str,
-                                blend: wgpu::BlendState| {
+                                blend: wgpu::BlendState,
+                                depth_write: bool| {
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some(label),
                 layout: Some(&pipeline_layout),
@@ -166,7 +169,7 @@ impl SkinnedPipeline {
                 },
                 depth_stencil: Some(wgpu::DepthStencilState {
                     format: wgpu::TextureFormat::Depth32Float,
-                    depth_write_enabled: false,
+                    depth_write_enabled: depth_write,
                     depth_compare: wgpu::CompareFunction::Less,
                     stencil: wgpu::StencilState::default(),
                     bias: wgpu::DepthBiasState::default(),
@@ -185,18 +188,31 @@ impl SkinnedPipeline {
             Some(wgpu::Face::Front),
             "fs_skinned",
             alpha,
+            false,
         );
         let transparent_alpha_pipeline = make_transparent(
             "Skinned Transparent Alpha Pipeline (front faces)",
             Some(wgpu::Face::Back),
             "fs_skinned",
             alpha,
+            false,
         );
         let echo_lighten_pipeline = make_transparent(
             "Skinned Echo Lighten Pipeline",
             Some(wgpu::Face::Back),
             "fs_skinned_lighten",
             crate::pipeline::LIGHTEN_BLEND,
+            false,
+        );
+        // A body translucent only for its soft edge (#582): front faces, blended,
+        // and writing depth, since the body is really there. Without the depth,
+        // SSAO, fog and depth of field read the cards behind it through it.
+        let soft_edge_pipeline = make_transparent(
+            "Skinned Soft Edge Pipeline",
+            Some(wgpu::Face::Back),
+            "fs_skinned",
+            alpha,
+            true,
         );
 
         // Transparent additive pipeline for skinned meshes
@@ -344,6 +360,7 @@ impl SkinnedPipeline {
             transparent_additive_pipeline,
             transparent_multiply_pipeline,
             echo_lighten_pipeline,
+            soft_edge_pipeline,
             bone_bind_group_layout,
             shader,
             pipeline_layout,

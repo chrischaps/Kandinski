@@ -102,7 +102,7 @@ pub struct SuiteSession {
 }
 
 impl SuiteSession {
-    /// Load stems for all six buses, schedule them for one shared clock tick,
+    /// Load the stems of every bus the manifest declares, schedule them for one shared clock tick,
     /// and start the clock. Validate the manifest before calling; playback
     /// assumes a well-formed suite.
     pub fn start<B: Backend>(
@@ -133,21 +133,14 @@ impl SuiteSession {
             .map_err(|e| FlintError::AudioError(format!("failed to create clock: {e}")))?;
         let start_at = StartTime::ClockTime(ClockTime::from_ticks_u64(&clock, preroll_samples));
 
-        // Canonical BUSES order (not the BTreeMap's alphabetical order), with
-        // any non-standard names the validator would have flagged appended.
-        let mut names: Vec<&String> = manifest.buses.keys().collect();
-        names.sort_by_key(|n| {
-            crate::BUSES
-                .iter()
-                .position(|b| b == n)
-                .unwrap_or(crate::BUSES.len())
-        });
+        // The manifest's buses in the order it declares them (not the
+        // BTreeMap's alphabetical order): the order they mix and list in.
         let mut loaded = Vec::new();
         let mut playable = 0usize;
-        for name in names {
-            let data = stems.load(name, &manifest.buses[name])?;
+        for (name, decl) in manifest.buses_in_order() {
+            let data = stems.load(name, decl)?;
             playable += data.is_some() as usize;
-            loaded.push((name.clone(), data));
+            loaded.push((name.to_string(), data));
         }
         if playable == 0 {
             return Err(FlintError::AudioError(
@@ -262,6 +255,16 @@ impl SuiteSession {
         Ok(())
     }
 
+    /// Stop every stem, fading over `fade_ms`. On a manager the session
+    /// shares with others, dropping its handles doesn't stop its sounds, so
+    /// a host stops them first.
+    pub fn stop(&mut self, fade_ms: f64) {
+        self.mixer.stop_all(kira::Tween {
+            duration: std::time::Duration::from_secs_f64(fade_ms.max(0.0) / 1000.0),
+            ..Default::default()
+        });
+    }
+
     /// Latency-compensated musical position ("what the ear hears now").
     pub fn now(&self) -> crate::conductor::MusicalPosition {
         self.conductor.now(self.clock_sample())
@@ -304,13 +307,13 @@ pub struct RealtimePlayer {
 /// `device` feature (#221) kira's DefaultBackend is its MockBackend, which
 /// would never advance a session's clock, so this fails as no device does.
 #[cfg(any(feature = "device", target_arch = "wasm32"))]
-pub(crate) fn open_device() -> Result<AudioManager<DefaultBackend>> {
+pub fn open_device() -> Result<AudioManager<DefaultBackend>> {
     AudioManager::<DefaultBackend>::new(kira::AudioManagerSettings::default())
         .map_err(|e| FlintError::AudioError(format!("no audio device: {e}")))
 }
 
 #[cfg(not(any(feature = "device", target_arch = "wasm32")))]
-pub(crate) fn open_device() -> Result<AudioManager<DefaultBackend>> {
+pub fn open_device() -> Result<AudioManager<DefaultBackend>> {
     Err(FlintError::AudioError(
         "no audio device: built without the `device` feature".into(),
     ))

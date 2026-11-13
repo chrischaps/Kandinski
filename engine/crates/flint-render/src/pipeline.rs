@@ -154,7 +154,10 @@ pub struct MaterialUniforms {
     /// Unlit (#627: the entity's `material.unlit`). `x` is 1 when the
     /// material skips lighting and draws its base colour (texture and
     /// vertex colour included) times `y`, its `emissive_scale`, plus its
-    /// emission, straight to the HDR target; 0 is lit. `zw` unused.
+    /// emission, straight to the HDR target; 0 is lit. `z` is the edge
+    /// softness (#582, a living prop's `softness`, skinned shader only): above
+    /// 0 the surface's alpha falls toward its silhouette, where it turns away
+    /// from the eye; 0 is a hard edge. `w` unused.
     pub unlit: [f32; 4],
 }
 
@@ -242,7 +245,19 @@ impl MaterialUniforms {
     /// Draw unlit (#627): base colour times `scale` plus emission, no
     /// lights, ambient or shadows. `scale` below 0 counts as 0.
     pub fn set_unlit(&mut self, scale: f32) {
-        self.unlit = [1.0, scale.max(0.0), 0.0, 0.0];
+        self.unlit[0] = 1.0;
+        self.unlit[1] = scale.max(0.0);
+    }
+
+    /// How far the surface's alpha feathers toward its silhouette (#582), 0 to
+    /// 1; 0 is a hard edge. Only the skinned shader reads it.
+    pub fn set_edge_softness(&mut self, softness: f32) {
+        self.unlit[2] = softness.clamp(0.0, 1.0);
+    }
+
+    /// The edge softness [`set_edge_softness`](Self::set_edge_softness) gave.
+    pub fn edge_softness(&self) -> f32 {
+        self.unlit[2]
     }
 
     /// Multiplies all of the emission, the material's own and per-vertex,
@@ -433,19 +448,11 @@ impl LightUniforms {
     }
 }
 
-/// The main render pipeline
-pub struct RenderPipeline {
-    pub pipeline: wgpu::RenderPipeline,
-    /// `pipeline` culling nothing, for glTF `doubleSided` materials (#623).
-    pub pipeline_double_sided: wgpu::RenderPipeline,
-    pub line_pipeline: wgpu::RenderPipeline,
-    pub overlay_line_pipeline: wgpu::RenderPipeline,
-    pub skeleton_line_pipeline: wgpu::RenderPipeline,
-    pub transparent_alpha_pipeline: wgpu::RenderPipeline,
-    /// Back-face pass of the alpha pipeline (drawn first).
-    pub transparent_alpha_back_pipeline: wgpu::RenderPipeline,
-    pub transparent_additive_pipeline: wgpu::RenderPipeline,
-    pub transparent_multiply_pipeline: wgpu::RenderPipeline,
+/// The bind group layouts every scene pipeline is made against, and the
+/// sampler the light group lends every material. Made once per renderer:
+/// they don't depend on the sample count, so an MSAA change keeps them and
+/// every bind group made from them (#735).
+pub struct SceneLayouts {
     pub transform_bind_group_layout: wgpu::BindGroupLayout,
     pub material_bind_group_layout: wgpu::BindGroupLayout,
     pub light_bind_group_layout: wgpu::BindGroupLayout,
@@ -453,21 +460,10 @@ pub struct RenderPipeline {
     /// group (binding 4) rather than in each material's: linear, with linear
     /// mips, repeating, as `TextureCache` made every texture's own.
     pub material_sampler: wgpu::Sampler,
-    /// What shallow wooze's pipelines build on (#215), made only when a scene
-    /// asks for them: the PBR fragment stage, and the layout and targets it has.
-    pub(crate) shader: wgpu::ShaderModule,
-    pub(crate) pipeline_layout: wgpu::PipelineLayout,
-    pub(crate) format: wgpu::TextureFormat,
-    pub(crate) sample_count: u32,
 }
 
-impl RenderPipeline {
-    pub fn new(device: &wgpu::Device, format: wgpu::TextureFormat, sample_count: u32) -> Self {
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("PBR Shader"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("shader.wgsl").into()),
-        });
-
+impl SceneLayouts {
+    pub fn new(device: &wgpu::Device) -> Self {
         // Bind group 0: Transform uniforms (vertex + fragment)
         let transform_bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -621,60 +617,99 @@ impl RenderPipeline {
             anisotropy_clamp: 8,
             ..Default::default()
         });
+        Self {
+            transform_bind_group_layout,
+            material_bind_group_layout,
+            light_bind_group_layout,
+            material_sampler,
+        }
+    }
+}
+
+/// The main render pipeline
+pub struct RenderPipeline {
+    pub pipeline: wgpu::RenderPipeline,
+    /// `pipeline` culling nothing, for glTF `doubleSided` materials (#623).
+    pub pipeline_double_sided: wgpu::RenderPipeline,
+    pub line_pipeline: wgpu::RenderPipeline,
+    pub overlay_line_pipeline: wgpu::RenderPipeline,
+    pub skeleton_line_pipeline: wgpu::RenderPipeline,
+    pub transparent_alpha_pipeline: wgpu::RenderPipeline,
+    /// Back-face pass of the alpha pipeline (drawn first).
+    pub transparent_alpha_back_pipeline: wgpu::RenderPipeline,
+    pub transparent_additive_pipeline: wgpu::RenderPipeline,
+    pub transparent_multiply_pipeline: wgpu::RenderPipeline,
+    /// What shallow wooze's pipelines build on (#215), made only when a scene
+    /// asks for them: the PBR fragment stage and the layout it has.
+    pub(crate) shader: wgpu::ShaderModule,
+    pub(crate) pipeline_layout: wgpu::PipelineLayout,
+}
+
+impl RenderPipeline {
+    pub fn new(
+        device: &wgpu::Device,
+        format: wgpu::TextureFormat,
+        sample_count: u32,
+        layouts: &SceneLayouts,
+    ) -> Self {
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("PBR Shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("shader.wgsl").into()),
+        });
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("PBR Pipeline Layout"),
             bind_group_layouts: &[
-                &transform_bind_group_layout,
-                &material_bind_group_layout,
-                &light_bind_group_layout,
+                &layouts.transform_bind_group_layout,
+                &layouts.material_bind_group_layout,
+                &layouts.light_bind_group_layout,
             ],
             push_constant_ranges: &[],
         });
 
         let make_opaque = |label: &str, cull_mode: Option<wgpu::Face>| {
-        device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some(label),
-            layout: Some(&pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: Some("vs_main"),
-                buffers: &[Vertex::desc()],
-                compilation_options: Default::default(),
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: Some("fs_main"),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format,
-                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-                compilation_options: Default::default(),
-            }),
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleList,
-                strip_index_format: None,
-                front_face: wgpu::FrontFace::Ccw,
-                cull_mode,
-                polygon_mode: wgpu::PolygonMode::Fill,
-                unclipped_depth: false,
-                conservative: false,
-            },
-            depth_stencil: Some(wgpu::DepthStencilState {
-                format: wgpu::TextureFormat::Depth32Float,
-                depth_write_enabled: true,
-                depth_compare: wgpu::CompareFunction::Less,
-                stencil: wgpu::StencilState::default(),
-                bias: wgpu::DepthBiasState::default(),
-            }),
-            multisample: wgpu::MultisampleState {
-                count: sample_count,
-                ..Default::default()
-            },
-            multiview: None,
-            cache: None,
-        })
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some(label),
+                layout: Some(&pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &shader,
+                    entry_point: Some("vs_main"),
+                    buffers: &[Vertex::desc()],
+                    compilation_options: Default::default(),
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &shader,
+                    entry_point: Some("fs_main"),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format,
+                        blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                    compilation_options: Default::default(),
+                }),
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    strip_index_format: None,
+                    front_face: wgpu::FrontFace::Ccw,
+                    cull_mode,
+                    polygon_mode: wgpu::PolygonMode::Fill,
+                    unclipped_depth: false,
+                    conservative: false,
+                },
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: wgpu::TextureFormat::Depth32Float,
+                    depth_write_enabled: true,
+                    depth_compare: wgpu::CompareFunction::Less,
+                    stencil: wgpu::StencilState::default(),
+                    bias: wgpu::DepthBiasState::default(),
+                }),
+                multisample: wgpu::MultisampleState {
+                    count: sample_count,
+                    ..Default::default()
+                },
+                multiview: None,
+                cache: None,
+            })
         };
         let pipeline = make_opaque("PBR Render Pipeline", Some(wgpu::Face::Back));
         // glTF `doubleSided` (#623): thin cards seen from behind
@@ -972,14 +1007,8 @@ impl RenderPipeline {
             transparent_alpha_back_pipeline,
             transparent_additive_pipeline,
             transparent_multiply_pipeline,
-            transform_bind_group_layout,
-            material_bind_group_layout,
-            light_bind_group_layout,
-            material_sampler,
             shader,
             pipeline_layout,
-            format,
-            sample_count,
         }
     }
 }

@@ -4,7 +4,7 @@ A scene in Flint is a TOML file that describes a collection of entities and thei
 
 ## File Format
 
-Scene files use the `.scene.toml` extension and have two sections:
+Scene files use the `.scene.toml` extension and have three kinds of section:
 
 ```toml
 # Metadata
@@ -12,6 +12,14 @@ Scene files use the `.scene.toml` extension and have two sections:
 name = "The Rusty Flint Tavern"
 version = "1.0"
 description = "A showcase scene demonstrating Flint engine capabilities"
+
+# Scene-level tables: settings of the scene as a whole
+[camera]
+position = [0, 4, 10]
+target = [0, 1, 0]
+
+[post_process]
+exposure = 1.2
 
 # Entity definitions
 [entities.main_hall]
@@ -26,8 +34,22 @@ archetype = "room"
 | `name` | yes | Human-readable scene name |
 | `version` | yes | Format version (currently "1.0") |
 | `description` | no | Optional description |
-| `input_config` | no | Path or name of an input config file for this scene (see [Input System](physics-and-runtime.md#input-system)) |
-| `preload_audio` | no | Default `true`. When `false`, the player skips the blanket preload of every file under `audio/` at scene load, so a scene with a large audio folder starts instantly. Sounds named by `audio_source` components and music-session stems still load through their own paths; only the convenience preload for script-triggered sounds is skipped (ADR 0066, scene audio preload opt-out). See [Audio](audio.md#preloading). |
+| `input_config` | no | Path of an input config file for this scene, from the scene's directory or any directory above it up to the project root (see [Input System](physics-and-runtime.md#input-system)) |
+| `preload_audio` | no | Default `true`. When `false`, the player skips the blanket preload of every file under `audio/` at scene load, so a scene with a large audio folder starts instantly. Sounds named by `audio_source` components and music-session stems still load through their own paths; only the convenience preload for script-triggered sounds is skipped ([ADR 0066](https://github.com/chrischaps/Flint/blob/main/docs/adr/0066-scene-audio-preload-opt-out.md), scene audio preload opt-out). See [Audio](audio.md#preloading). |
+
+### Scene-level tables
+
+Every other top-level table is a setting of the scene as a whole. The engine's are:
+
+| Table | Holds | More |
+|-------|-------|------|
+| `[camera]` | the starting view: `position`, `target`, `fov`, `projection`, `ortho_height`, `near`, `far` | `flint schema camera` |
+| `[environment]` | `skybox`, ambient colours, scene-wide shading, `shadows`, `default_lights` | [Lighting](lighting.md) |
+| `[post_process]` | exposure, bloom, SSAO, fog, grading, and the stylize passes under `[post_process.styles.<name>]` | [Post-Processing](post-processing.md) |
+| `[living]` | what the scene says about all its living props | [Procedural Generation](procgen.md) |
+| `[wooze]` | the wooze field and its `[[wooze.zone]]` entries | [Procedural Generation](procgen.md) |
+
+Each is declared by a `[table.<name>]` schema and checked on every load: a key it doesn't declare warns with the nearest name, and **a top-level table no schema declares warns too** (`[enviroment]`: did you mean `environment`?), where it used to be dropped without a word. A game adds tables of its own, such as `[weather]`, by declaring them in its schema layer; the loader keeps them as written and a player extension reads them. See [Schemas: Scene-level tables](schemas.md#scene-level-tables).
 
 ### The `[entities.*]` Tables
 
@@ -86,9 +108,9 @@ curve without turning: `{ xz = s }` slides its far end sideways by `s`
 metres per metre while its near and far edges stay square to the road, so
 neighbouring strips meet edge to edge however wide they are. Turning
 (yawing) each strip instead swings its far corners through its
-neighbours. `demo/shear_road.scene.toml` is a scanline road of 22 such
+neighbours. `examples/shear_road.scene.toml` is a scanline road of 22 such
 tiles, each one entity with `{ xz, yz }` for the bend and the hill, and
-`demo/shear_road_yawed.scene.toml` is the same road laid with yaw:
+`examples/shear_road_yawed.scene.toml` is the same road laid with yaw:
 
 ![A sunset road of sheared tiles, curving right then left, edges and lane line continuous](../images/shear-road.png)
 
@@ -131,12 +153,12 @@ flint scene info levels/tavern.scene.toml
 The `flint-scene` crate handles serialization. Scenes are loaded into the ECS world as entities with dynamic components, and saved back to TOML with stable ordering.
 
 When a scene is loaded:
-1. The TOML is parsed into a scene structure
+1. The TOML is parsed into a scene structure. A file that is not TOML is an error that names the file as well as the line
 2. Each entity definition creates an ECS entity with a stable `EntityId`
 3. If the entity names an archetype, the archetype's `defaults` are written in first for every component the entity did not author itself
-4. Each authored component is validated against its component schema. Failures are **warnings, not errors**: the loader logs `[scene] entity '<name>' component '<comp>': <reason>` through `tracing` and keeps going. Without a tracing subscriber you will not see them, so a scene that loads is not necessarily a scene that validates. Run `flint validate` for an authoritative answer.
+4. Every entity is checked against the schemas in one pass: its archetype, each component and each field (see [Scene Diagnostics](schemas.md#scene-diagnostics)). Nothing found here stops the load: the loader logs one summary line and the first five problems through `tracing`, as warnings, and keeps going. An unknown archetype gives the entity no defaults. A scene that loads is not necessarily a scene that validates: `flint validate` prints the whole list and fails on an error.
 5. The authored data is merged field-by-field into whatever the archetype put there (see [Schemas](schemas.md))
-6. For every component the entity explicitly lists, any field that has a `default` in its component schema and is still unset is filled in. Defaults are applied only to components the entity wrote a table for, not to archetype-required components it left out entirely, and validation in step 4 ran on the authored data *before* defaults landed, so a missing required field still warns even though a default will fill it.
+6. For every component the entity explicitly lists, any field that has a `default` in its component schema and is still unset is filled in. Defaults are applied only to components the entity wrote a table for, not to archetype-required components it left out entirely. Step 4 knows about them: a `required` field that an archetype default or the field's own `default` will fill is not reported as missing.
 7. Parent-child relationships are established
 8. The entity ID counter is adjusted to be above any existing ID (preventing collisions on subsequent creates)
 
@@ -170,7 +192,7 @@ The CLI commands (`entity create`, `entity delete`) modify the scene file, and t
 
 ## Example: The Showcase Scene
 
-The demo scene `demo/showcase.scene.toml` demonstrates the full format:
+The demo scene `examples/showcase.scene.toml` demonstrates the full format:
 
 ```toml
 [scene]
@@ -231,7 +253,7 @@ Prefabs are reusable entity group templates that reduce scene file duplication. 
 
 ### Defining a Prefab
 
-Prefab files live in the `prefabs/` directory and follow the same entity format as scenes, with a `[prefab]` metadata header:
+Prefab files live in a `prefabs/` folder, beside the scene or beside any directory above it up to the project root (the nearest of a name wins; [where the engine looks](assets.md#where-the-engine-looks-for-a-file)), and follow the same entity format as scenes, with a `[prefab]` metadata header. A template that isn't found fails the load with every path tried.
 
 ```toml
 [prefab]
@@ -289,11 +311,7 @@ Overrides are merged at the field level, not the component level. If a prefab te
 
 ### Path Resolution
 
-The loader searches for prefab templates in:
-1. `<scene_directory>/prefabs/`
-2. `<scene_directory>/../prefabs/`
-
-This means a `prefabs/` directory at the project root is found when loading scenes from `scenes/`.
+The loader finds a prefab template by [the engine's one search](assets.md#where-the-engine-looks-for-a-file) (kind `prefabs`): `prefabs/` beside the scene, then beside each directory above it up to the project root, then the engine's. A `prefabs/` directory at the project root is found from a scene at any depth.
 
 ### Previewing Prefabs
 
@@ -315,10 +333,10 @@ Attach a spline to an entity with the `spline` component:
 [entities.track_path]
 
 [entities.track_path.spline]
-source = "oval_plus.spline.toml"
+file = "oval_plus.spline.toml"
 ```
 
-The engine loads the `.spline.toml` file, samples it into a dense point array stored as the `spline_data` ECS component, and makes it available for script queries via the [Spline API](scripting.md#spline-api).
+`file` is found like any file a scene names: beside the scene, then beside each folder up to the project root. The engine loads the `.spline.toml` file, samples it into a dense point array stored as the `spline_data` ECS component, and makes it available for script queries via the [Spline API](scripting.md#spline-api).
 
 ### Spline Meshes
 
@@ -328,17 +346,17 @@ The `spline_mesh` component generates geometry by sweeping a rectangular cross-s
 [entities.road_surface]
 
 [entities.road_surface.spline_mesh]
-spline = "track_path"
+spline = "track_path"        # the entity with the `spline`
 width = 12.0
 height = 0.3
-offset_y = -0.15
-
-[entities.road_surface.material]
-base_color = [0.3, 0.3, 0.3]
+offset = [0.0, -0.15]        # [right, up] from the path, in metres
+color = [0.3, 0.3, 0.3, 1.0]
 roughness = 0.8
+texture = "textures/asphalt.png"
+texture_length = 6.0         # metres of road per texture repeat
 ```
 
-One spline can feed multiple mesh entities (road surface, walls, guardrails) with different cross-section dimensions and materials.
+One spline can feed multiple mesh entities (road surface, walls, guardrails) with different cross-section dimensions and colours. The mesh's look is the component's own fields (`color`, `stripe_color`, `metallic`, `roughness`, `texture`, `normal_texture`), and it comes with a triangle-mesh collider unless `collider = false`. `chunk_size` splits a long sweep into child entities. `flint schema spline_mesh` lists every field with its fallback; `spline`, `width` and `height` are required. The mesh is built in world space, so leave the entity's transform at the origin.
 
 ## Further Reading
 

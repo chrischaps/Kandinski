@@ -360,6 +360,8 @@ pub struct InputState {
 
     last_device: InputDevice,
     gamepad_connected: bool,
+    /// The host says the device is touch-first (#660).
+    touch_device: bool,
 
     /// While set, every pad reads as idle ([`InputState::hold_gamepads`]).
     gamepads_held: bool,
@@ -406,6 +408,7 @@ impl InputState {
             last_frame_pressed_actions: HashSet::new(),
             last_device: InputDevice::Keyboard,
             gamepad_connected: false,
+            touch_device: false,
             gamepads_held: false,
             gamepad_buttons_swallowed: HashSet::new(),
         }
@@ -424,6 +427,18 @@ impl InputState {
 
     pub fn set_gamepad_connected(&mut self, connected: bool) {
         self.gamepad_connected = connected;
+    }
+
+    /// True on a touch-first device: a web page whose main pointer is a
+    /// finger (`pointer: coarse`), or Android. A fact about the device, not
+    /// about the last input, so it holds from the first frame, before any
+    /// finger lands (#660). The host sets it; the state never infers it.
+    pub fn touch_device(&self) -> bool {
+        self.touch_device
+    }
+
+    pub fn set_touch_device(&mut self, touch_first: bool) {
+        self.touch_device = touch_first;
     }
 
     pub fn config(&self) -> &InputConfig {
@@ -2203,7 +2218,9 @@ radius = 30
             .load_bindings(InputConfig::from_toml_str(KEYS_AND_TOUCH).unwrap())
             .unwrap();
         let screen = input.screen_size();
-        input.touch_controls_mut().set_metrics(screen, 1.0, [0.0; 4]);
+        input
+            .touch_controls_mut()
+            .set_metrics(screen, 1.0, [0.0; 4]);
         input
     }
 
@@ -2261,7 +2278,10 @@ radius = 30
         input.process_touch_start(3, 150.0, 400.0);
         assert!(input.touch_controls_visible());
         input.process_gamepad_axis(0, "LeftStickX", 0.1);
-        assert!(input.touch_controls_visible(), "stick noise is not a takeover");
+        assert!(
+            input.touch_controls_visible(),
+            "stick noise is not a takeover"
+        );
         input.process_gamepad_button_down(0, "South");
         assert!(!input.touch_controls_visible());
         assert!(input.touch_controls().widgets().is_empty());
