@@ -5,9 +5,17 @@ edition.workspace = true
 license.workspace = true
 description = "egui-based validation viewer for Flint scenes"
 
+[features]
+# The wooze field's clocks (#214, #215, #252): the shading boil, shallow
+# wooze and woozy grass on a scene's `[wooze]` table (`field_clocks.rs`).
+# Off, the viewer links no flint-wooze of its own (#1330) and a scene with
+# the table is drawn still, said once.
+default = ["living"]
+living = ["dep:flint-wooze"]
+
 [dependencies]
 flint-core = { workspace = true }
-flint-wooze = { workspace = true }
+flint-wooze = { workspace = true, optional = true }
 flint-geometry = { workspace = true }
 flint-ecs = { workspace = true }
 flint-scene = { workspace = true }
@@ -18,7 +26,9 @@ flint-particles = { workspace = true }
 flint-debug-ui = { workspace = true }
 flint-import = { workspace = true }
 flint-constraint = { workspace = true }
+flint-runtime = { workspace = true, features = ["egui"] }
 toml = { workspace = true }
+serde_json = { workspace = true }
 wgpu = { workspace = true }
 winit = { workspace = true }
 pollster = { workspace = true }
@@ -29,3 +39,9 @@ egui = { workspace = true }
 egui-wgpu = { workspace = true }
 egui-winit = { workspace = true }
 tracing = { workspace = true }
+image = { workspace = true }
+
+# Built-in shader modules and frame acquisition go through flint-render's
+# seams; the list is this crate's clippy.toml (#944, #761), denied workspace-wide (#979).
+[lints]
+workspace = true

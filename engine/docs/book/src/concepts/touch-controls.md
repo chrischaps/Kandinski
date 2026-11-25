@@ -1,5 +1,7 @@
 # On-Screen Touch Controls
 
+> **Package:** `engine`, the kernel: every game has it ([Packages](packages.md)).
+
 A phone has no keyboard and no gamepad. A game whose actions are bound only to keys can still be played on one: add a `[touch_controls]` block to its input config and the engine draws a virtual stick, buttons and a menu button, and turns a drag on the screen into mouse-look.
 
 ![Two thumbs in the tavern: the stick pushed forward, JUMP held](../images/touch-controls-tavern.png)
@@ -65,11 +67,11 @@ action = "pause"                   # default
 anchor = "top_right"               # default
 ```
 
-`examples/input_touch.toml` is this block for the first-person demos:
+[`flint-examples/input_touch.toml`](https://github.com/chrischaps/flint-examples/blob/main/input_touch.toml) is this block for the first-person demos:
 
 ```bash
-cargo run --bin flint-player -- examples/phase4_runtime.scene.toml \
-  --input-config examples/input_touch.toml --touch-controls always
+cargo run --bin flint-player -- flint-examples/phase4_runtime.scene.toml \
+  --input-config flint-examples/input_touch.toml --touch-controls always
 ```
 
 ### Sticks

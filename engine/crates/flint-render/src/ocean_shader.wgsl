@@ -15,17 +15,8 @@
 // vertex brings its rest position, normal and flow; `body` scales the waves,
 // tints the water and sets the flow's phase period. The sea binds a body
 // block too (its own colours, full waves, no flow), so its look is unchanged.
-
-struct TransformUniforms {
-    view_proj: mat4x4<f32>,
-    model: mat4x4<f32>,
-    model_inv_transpose: mat4x4<f32>,
-    camera_pos: vec3<f32>,
-    _pad: f32,
-};
-
-@group(0) @binding(0)
-var<uniform> transform: TransformUniforms;
+//
+// The transform group and `clip_of` are mesh_vertex.wgsl's (#1244).
 
 // Two vec4s per wave: a = [dir.x, dir.y, k, amp], b = [phase_t, q, omega_eff, 0].
 // phase_t = (omega*t - phase0) mod 2pi, precomputed in f64 on the CPU.
@@ -69,22 +60,25 @@ struct OceanUniforms {
     sky_horizon: vec4<f32>,
     sky_haze: vec4<f32>,           // rgb + haze strength in alpha
     sky_reflection_strength: f32,  // 0 disables (also 0 when no sky component)
-    // Contact foam: splash ring around the scene's ocean_contact hull.
+    // Contact foam: a splash ring round each ocean_contact hull (#749).
     splash_strength: f32,          // overall gain; 0 disables (also 0 with no hull)
     splash_width: f32,             // max band width outward from the hull (m)
     splash_flicker_speed: f32,     // lapping-animation rate
-    hull_a: vec4<f32>,             // [center.x, center.z, cos(yaw), sin(yaw)]
-    hull_b: vec4<f32>,             // [half_x, half_z, baseline, noise_scale]
-    hull_c: vec4<f32>,             // [hull_vel.xyz, response]
+    splash_baseline: f32,          // churn floor on calm water
+    splash_noise_scale: f32,       // scalloped edge frequency
+    splash_response: f32,          // impact speed -> churn gain (s/m)
+    contact_count: u32,            // hulls in use, 0..=MAX_CONTACTS
     // Cel band edge treatment (see cel_band + the ramp in fs_main).
     band_wobble: f32,              // ramp noise wobble amplitude (0 = off)
     band_dither: f32,              // halftone transition width, 0 = hard line
     band_dither_scale: f32,        // halftone dot grid frequency (dots/m)
-    rain_ripple: f32,              // rain impact-ring density 0..1 (weather)
+    rain_ripple: f32,              // rain impact-ring density 0..1
     foam_glow: vec4<f32>,          // bioluminescence: rgb + strength in .a
-    // Reality tear (mirrors PostProcessConfig): 2 = blood ocean.
-    mode: u32,
-    mode_mix: f32,
+    // Tint (#746; render modes 2 and 5 before it): how far the palette
+    // moves to tint_*'s, and flags (1 = the underside only, 2 = keep the
+    // palette's own brightness).
+    tint: f32,
+    tint_flags: u32,
     // Shoreline foam (ADR 0088): a band where the opaque scene behind the
     // water lies within shore_foam_width m below the surface. 0 = off, and
     // the renderer forces 0 when the grab pass didn't run.
@@ -97,6 +91,23 @@ struct OceanUniforms {
     shore_foam_reach: f32,
     _pad_shore1: f32,
     _pad_shore2: f32,
+    // The tint's palette (OceanTint::to_gpu): rgb, then deep: pool scale
+    // (0 = even), shallow: band count (0 = the sea's), sss: band wobble added.
+    tint_deep: vec4<f32>,
+    tint_shallow: vec4<f32>,
+    tint_sss: vec4<f32>,
+    tint_foam: vec4<f32>,
+    tint_sky: vec4<f32>,
+    // The hulls the sea foams round, the first contact_count of them.
+    hulls: array<ContactHull, 4>,
+};
+
+// One ocean_contact hull as drawn; must match ContactHullGpu in
+// ocean_pipeline.rs (MAX_CONTACTS of them).
+struct ContactHull {
+    pose: vec4<f32>,     // [center.x, center.z, cos(yaw), sin(yaw)]
+    extent: vec4<f32>,   // [half_x, half_z, 0, 0]
+    velocity: vec4<f32>, // [vel.xyz, 0]
 };
 
 @group(1) @binding(0)
@@ -116,75 +127,8 @@ struct BodyUniforms {
 @group(1) @binding(1)
 var<uniform> body: BodyUniforms;
 
-// Bind group 2: lights + shadows (same layout as shader.wgsl / terrain)
-struct DirectionalLight {
-    direction: vec3<f32>,
-    volumetric_intensity: f32,
-    color: vec3<f32>,
-    intensity: f32,
-    volumetric_color: vec3<f32>,
-    _pad1: f32,
-};
-
-struct PointLight {
-    position: vec3<f32>,
-    radius: f32,
-    color: vec3<f32>,
-    intensity: f32,
-    // Physical source radius (world units); 0 = punctual (ADR 0056).
-    // Struct grew 32 -> 48 B — must match the Rust PointLight in all six
-    // LightUniforms mirrors (light_uniforms_layout test).
-    source_radius: f32,
-    _pad0: f32,
-    _pad1: f32,
-    _pad2: f32,
-};
-
-struct SpotLight {
-    position: vec3<f32>,
-    radius: f32,
-    direction: vec3<f32>,
-    inner_angle: f32,
-    color: vec3<f32>,
-    outer_angle: f32,
-    intensity: f32,
-    _pad0: f32,
-    _pad1: f32,
-    _pad2: f32,
-};
-
-struct LightUniforms {
-    directional_lights: array<DirectionalLight, 4>,
-    point_lights: array<PointLight, 16>,
-    spot_lights: array<SpotLight, 8>,
-    directional_count: u32,
-    point_count: u32,
-    spot_count: u32,
-    _pad: u32,
-    ambient_sky: vec4<f32>,
-    ambient_ground: vec4<f32>,
-    // rgb = sheen tint, w = strength; zero = off (must match LightUniforms in pipeline.rs)
-    sheen_color_strength: vec4<f32>,
-};
-
-@group(2) @binding(0)
-var<uniform> lights: LightUniforms;
-
-@group(2) @binding(1)
-var shadow_maps: texture_depth_2d_array;
-@group(2) @binding(2)
-var shadow_sampler: sampler_comparison;
-
-struct ShadowUniforms {
-    cascade_view_proj: array<mat4x4<f32>, 3>,
-    cascade_splits: vec4<f32>,
-    // PCSS (ADR 0057): xyz = per-cascade light-ortho depth range (world
-    // units), w = tan(sun angular size); w = 0 -> legacy 3x3 PCF verbatim.
-    pcss: vec4<f32>,
-};
-
-@group(2) @binding(3)
-var<uniform> shadow: ShadowUniforms;
+// Bind group 2: lights + shadows (lights.wgsl, light_bindings.wgsl, #738);
+// the point and spot lights are read through local_lights.wgsl (#1048)
 
 // Grab pass (valid when grab_enabled == 1): the opaque scene rendered
 // before the ocean, for refraction of whatever is underwater.
@@ -214,8 +158,38 @@ struct VertexOutput {
     @location(5) rest_normal: vec3<f32>, // the surface's normal at rest
 };
 
-const PI: f32 = 3.14159265359;
+// PI is brdf.wgsl's, which comes in front with the local lights (#1048)
 const TAU: f32 = 6.28318530718;
+
+// A lantern's light scattered in the surface (#1048): what the water's own
+// colour takes of it, over PI as a lit ground's Lambert does. Foam takes it
+// most, being the brightest part of `base`.
+fn water_local_scatter(l: LocalLight, N: vec3<f32>) -> vec3<f32> {
+    return l.radiance * (max(dot(N, l.L), 0.0) / PI);
+}
+
+// A lantern's light glowing through the wave flanks facing the eye, as the
+// sun's does (`toward_sun` in fs_main), from wherever the lamp stands; at
+// half the sun's weight, so the sss colour tints the lamp's pool rather than
+// taking it over.
+fn water_local_sss(l: LocalLight, V: vec3<f32>, rim: f32) -> vec3<f32> {
+    return l.radiance * (0.5 * rim * pow(max(dot(V, -l.L), 0.0), 2.0));
+}
+
+// A lantern's reflection on the waves (#1048): the sun's cel glint (the same
+// lobe, threshold and specular_strength), so the light breaks into the same
+// hard sparkle on the swell, inside a wider cel band of the lamp's colour at
+// a quarter of it: the streak of a lamp's reflection on rippled water.
+fn water_local_glint(l: LocalLight, N: vec3<f32>, V: vec3<f32>) -> vec3<f32> {
+    let H = normalize(V + l.L);
+    let n_dot_h = max(dot(N, H), 0.0);
+    let raw = pow(n_dot_h, 220.0) * ocean.specular_strength;
+    let aa = clamp(fwidth(raw) * 1.5, 1e-4, 0.4);
+    let wide = pow(n_dot_h, 24.0) * ocean.specular_strength;
+    let wide_aa = clamp(fwidth(wide) * 1.5, 1e-4, 0.4);
+    return l.radiance * (smoothstep(0.30 - aa, 0.30 + aa, raw)
+        + 0.25 * smoothstep(0.30 - wide_aa, 0.30 + wide_aa, wide));
+}
 
 // ── Grid warp ───────────────────────────────────────────────────────────
 // Chebyshev-radius exponential-ish warp: dense center, km-scale rim.
@@ -390,7 +364,7 @@ fn vs_main(in: VertexInput) -> VertexOutput {
     let off = gerstner_offset(flat_xz, fade * body.params.x);
     let world_pos = vec3<f32>(flat_xz.x + off.x, off.y, flat_xz.y + off.z);
 
-    out.clip_position = transform.view_proj * vec4<f32>(world_pos, 1.0);
+    out.clip_position = clip_of(vec4<f32>(world_pos, 1.0));
     out.world_pos = world_pos;
     out.param_xz = flat_xz;
     out.fade = fade;
@@ -413,7 +387,7 @@ fn vs_body(in: BodyVertexInput) -> VertexOutput {
     let off = flowing_offset(flow_taps(rest_xz, in.flow), fade * body.params.x);
     let world_pos = in.position + off;
 
-    out.clip_position = transform.view_proj * vec4<f32>(world_pos, 1.0);
+    out.clip_position = clip_of(vec4<f32>(world_pos, 1.0));
     out.world_pos = world_pos;
     out.param_xz = rest_xz;
     out.fade = fade;
@@ -423,71 +397,12 @@ fn vs_body(in: BodyVertexInput) -> VertexOutput {
     return out;
 }
 
-// ── Shadow sampling (same as terrain_shader.wgsl) ───────────────────────
-
-fn shadow_factor(world_pos: vec3<f32>, view_depth: f32) -> f32 {
-    let shadow_far = shadow.cascade_splits.z;
-    let fade_start = shadow_far * 0.75;
-    if (view_depth > shadow_far) {
-        return 1.0;
-    }
-    let distance_fade = 1.0 - smoothstep(fade_start, shadow_far, view_depth);
-
-    var cascade: i32 = 0;
-    if (view_depth > shadow.cascade_splits.x) {
-        cascade = 1;
-    }
-    if (view_depth > shadow.cascade_splits.y) {
-        cascade = 2;
-    }
-
-    let light_space = shadow.cascade_view_proj[cascade] * vec4<f32>(world_pos, 1.0);
-    let proj = light_space.xyz / light_space.w;
-    let shadow_uv = proj.xy * vec2<f32>(0.5, -0.5) + vec2<f32>(0.5);
-
-    let edge_fade = min(
-        min(smoothstep(0.0, 0.02, shadow_uv.x), smoothstep(0.0, 0.02, 1.0 - shadow_uv.x)),
-        min(smoothstep(0.0, 0.02, shadow_uv.y), smoothstep(0.0, 0.02, 1.0 - shadow_uv.y))
-    );
-    if (edge_fade <= 0.0) {
-        return 1.0;
-    }
-
-    let depth = proj.z;
-    // Texel size rides cascade_splits.w (0 = unset -> legacy 1/2048).
-    var texel_size = shadow.cascade_splits.w;
-    if (texel_size <= 0.0) {
-        texel_size = 1.0 / 2048.0;
-    }
-    var shadow_sum = 0.0;
-    for (var y = -1; y <= 1; y = y + 1) {
-        for (var x = -1; x <= 1; x = x + 1) {
-            let offset = vec2<f32>(f32(x), f32(y)) * texel_size;
-            shadow_sum += textureSampleCompareLevel(
-                shadow_maps, shadow_sampler, shadow_uv + offset, cascade, depth
-            );
-        }
-    }
-
-    let raw_shadow = shadow_sum / 9.0;
-    return mix(1.0, raw_shadow, distance_fade * edge_fade);
-}
-
 // Invert the engine's wgpu-convention [0,1] projection (ADR 0055): stored
 // depth d maps to view distance z = n·f / (f − d·(f−n)).
 fn linearize_depth(d: f32) -> f32 {
     let n = ocean.camera_near;
     let f = ocean.camera_far;
     return (n * f) / max(f - d * (f - n), 1e-4);
-}
-
-fn aces_filmic(x: vec3<f32>) -> vec3<f32> {
-    let a = 2.51;
-    let b = 0.03;
-    let c = 2.43;
-    let d = 0.59;
-    let e = 0.14;
-    return saturate((x * (a * x + b)) / (x * (c * x + d) + e));
 }
 
 // Quantize a 0..1 value into `steps` hard bands with fwidth anti-aliasing.
@@ -559,11 +474,12 @@ fn fs_main(in: VertexOutput,
     // bloomed sun-disc on the water right under the camera.
     let fresnel = 0.02 + 0.98 * pow(clamp(1.0 - ndv, 0.0, 1.0), 5.0);
 
-    // ── Reality tear, mode 2: the sea turns to blood ────────────────────
+    // ── Tint (#746): the palette moves toward the tint's ────────────────
     // The whole palette is remapped through locals BEFORE any use, so every
     // downstream term (bands, SSS, foam, reflections) agrees. Remapping here
-    // — after the TOD script's palette landed in the uniforms — means the
-    // tear can never race time_of_day.rhai.
+    // — after a script's palette (a time of day) landed in the uniforms —
+    // means the tint can never race it. Pools of dye and the ceiling seen
+    // from under the water are two settings of it (tint_pools, tint_below).
     var deep_rgb = body.deep_color.rgb;
     var shallow_rgb = body.shallow_color.rgb;
     var sss_rgb = ocean.sss_color.rgb;
@@ -574,45 +490,42 @@ fn fs_main(in: VertexOutput,
     var sky_haze_rgb = ocean.sky_haze.rgb;
     var ramp_steps = max(ocean.ramp_steps, 1.0);
     var band_wobble = ocean.band_wobble;
-    if (ocean.mode == 2u && ocean.mode_mix > 0.001) {
-        // Blood pools: world-anchored patches that spread to full coverage
-        // as the tear deepens. Threshold sweeps the fbm span (~[0, 0.875],
-        // mean ≈ 0.44) so coverage tracks mode_mix; pinned full at mix = 1.
-        let pool = fbm(in.param_xz * 0.08 + vec2<f32>(ocean.time * 0.01, 0.0));
-        let th = 0.44 + 0.4 * (1.0 - 2.0 * ocean.mode_mix);
-        let m = max(smoothstep(th - 0.12, th + 0.12, pool),
-                    smoothstep(0.85, 1.0, ocean.mode_mix));
-        // Scale by the TOD palette's own luminance so night blood stays
+    let below_only = (ocean.tint_flags & 1u) != 0u;
+    if (ocean.tint > 0.001 && (!below_only || !front)) {
+        // Pools: world-anchored patches that spread to full coverage as the
+        // tint deepens. The threshold sweeps the fbm span (~[0, 0.875], mean
+        // ≈ 0.44) so coverage tracks the amount; pinned full at 1. No pools
+        // (scale 0): the amount itself, evenly.
+        var m = ocean.tint;
+        let pools = ocean.tint_deep.w;
+        if (pools > 0.0) {
+            let pool = fbm(in.param_xz * pools + vec2<f32>(ocean.time * 0.01, 0.0));
+            let th = 0.44 + 0.4 * (1.0 - 2.0 * ocean.tint);
+            m = max(smoothstep(th - 0.12, th + 0.12, pool),
+                    smoothstep(0.85, 1.0, ocean.tint));
+        }
+        // Scaled by the palette's own luminance, so a night sea stays
         // night-dark instead of glowing.
-        let deep_l = dot(deep_rgb, vec3<f32>(0.2126, 0.7152, 0.0722));
-        let k = clamp(deep_l / 0.25, 0.35, 1.3);
-        deep_rgb = mix(deep_rgb, vec3<f32>(0.10, 0.005, 0.01) * k, m);
-        shallow_rgb = mix(shallow_rgb, vec3<f32>(0.45, 0.04, 0.05) * k, m);
-        sss_rgb = mix(sss_rgb, vec3<f32>(0.85, 0.05, 0.03), m);
-        foam_rgb = mix(foam_rgb, vec3<f32>(0.95, 0.78, 0.76), m);
-        shore_rgb = mix(shore_rgb, vec3<f32>(0.95, 0.78, 0.76), m);
-        // Reflections must bleed too or the pools stay sky-blue at grazing.
-        sky_zen_rgb = mix(sky_zen_rgb, sky_zen_rgb * vec3<f32>(1.0, 0.25, 0.3), m);
-        sky_hor_rgb = mix(sky_hor_rgb, sky_hor_rgb * vec3<f32>(1.1, 0.3, 0.32), m);
-        sky_haze_rgb = mix(sky_haze_rgb, sky_haze_rgb * vec3<f32>(1.1, 0.3, 0.32), m);
-        // Viscosity: fewer, wider bands with a raggedier ink line.
-        ramp_steps = mix(ramp_steps, 2.0, m);
-        band_wobble = band_wobble + 0.15 * m;
-    }
-
-    // ── Underwater, mode 5 (back faces only): the surface as a ceiling ──
-    // The composite pass owns the murk/waterline; here the underside just
-    // has to AGREE with it — murk-matched blues, luminous flat-white foam
-    // patches (crests read as glowing panes from below), fewer bands. Top
-    // faces are untouched: looking down through the line stays the normal
-    // sea.
-    if (ocean.mode == 5u && ocean.mode_mix > 0.001 && !front) {
-        let m = ocean.mode_mix;
-        deep_rgb = mix(deep_rgb, vec3<f32>(0.02, 0.12, 0.26), m);
-        shallow_rgb = mix(shallow_rgb, vec3<f32>(0.07, 0.30, 0.46), m);
-        sss_rgb = mix(sss_rgb, vec3<f32>(0.10, 0.45, 0.55), m);
-        foam_rgb = mix(foam_rgb, vec3<f32>(0.94, 0.98, 1.0), m);
-        ramp_steps = mix(ramp_steps, 2.0, m);
+        var k = 1.0;
+        if ((ocean.tint_flags & 2u) != 0u) {
+            let deep_l = dot(deep_rgb, vec3<f32>(0.2126, 0.7152, 0.0722));
+            k = clamp(deep_l / 0.25, 0.35, 1.3);
+        }
+        deep_rgb = mix(deep_rgb, ocean.tint_deep.rgb * k, m);
+        shallow_rgb = mix(shallow_rgb, ocean.tint_shallow.rgb * k, m);
+        sss_rgb = mix(sss_rgb, ocean.tint_sss.rgb, m);
+        foam_rgb = mix(foam_rgb, ocean.tint_foam.rgb, m);
+        shore_rgb = mix(shore_rgb, ocean.tint_foam.rgb, m);
+        // Reflections must take it too, or tinted pools stay sky-blue at
+        // grazing angles.
+        sky_zen_rgb = mix(sky_zen_rgb, sky_zen_rgb * ocean.tint_sky.rgb, m);
+        sky_hor_rgb = mix(sky_hor_rgb, sky_hor_rgb * ocean.tint_sky.rgb, m);
+        sky_haze_rgb = mix(sky_haze_rgb, sky_haze_rgb * ocean.tint_sky.rgb, m);
+        // Fewer, wider bands with a raggedier ink line (viscosity).
+        if (ocean.tint_shallow.w > 0.0) {
+            ramp_steps = mix(ramp_steps, ocean.tint_shallow.w, m);
+        }
+        band_wobble = band_wobble + ocean.tint_sss.w * m;
     }
 
     // Primary light (the sun). Fall back to top-down white if scene has none.
@@ -651,6 +564,27 @@ fn fs_main(in: VertexOutput,
     let rim = pow(clamp(1.0 - N.y, 0.0, 1.0), 1.5);
     let toward_sun = pow(max(dot(V, -L), 0.0), 2.0);
     water_color += sss_rgb * (rim * toward_sun * height01);
+
+    // ── The point and spot lights (#1048): the light each scatters in the
+    // surface, glows through the flanks with and glints off the waves.
+    // With none, the loops run zero times and every sum below adds 0. ──
+    var local_scatter = vec3<f32>(0.0);
+    var local_sss = vec3<f32>(0.0);
+    var local_glint = vec3<f32>(0.0);
+    for (var i = 0u; i < lights.point_count; i = i + 1u) {
+        let l = point_light_at(i, in.world_pos, in.rest_normal, in.clip_position.xy);
+        local_scatter += water_local_scatter(l, N);
+        local_sss += water_local_sss(l, V, rim);
+        local_glint += water_local_glint(l, N, V);
+    }
+    for (var i = 0u; i < lights.spot_count; i = i + 1u) {
+        // The rest normal offsets the spot's map, as the cascades take none:
+        // the swell's own normal would move the shadow with the waves
+        let l = spot_light_at(i, in.world_pos, in.rest_normal, in.clip_position.xy);
+        local_scatter += water_local_scatter(l, N);
+        local_sss += water_local_sss(l, V, rim);
+        local_glint += water_local_glint(l, N, V);
+    }
 
     // ── Foam: crest pinch (Jacobian) broken up by drifting noise ───────
     // Foam fades with distance: graphic detail near the camera, flat color
@@ -692,28 +626,34 @@ fn fs_main(in: VertexOutput,
     let foam_flecks = smoothstep(fleck_cut - lace_aa, fleck_cut + lace_aa, lace)
         * halo_band * (1.0 - foam_solid);
 
-    // ── Contact foam: churn where water strikes the ocean_contact hull ──
-    // Rounded-rect SDF in the hull's yawed local frame; churn is driven by
+    // ── Contact foam: churn where water strikes an ocean_contact hull ──
+    // Rounded-rect SDF in each hull's yawed local frame; churn is driven by
     // the water's orbital velocity relative to the hull, projected INTO the
     // nearest hull face — so a flat sea (or the lee side, where flow moves
-    // away from the hull) stays quiet, and the windward face flares.
+    // away from the hull) stays quiet, and the windward face flares. Where
+    // two hulls' rings meet, the stronger shows.
     var contact_foam = 0.0;
-    if (ocean.splash_strength > 0.001) {
-        let rel = in.world_pos.xz - ocean.hull_a.xy;
-        let cy = ocean.hull_a.z;
-        let sy = ocean.hull_a.w;
+    // The count is the CPU's, clamped again so the loop ends on any input
+    // (built-in WGSL runs without loop bounding, #944).
+    let contact_count = min(ocean.contact_count, 4u);
+    for (var hi = 0u; hi < contact_count; hi++) {
+        let hull = ocean.hulls[hi];
+        let rel = in.world_pos.xz - hull.pose.xy;
+        let cy = hull.pose.z;
+        let sy = hull.pose.w;
         // World → hull-local. Yaw convention: forward = (sin y, cos y),
         // right = (cos y, -sin y), matching the engine's Y-up Euler rotation.
         let local = vec2<f32>(rel.x * cy - rel.y * sy, rel.x * sy + rel.y * cy);
         // Corner radius ~ log radius so foam wraps the outer logs.
         let corner = 0.13;
-        let qd = abs(local) - (ocean.hull_b.xy - vec2<f32>(corner));
+        let qd = abs(local) - (hull.extent.xy - vec2<f32>(corner));
         let sd = length(max(qd, vec2<f32>(0.0))) + min(max(qd.x, qd.y), 0.0) - corner;
-        // Derivative BEFORE the divergent branch below.
+        // Derivative BEFORE the divergent branch below (the loop's bound
+        // is uniform, so this is still uniform control flow).
         let sd_aa = clamp(fwidth(sd) * 1.5, 1e-4, 0.4);
 
-        if (sd < ocean.splash_width * 2.0 + 0.3) {
-            let rel_vel = gerstner_velocity(in.param_xz, in.fade) - ocean.hull_c.xyz;
+        if (ocean.splash_strength > 0.001 && sd < ocean.splash_width * 2.0 + 0.3) {
+            let rel_vel = gerstner_velocity(in.param_xz, in.fade) - hull.velocity.xyz;
             // Outward hull normal from the SDF gradient, hull-local frame.
             var g_local: vec2<f32>;
             if (sd > 0.0 && (qd.x > 0.0 || qd.y > 0.0)) {
@@ -739,19 +679,21 @@ fn fs_main(in: VertexOutput,
             // what actually churns — weight impact by surface height so
             // windward crest-strikes dominate and the lee stays quiet.
             let crest = clamp(0.5 + swell * 1.2, 0.25, 1.25);
-            let churn = clamp(ocean.hull_b.z + impact * crest * ocean.hull_c.w, 0.0, 1.5);
+            let churn = clamp(ocean.splash_baseline + impact * crest * ocean.splash_response,
+                              0.0, 1.5);
 
             // Scalloped, lapping edge; churn drives both width and opacity.
-            let lap = fbm(local * ocean.hull_b.w + vec2<f32>(
+            let lap = fbm(local * ocean.splash_noise_scale + vec2<f32>(
                 ocean.time * 0.9 * ocean.splash_flicker_speed,
                 ocean.time * -0.6 * ocean.splash_flicker_speed));
             let width = ocean.splash_width * churn * (0.55 + 0.9 * lap);
             let band = 1.0 - smoothstep(width - sd_aa, width + sd_aa, sd);
-            contact_foam = band * clamp(ocean.splash_strength * churn, 0.0, 1.5);
+            var hull_foam = band * clamp(ocean.splash_strength * churn, 0.0, 1.5);
             // Same lace as the crest foam breaks the ring into a dashed,
             // bubbly lap — a solid band reads as a glow decal at night.
-            contact_foam *= 0.30 + 0.70 * smoothstep(0.38 - lace_aa,
-                                                     0.38 + lace_aa, lace);
+            hull_foam *= 0.30 + 0.70 * smoothstep(0.38 - lace_aa,
+                                                  0.38 + lace_aa, lace);
+            contact_foam = max(contact_foam, hull_foam);
         }
     }
 
@@ -922,7 +864,9 @@ fn fs_main(in: VertexOutput,
     let spec = smoothstep(0.30 - spec_aa, 0.30 + spec_aa, spec_raw) * front_f;
 
     // ── Shadows (scene silhouettes on the water) ────────────────────────
-    let sf = shadow_factor(in.world_pos, view_depth);
+    // The cascades every surface takes (shadows.wgsl), with no normal offset:
+    // the waves' own normal would move the shadow with the swell.
+    let sf = shadow_factor(in.world_pos, view_depth, vec3<f32>(0.0));
 
     // Lighting composition. The water body color is treated as pre-lit
     // (stylized): tinted by the sun, dimmed in shadow, foam takes light fully.
@@ -946,7 +890,8 @@ fn fs_main(in: VertexOutput,
     // the time-of-day palette. foam_color itself is constant white and the
     // raw hemisphere ambient is desaturated — together they rendered dusk
     // foam as daylight blue-gray slabs on a purple sea. Water keeps plain
-    // ambient: its palette is already TOD-driven by time_of_day.rhai.
+    // ambient: its palette is the component's, which a game's time of day
+    // may already be moving.
     var foam_ambient = ambient;
     if (ocean.sky_reflection_strength > 0.001) {
         let sky_glow = mix(sky_hor_rgb, sky_haze_rgb, ocean.sky_haze.a);
@@ -955,7 +900,8 @@ fn fs_main(in: VertexOutput,
 
     // Styled opaque water body (no foam) — also the infinite-depth limit of
     // the transmission below, so high turbidity converges to it seamlessly.
-    let water_body = water_color * sun_tint * shadow_dim + ambient * water_color * 0.5;
+    let water_body = water_color * sun_tint * shadow_dim + ambient * water_color * 0.5
+        + water_color * local_scatter + sss_rgb * local_sss * height01;
 
     let base = mix(water_color, foam_tint, foam_mix);
     var color = base * sun_tint * shadow_dim;
@@ -965,6 +911,8 @@ fn fs_main(in: VertexOutput,
         * clamp(fresnel * 3.0, 0.0, 1.0);
     color += mix(ambient * water_color, foam_ambient * foam_tint,
                  foam_mix) * 0.5;
+    // The lanterns' light in the surface and through the flanks (#1048)
+    color += base * local_scatter + sss_rgb * local_sss * (height01 * (1.0 - foam_mix));
 
     // ── Refraction + turbidity (grab pass): see through to the legs ─────
     if (ocean.grab_enabled == 1u) {
@@ -1020,8 +968,14 @@ fn fs_main(in: VertexOutput,
         color = mix(color, sky_ref, clamp(reflect_amt, 0.0, 1.0));
     }
 
-    // ── Bioluminescent foam (foam_glow.a > 0, driven by biolum.rhai on
-    // rare night bloom windows). Emissive, added AFTER reflection/
+    // The lanterns' glints (#1048), laid over the sky's reflection since
+    // they are part of what the water reflects: weighted by fresnel as the
+    // sun's is, none on the underside, none on foam
+    color += local_glint * (front_f * foam_distance_fade * (1.0 - foam_mix)
+        * clamp(fresnel * 3.0, 0.0, 1.0));
+
+    // ── Bioluminescent foam (foam_glow.a > 0: the component's foam_glow,
+    // which a game raises at night). Emissive, added AFTER reflection/
     // refraction mixing so nothing washes it out. Weighted hard toward
     // agitation — bioluminescence is STIMULATED light: the churned
     // contact wake flares, flecks spark, and the passive crest mass gets

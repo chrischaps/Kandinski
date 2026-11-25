@@ -31,13 +31,17 @@
 //! input = "config/input.toml"
 //! strict = true                             # an undeclared component field is an error
 //! save_version = 2                          # the version saves are written at
+//!
+//! [project.diagnostics]
+//! allow = ["unknown-field:material.wetness"] # diagnostics this project accepts (#795)
 //! ```
 //!
 //! Every key is optional and so is the table: an empty `flint.toml` is a
 //! marker and nothing more. Paths are relative to the root. A key of the
 //! wrong type, or a key in `[project]` this version doesn't know, is a
 //! [`ProjectError`] naming the file and the key, so a typo is never silently
-//! ignored. Tables other than `[project]` are left alone.
+//! ignored. `[packages]` (ADR 0136 decision 9, #1334) is read into
+//! [`Project::packages`]; other tables are left alone.
 //!
 //! ```
 //! use flint_core::project::{Found, Project};
@@ -79,7 +83,20 @@ pub use root::guessed_root;
 pub const MANIFEST_FILE: &str = "flint.toml";
 
 /// The keys `[project]` may hold.
-const PROJECT_KEYS: [&str; 6] = ["id", "schemas", "scene", "input", "strict", "save_version"];
+const PROJECT_KEYS: [&str; 8] = [
+    "id",
+    "schemas",
+    "scene",
+    "input",
+    "strict",
+    "save_version",
+    "diagnostics",
+    "physics",
+];
+
+/// How many layers `[project.physics] layers` may name besides `default`:
+/// Rapier has 32 collision groups and `default` is the first (#729).
+pub const MAX_PHYSICS_LAYERS: usize = 31;
 
 /// Why a directory was taken as the project root.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -138,10 +155,41 @@ pub enum ProjectError {
 
     /// `[project]` holds a key this version doesn't know.
     #[error(
-        "{}: unknown key `{key}` in [project] (the keys are id, schemas, scene, input, strict, save_version)",
+        "{}: unknown key `{key}` in [project] (the keys are id, schemas, scene, input, strict, save_version, diagnostics, physics)",
         file.display()
     )]
     UnknownKey { file: PathBuf, key: String },
+
+    /// `[project.physics]` that can't be the project's collision layers: a
+    /// key other than `layers`, a name twice or empty, or too many (#729).
+    #[error("{}: `{key}`: {message}", file.display())]
+    BadPhysics {
+        file: PathBuf,
+        key: String,
+        message: String,
+    },
+
+    /// A line of `[packages]` that can't be one (ADR 0136 decision 9,
+    /// #1334): a bad name, a version requirement that doesn't parse, a
+    /// table or `true`.
+    #[error("{}: `{key}`: {message}", file.display())]
+    BadPackages {
+        file: PathBuf,
+        /// `packages`, or `packages.<name>`.
+        key: String,
+        message: String,
+    },
+
+    /// An entry of `[project.diagnostics] allow` that names no code a
+    /// project may allow (#795), or a key of `[project.diagnostics]` other
+    /// than `allow`.
+    #[error("{}: `{key}`: {message}", file.display())]
+    BadDiagnostics {
+        file: PathBuf,
+        /// `project.diagnostics.allow[2]`, or the unknown key.
+        key: String,
+        message: String,
+    },
 }
 
 /// A located project: its root, how it was found, and what its manifest says.
@@ -172,6 +220,18 @@ pub struct Project {
     /// (#726). A save file at a lower one is handed to the scripts'
     /// `on_persist_migrate(from)`. 0 when the manifest doesn't say.
     pub save_version: i64,
+    /// `[packages]` (ADR 0136 decision 9, #1334): the packages the game
+    /// uses, as written. `None` when the manifest has no such table: every
+    /// package is in, as before the key existed.
+    pub packages: Option<crate::package::PackageList>,
+    /// `[project.diagnostics] allow` (#795): the diagnostics this project
+    /// accepts, left out of what `flint_scene::diagnose`, the loaders,
+    /// `flint validate` and `flint check` report (they say how many).
+    pub allow: Vec<crate::diagnostic::Allow>,
+    /// `[project.physics] layers` (#729): the collision layers a
+    /// `collider.layer` and `collider.mask` may name, besides `default`,
+    /// which is always the first. Empty when the manifest doesn't say.
+    pub physics_layers: Vec<String>,
 }
 
 static OVERRIDE: OnceLock<Project> = OnceLock::new();
@@ -277,6 +337,9 @@ impl Project {
             input: None,
             strict: false,
             save_version: 0,
+            packages: None,
+            allow: Vec::new(),
+            physics_layers: Vec::new(),
         }
     }
 
@@ -305,6 +368,15 @@ impl Project {
                 file: file.to_path_buf(),
                 message: e.to_string().trim_end().to_string(),
             })?;
+        if let Some(value) = doc.get("packages") {
+            self.packages = Some(crate::package::PackageList::read(value, file).map_err(|e| {
+                ProjectError::BadPackages {
+                    file: file.to_path_buf(),
+                    key: e.key,
+                    message: e.message,
+                }
+            })?);
+        }
         let Some(section) = doc.get("project") else {
             return Ok(());
         };
@@ -364,6 +436,12 @@ impl Project {
                 ))
             }
         };
+        if let Some(value) = table.get("diagnostics") {
+            self.allow = read_allow(file, value)?;
+        }
+        if let Some(value) = table.get("physics") {
+            self.physics_layers = read_physics_layers(file, value)?;
+        }
         if let Some(value) = table.get("schemas") {
             let list = value
                 .as_array()
@@ -529,6 +607,11 @@ pub struct SchemaDirs {
     /// flags name themselves. Empty otherwise.
     /// [`dropped_warnings`](Self::dropped_warnings) words them.
     pub dropped: Vec<PathBuf>,
+    /// The packages the project's `[packages]` lets in, held to the engine's
+    /// manifests (#1334): only theirs are among `dirs`. `None` with no
+    /// `[packages]` key (every package's schemas load), or with no engine
+    /// among the directories to read the manifests from.
+    pub packages: Option<crate::package::InUse>,
 }
 
 impl Default for SchemaDirs {
@@ -539,6 +622,7 @@ impl Default for SchemaDirs {
             dirs: Vec::new(),
             source: SchemaSource::Discovery,
             dropped: Vec::new(),
+            packages: None,
         }
     }
 }
@@ -555,6 +639,13 @@ pub enum SchemaDirsError {
     /// The project's manifest could not be read.
     #[error(transparent)]
     Project(#[from] ProjectError),
+    /// `[packages]` names a package the engine doesn't have, or leaves out
+    /// one that can't be (#1334): each line's `bad-manifest`.
+    #[error("{}: [packages]: {}", file.display(), problems.iter().map(|d| d.one_line()).collect::<Vec<_>>().join("; "))]
+    Packages {
+        file: PathBuf,
+        problems: Vec<crate::diagnostic::Diagnostic>,
+    },
 }
 
 /// The one answer to "which schema directories?" (ADR 0114, decision 3).
@@ -569,13 +660,26 @@ pub enum SchemaDirsError {
 /// A directory that a flag or the manifest names and that isn't there is an
 /// error naming it and who named it. Discovery only returns what exists, so
 /// its list may be empty.
+///
+/// Whichever way, an engine schema directory brings its packages' schemas
+/// right after it ([`package_schema_dirs`], #1332): `--schemas schemas` in
+/// this checkout is `schemas`, `packages/living/schemas`,
+/// `packages/music/schemas`.
 pub fn schema_dirs(
     scene: Option<&Path>,
     flags: &[impl AsRef<Path>],
 ) -> Result<SchemaDirs, SchemaDirsError> {
     if !flags.is_empty() {
         let dirs = flags.iter().map(|f| f.as_ref().to_path_buf()).collect();
-        let mut resolved = named(dirs, SchemaSource::Flags)?;
+        // The flags name the directories; the project still says which
+        // packages are in (a manifest that doesn't read lets every one in,
+        // as the flags never read it before)
+        let project = match scene {
+            Some(scene) => Project::for_path(scene),
+            None => Project::current(),
+        };
+        let list = project.ok().and_then(|p| p.packages);
+        let mut resolved = named(dirs, SchemaSource::Flags, list.as_ref())?;
         // TEMPORARY, for one release (ADR 0114 decision 3): what the old
         // rule would have added to these flags
         if let Some(scene) = scene {
@@ -593,7 +697,7 @@ pub fn schema_dirs(
     };
     if !project.schemas.is_empty() {
         let source = SchemaSource::Manifest(project.manifest_path());
-        return named(project.schema_dirs(), source);
+        return named(project.schema_dirs(), source, project.packages.as_ref());
     }
     let mut dirs = Vec::new();
     if vfs::is_dir("schemas") {
@@ -602,10 +706,12 @@ pub fn schema_dirs(
     if let Some(scene) = scene {
         add_dirs_beside(scene, &mut dirs);
     }
+    let (dirs, packages) = with_packages(dirs, project.packages.as_ref())?;
     Ok(SchemaDirs {
         dirs,
         source: SchemaSource::Discovery,
         dropped: Vec::new(),
+        packages,
     })
 }
 
@@ -625,10 +731,29 @@ pub fn host_schema_dirs(listed: &[impl AsRef<Path>], scene: Option<&Path>) -> Sc
         add_dirs_beside(scene, &mut dirs);
     }
     SchemaDirs {
-        dirs,
+        dirs: bring_packages(dirs),
         source: SchemaSource::Host,
         dropped: Vec::new(),
+        packages: None,
     }
+}
+
+/// The schema directories of a game whose files were packed where the
+/// packer put the engine's schemas, as an Android APK unpacks into the app's
+/// files (#797): the scene's manifest list when its project names one, as
+/// every other host reads it (so a game that lists `engine/schemas/examples`
+/// gets the room-builder archetypes), else `packed` as a host list, the
+/// pair the packer copied in for a game with no manifest list. A manifest
+/// naming a directory that wasn't packed is [`schema_dirs`]'s error.
+pub fn packed_schema_dirs(
+    scene: &Path,
+    packed: &[impl AsRef<Path>],
+) -> Result<SchemaDirs, SchemaDirsError> {
+    let resolved = schema_dirs(Some(scene), &[] as &[&Path])?;
+    if resolved.source != SchemaSource::Discovery {
+        return Ok(resolved);
+    }
+    Ok(host_schema_dirs(packed, Some(scene)))
 }
 
 impl SchemaDirs {
@@ -662,6 +787,7 @@ impl SchemaDirs {
             SchemaSource::Host => {
                 let mut next = self.clone();
                 add_dirs_beside(scene, &mut next.dirs);
+                next.dirs = bring_packages(next.dirs);
                 Ok(next)
             }
             SchemaSource::Manifest(_) | SchemaSource::Discovery => {
@@ -682,18 +808,170 @@ impl SchemaDirs {
 }
 
 /// A list somebody named: every directory in it has to be there.
-fn named(dirs: Vec<PathBuf>, source: SchemaSource) -> Result<SchemaDirs, SchemaDirsError> {
-    match dirs.iter().find(|d| !vfs::is_dir(d)) {
-        Some(dir) => Err(SchemaDirsError::Missing {
+fn named(
+    dirs: Vec<PathBuf>,
+    source: SchemaSource,
+    list: Option<&crate::package::PackageList>,
+) -> Result<SchemaDirs, SchemaDirsError> {
+    if let Some(dir) = dirs.iter().find(|d| !vfs::is_dir(d)) {
+        return Err(SchemaDirsError::Missing {
             dir: dir.clone(),
             named_by: source,
-        }),
-        None => Ok(SchemaDirs {
-            dirs,
-            source,
-            dropped: Vec::new(),
-        }),
+        });
     }
+    let (dirs, packages) = with_packages(dirs, list)?;
+    Ok(SchemaDirs {
+        dirs,
+        source,
+        dropped: Vec::new(),
+        packages,
+    })
+}
+
+/// The schema directories the engine's packages bring with an engine schema
+/// directory (ADR 0136 decision 8, #1332), as `(package, directory)` in the
+/// fixed order, by package name: `<engine>/packages/<name>/schemas` for each
+/// package that has one, spelled from `dir` (`schemas` brings
+/// `packages/living/schemas`, `engine/schemas` brings
+/// `engine/packages/living/schemas`).
+///
+/// `dir` is an engine schema directory when the kernel's manifest,
+/// `packages/engine/package.toml`, stands beside it: the engine's own
+/// checkout, a game's `engine/` subtree, `--schemas ../Flint/schemas`, an
+/// Android game's unpacked `engine/`. Any other directory brings nothing.
+/// Read through the vfs; nothing here is an error.
+pub fn package_schema_dirs(dir: &Path) -> Vec<(String, PathBuf)> {
+    let Some(engine) = dir.parent() else {
+        return Vec::new();
+    };
+    let packages = engine.join(crate::package::PACKAGES_DIR);
+    let kernel = packages
+        .join(KERNEL_PACKAGE)
+        .join(crate::package::MANIFEST_FILE);
+    if !vfs::is_file(&kernel) {
+        return Vec::new();
+    }
+    let mut found: Vec<(String, PathBuf)> = vfs::read_dir(&packages)
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|package| {
+            let name = package.file_name()?.to_string_lossy().into_owned();
+            let schemas = package.join(PACKAGE_SCHEMAS_DIR);
+            vfs::is_dir(&schemas).then_some((name, schemas))
+        })
+        .collect();
+    found.sort();
+    found
+}
+
+/// The kernel's package, whose manifest marks an engine tree.
+const KERNEL_PACKAGE: &str = "engine";
+
+/// A package's schemas: the folder of that name beside its manifest, laid
+/// out as the engine's are (ADR 0136 decision 8).
+pub const PACKAGE_SCHEMAS_DIR: &str = "schemas";
+
+/// [`with_packages`] with every package in: a host's list, which the
+/// packer settled.
+fn bring_packages(dirs: Vec<PathBuf>) -> Vec<PathBuf> {
+    with_packages(dirs, None)
+        .map(|(dirs, _)| dirs)
+        .unwrap_or_default()
+}
+
+/// `dirs` with each engine schema directory followed by the package
+/// directories it brings ([`package_schema_dirs`]), in their fixed order. A
+/// package directory the list already names, anywhere, is left where the
+/// list put it, so a list that spells them out (a bundle's) reads the same.
+///
+/// With a `[packages]` list (#1334) only the packages it lets in are
+/// brought, and a package directory the list names for one it leaves out is
+/// dropped; the [`InUse`](crate::package::InUse) that decided it comes back
+/// beside them. Its mistakes are [`SchemaDirsError::Packages`]. With no
+/// engine among `dirs` there are no manifests to hold the list to, and
+/// nothing is left out.
+fn with_packages(
+    dirs: Vec<PathBuf>,
+    list: Option<&crate::package::PackageList>,
+) -> Result<(Vec<PathBuf>, Option<crate::package::InUse>), SchemaDirsError> {
+    let in_use = match list {
+        None => None,
+        Some(list) => match dirs.iter().find_map(|d| engine_packages_of(d)) {
+            None => None,
+            Some(packages_dir) => {
+                let packages = crate::package::Packages::read(&packages_dir);
+                Some(
+                    crate::package::InUse::resolve(list, &packages).map_err(|problems| {
+                        SchemaDirsError::Packages {
+                            file: list.file.clone(),
+                            problems,
+                        }
+                    })?,
+                )
+            }
+        },
+    };
+    let wanted = |name: &str| in_use.as_ref().is_none_or(|u| u.is_on(name));
+    let dirs: Vec<PathBuf> = dirs
+        .into_iter()
+        .filter(|d| package_of_schema_dir(d).is_none_or(|(_, name)| wanted(&name)))
+        .collect();
+    let mut listed: Vec<String> = Vec::new();
+    let mut out = Vec::with_capacity(dirs.len());
+    for dir in &dirs {
+        listed.push(same_dir_key(dir));
+    }
+    for dir in dirs {
+        let brings = package_schema_dirs(&dir);
+        out.push(dir);
+        for (name, package) in brings {
+            if !wanted(&name) {
+                continue;
+            }
+            let key = same_dir_key(&package);
+            if !listed.contains(&key) {
+                listed.push(key);
+                out.push(package);
+            }
+        }
+    }
+    Ok((out, in_use))
+}
+
+/// The engine's package folder (`<engine>/packages`) of the first engine
+/// schema directory, or package schema directory, in `dirs`: where the
+/// manifests that hold a `[packages]` list are read (#1334).
+pub fn engine_packages_for(dirs: &[PathBuf]) -> Option<PathBuf> {
+    dirs.iter().find_map(|d| engine_packages_of(d))
+}
+
+/// The engine package folder an engine schema directory, or a package's
+/// schema directory, belongs to: `<engine>/packages`.
+fn engine_packages_of(dir: &Path) -> Option<PathBuf> {
+    if let Some((packages, _)) = package_of_schema_dir(dir) {
+        return Some(packages);
+    }
+    let packages = dir.parent()?.join(crate::package::PACKAGES_DIR);
+    is_engine_packages(&packages).then_some(packages)
+}
+
+/// Whether `dir` is an engine's package folder: the kernel's manifest is
+/// in it.
+fn is_engine_packages(dir: &Path) -> bool {
+    vfs::is_file(dir.join(KERNEL_PACKAGE).join(crate::package::MANIFEST_FILE))
+}
+
+/// `(<engine>/packages, name)` when `dir` is a package's schema directory,
+/// `<engine>/packages/<name>/schemas`.
+fn package_of_schema_dir(dir: &Path) -> Option<(PathBuf, String)> {
+    if dir.file_name()? != PACKAGE_SCHEMAS_DIR {
+        return None;
+    }
+    let package = dir.parent()?;
+    let name = package.file_name()?.to_string_lossy().into_owned();
+    let packages = package.parent()?;
+    (packages.file_name()? == crate::package::PACKAGES_DIR && is_engine_packages(packages))
+        .then(|| (packages.to_path_buf(), name))
 }
 
 /// Whether `dir` is the root of a Flint engine checkout: the one marker
@@ -763,6 +1041,116 @@ fn marker(dir: &Path, home: Option<&Path>) -> Option<Found> {
         return Some(Found::Layout);
     }
     None
+}
+
+/// `[project.diagnostics]`: a table holding `allow`, a list of
+/// [`Allow`](crate::diagnostic::Allow) entries.
+/// `[project.physics]`: `layers`, a list of distinct non-empty names
+/// (`default` may be among them; it is always the first layer), at most
+/// [`MAX_PHYSICS_LAYERS`] others.
+fn read_physics_layers(file: &Path, value: &toml::Value) -> Result<Vec<String>, ProjectError> {
+    let bad = |key: &str, message: String| ProjectError::BadPhysics {
+        file: file.to_path_buf(),
+        key: key.to_string(),
+        message,
+    };
+    let table = value.as_table().ok_or_else(|| ProjectError::WrongType {
+        file: file.to_path_buf(),
+        key: "project.physics".into(),
+        expected: "a table",
+        got: kind_of(value),
+    })?;
+    if let Some(key) = table.keys().find(|k| k.as_str() != "layers") {
+        return Err(bad(
+            &format!("project.physics.{key}"),
+            "unknown key (the one key is `layers`)".into(),
+        ));
+    }
+    let Some(list) = table.get("layers") else {
+        return Ok(Vec::new());
+    };
+    let list = list.as_array().ok_or_else(|| ProjectError::WrongType {
+        file: file.to_path_buf(),
+        key: "project.physics.layers".into(),
+        expected: "a list of layer names",
+        got: kind_of(list),
+    })?;
+    let mut names: Vec<String> = Vec::new();
+    for (i, entry) in list.iter().enumerate() {
+        let key = format!("project.physics.layers[{i}]");
+        let Some(name) = entry.as_str() else {
+            return Err(ProjectError::WrongType {
+                file: file.to_path_buf(),
+                key,
+                expected: "a string",
+                got: kind_of(entry),
+            });
+        };
+        let name = name.trim();
+        if name.is_empty() {
+            return Err(bad(&key, "a layer name is empty".into()));
+        }
+        if names.iter().any(|n| n == name) {
+            return Err(bad(&key, format!("`{name}` is listed twice")));
+        }
+        names.push(name.to_string());
+    }
+    let others = names.iter().filter(|n| n.as_str() != "default").count();
+    if others > MAX_PHYSICS_LAYERS {
+        return Err(bad(
+            "project.physics.layers",
+            format!(
+                "{others} layers besides `default`; Rapier has 32 collision groups, so at most {MAX_PHYSICS_LAYERS}"
+            ),
+        ));
+    }
+    Ok(names)
+}
+
+fn read_allow(
+    file: &Path,
+    value: &toml::Value,
+) -> Result<Vec<crate::diagnostic::Allow>, ProjectError> {
+    let wrong = |key: &str, expected: &'static str, got: &toml::Value| ProjectError::WrongType {
+        file: file.to_path_buf(),
+        key: key.to_string(),
+        expected,
+        got: kind_of(got),
+    };
+    let table = value
+        .as_table()
+        .ok_or_else(|| wrong("project.diagnostics", "a table", value))?;
+    if let Some(key) = table.keys().find(|k| k.as_str() != "allow") {
+        return Err(ProjectError::BadDiagnostics {
+            file: file.to_path_buf(),
+            key: format!("project.diagnostics.{key}"),
+            message: "unknown key (the one key is `allow`)".to_string(),
+        });
+    }
+    let Some(list) = table.get("allow") else {
+        return Ok(Vec::new());
+    };
+    let list = list.as_array().ok_or_else(|| {
+        wrong(
+            "project.diagnostics.allow",
+            "a list of strings like \"unknown-field:material.wetness\"",
+            list,
+        )
+    })?;
+    list.iter()
+        .enumerate()
+        .map(|(i, entry)| {
+            let key = format!("project.diagnostics.allow[{i}]");
+            let text = entry
+                .as_str()
+                .ok_or_else(|| wrong(&key, "a string", entry))?;
+            crate::diagnostic::Allow::parse(text).map_err(|message| ProjectError::BadDiagnostics {
+                file: file.to_path_buf(),
+                key,
+                message,
+            })
+        })
+        .collect()
 }
 
 fn kind_of(value: &toml::Value) -> &'static str {
@@ -1130,6 +1518,103 @@ save_version = 1.5
         }
     }
 
+    /// `[project.physics] layers` (#729): the collision layers, as written;
+    /// a name twice, an empty one, too many or another key is refused by key.
+    #[test]
+    fn the_manifest_names_the_collision_layers() {
+        let text = "[project]\nid = \"x\"\n\n[project.physics]\n\
+                    layers = [\"world\", \"player\", \"pickup\"]\n";
+        with_files(&[("game/flint.toml", text)], || {
+            let project = discover("game").unwrap();
+            assert_eq!(project.physics_layers, ["world", "player", "pickup"]);
+        });
+        let many: Vec<String> = (0..32).map(|i| format!("\"l{i}\"")).collect();
+        let many = format!("[project.physics]\nlayers = [{}]\n", many.join(", "));
+        let refused = [
+            (
+                "[project.physics]\nlayers = [\"a\", \"a\"]\n",
+                "project.physics.layers[1]",
+                "listed twice",
+            ),
+            (
+                "[project.physics]\nlayers = [\"\"]\n",
+                "project.physics.layers[0]",
+                "empty",
+            ),
+            (
+                "[project.physics]\nlayer = []\n",
+                "project.physics.layer",
+                "the one key is `layers`",
+            ),
+            (many.as_str(), "project.physics.layers", "at most 31"),
+        ];
+        for (text, key, says) in refused {
+            with_files(&[("game/flint.toml", text)], || {
+                let err = discover("game").unwrap_err();
+                assert!(
+                    matches!(&err, ProjectError::BadPhysics { key: k, .. } if k == key),
+                    "{text}: {err}"
+                );
+                assert!(err.to_string().contains(says), "{err}");
+            });
+        }
+    }
+
+    /// `[project.diagnostics] allow` (#795): each entry a code a project may
+    /// allow, with or without its place; anything else is refused by key.
+    #[test]
+    fn the_manifest_allows_diagnostics_by_code_and_place() {
+        let text = "[project]\nid = \"x\"\n\n[project.diagnostics]\n\
+                    allow = [\"unknown-field:material.wetness\", \"unknown-table\"]\n";
+        with_files(&[("game/flint.toml", text)], || {
+            let project = discover("game").unwrap();
+            let allowed: Vec<String> = project.allow.iter().map(|a| a.to_string()).collect();
+            assert_eq!(allowed, ["unknown-field:material.wetness", "unknown-table"]);
+        });
+        let refused = [
+            (
+                "[project.diagnostics]\nallow = [\"unknown-feild\"]\n",
+                "project.diagnostics.allow[0]",
+                "did you mean `unknown-field`?",
+            ),
+            (
+                "[project.diagnostics]\nallow = [\"bad-type\", \"toml-parse\"]\n",
+                "project.diagnostics.allow[1]",
+                "did not load",
+            ),
+            (
+                "[project.diagnostics]\nalow = []\n",
+                "project.diagnostics.alow",
+                "the one key is `allow`",
+            ),
+        ];
+        for (text, key, says) in refused {
+            with_files(&[("game/flint.toml", text)], || {
+                let err = discover("game").unwrap_err();
+                assert!(
+                    matches!(&err, ProjectError::BadDiagnostics { key: k, .. } if k == key),
+                    "{err:?}"
+                );
+                let said = err.to_string();
+                assert!(said.contains(says), "{said}");
+                assert!(said.contains("flint.toml"), "{said}");
+            });
+        }
+        with_files(
+            &[(
+                "game/flint.toml",
+                "[project.diagnostics]\nallow = \"bad-type\"\n",
+            )],
+            || {
+                let err = discover("game").unwrap_err();
+                assert!(
+                    matches!(&err, ProjectError::WrongType { key, .. } if key == "project.diagnostics.allow"),
+                    "{err:?}"
+                );
+            },
+        );
+    }
+
     #[test]
     fn an_unknown_project_key_names_the_file_and_the_key() {
         with_files(
@@ -1200,10 +1685,10 @@ save_version = 1.5
         with_files(
             &[
                 ("flint/crates/flint-core/Cargo.toml", ""),
-                ("flint/examples/a.scene.toml", ""),
+                ("flint/levels/a.scene.toml", ""),
             ],
             || {
-                let p = discover("flint/examples/a.scene.toml").unwrap();
+                let p = discover("flint/levels/a.scene.toml").unwrap();
                 assert_eq!(p.root, Path::new("flint"));
                 assert_eq!(p.found, Found::Engine);
                 assert_eq!(p.id, None);
@@ -1409,12 +1894,12 @@ save_version = 1.5
                 ("engine/schemas/", ""),
                 ("schemas/", ""),
                 ("scenes/a.scene.toml", ""),
-                ("examples/b.scene.toml", ""),
+                ("levels/b.scene.toml", ""),
             ],
             || {
                 assert!(dropped("scenes/a.scene.toml", &["engine/schemas", "schemas"]).is_empty());
-                assert!(dropped("examples/b.scene.toml", &["schemas"]).is_empty());
-                assert!(dropped("examples/b.scene.toml", &["./schemas"]).is_empty());
+                assert!(dropped("levels/b.scene.toml", &["schemas"]).is_empty());
+                assert!(dropped("levels/b.scene.toml", &["./schemas"]).is_empty());
                 // No scene, no flags, a manifest, a host: never
                 assert!(schema_dirs(None, &["engine/schemas"])
                     .unwrap()
@@ -1538,6 +2023,55 @@ save_version = 1.5
         );
     }
 
+    /// Android (#797): what the APK unpacked is read by the manifest like
+    /// every other host, so a game can list the examples layer; with no list
+    /// it is the pair the packer copied in, as before.
+    #[test]
+    fn a_packed_game_reads_its_manifest_else_the_packed_pair() {
+        let packed = ["data/engine/schemas", "data/schemas"];
+        let scene = Path::new("data/scenes/a.scene.toml");
+        let tree = |manifest: Option<&'static str>| {
+            let mut files = vec![
+                ("data/engine/schemas/", ""),
+                ("data/engine/schemas/examples/", ""),
+                ("data/schemas/", ""),
+                ("data/scenes/a.scene.toml", ""),
+            ];
+            if let Some(text) = manifest {
+                files.push(("data/flint.toml", text));
+            }
+            files
+        };
+        let listed =
+            "[project]\nschemas = [\"engine/schemas\", \"engine/schemas/examples\", \"schemas\"]\n";
+        with_files(&tree(Some(listed)), || {
+            let dirs = packed_schema_dirs(scene, &packed).unwrap();
+            assert_eq!(dirs.source.name(), "manifest");
+            assert_eq!(
+                paths(&dirs),
+                [
+                    "data/engine/schemas",
+                    "data/engine/schemas/examples",
+                    "data/schemas"
+                ]
+            );
+        });
+        // A manifest with no list, or none at all: the packed pair
+        for manifest in [Some("[project]\nid = \"kart\"\n"), None] {
+            with_files(&tree(manifest), || {
+                let dirs = packed_schema_dirs(scene, &packed).unwrap();
+                assert_eq!(dirs.source, SchemaSource::Host, "{manifest:?}");
+                assert_eq!(paths(&dirs), packed, "{manifest:?}");
+            });
+        }
+        // A list naming what wasn't packed says so
+        let missing = "[project]\nschemas = [\"engine/schemas\", \"extra\"]\n";
+        with_files(&tree(Some(missing)), || {
+            let err = packed_schema_dirs(scene, &packed).unwrap_err();
+            assert!(err.to_string().contains("extra"), "{err}");
+        });
+    }
+
     #[test]
     fn with_no_flags_and_no_list_schemas_are_discovered() {
         // The working directory's, beside the scene, one level up: those
@@ -1566,10 +2100,10 @@ save_version = 1.5
             &[
                 ("crates/flint-core/Cargo.toml", ""),
                 ("schemas/", ""),
-                ("examples/a.scene.toml", ""),
+                ("levels/a.scene.toml", ""),
             ],
             || {
-                let dirs = schema_dirs(Some("examples/a.scene.toml".as_ref()), NO_FLAGS).unwrap();
+                let dirs = schema_dirs(Some("levels/a.scene.toml".as_ref()), NO_FLAGS).unwrap();
                 assert_eq!(dirs.source, SchemaSource::Discovery);
                 assert_eq!(paths(&dirs), ["schemas"]);
             },
@@ -1614,6 +2148,95 @@ save_version = 1.5
                     paths(&dirs),
                     ["engine/schemas", "schemas", "levels/schemas"]
                 );
+            },
+        );
+    }
+
+    /// #1332: an engine schema directory brings its packages' schemas, right
+    /// after it and by package name, however the list was made. A directory
+    /// with no kernel manifest beside it brings nothing.
+    #[test]
+    fn an_engine_schema_directory_brings_its_packages_schemas() {
+        let engine = [
+            ("engine/schemas/", ""),
+            ("engine/packages/engine/package.toml", ""),
+            ("engine/packages/music/package.toml", ""),
+            ("engine/packages/music/schemas/", ""),
+            ("engine/packages/living/package.toml", ""),
+            ("engine/packages/living/schemas/", ""),
+            // a package with no schemas of its own brings no directory
+            ("engine/packages/rhythm/package.toml", ""),
+            ("schemas/", ""),
+            ("levels/a.scene.toml", ""),
+        ];
+        let game = [
+            "engine/schemas",
+            "engine/packages/living/schemas",
+            "engine/packages/music/schemas",
+            "schemas",
+        ];
+        let manifest = "[project]\nschemas = [\"engine/schemas\", \"schemas\"]\n";
+        let mut files = engine.to_vec();
+        files.push(("flint.toml", manifest));
+        with_files(&files, || {
+            let scene = Some(Path::new("levels/a.scene.toml"));
+            assert_eq!(
+                package_schema_dirs(Path::new("engine/schemas")),
+                [
+                    (
+                        "living".to_string(),
+                        PathBuf::from("engine/packages/living/schemas")
+                    ),
+                    (
+                        "music".to_string(),
+                        PathBuf::from("engine/packages/music/schemas")
+                    ),
+                ]
+            );
+            assert!(package_schema_dirs(Path::new("schemas")).is_empty());
+            // The manifest, flags and a host's list read alike
+            assert_eq!(paths(&schema_dirs(scene, NO_FLAGS).unwrap()), game);
+            assert_eq!(
+                paths(&schema_dirs(scene, &["engine/schemas", "schemas"]).unwrap()),
+                game
+            );
+            assert_eq!(
+                paths(&host_schema_dirs(&["engine/schemas", "schemas"], scene)),
+                game
+            );
+            // A list that spells them out already keeps its own order
+            let spelled = ["engine/schemas", "schemas", "engine/packages/music/schemas"];
+            assert_eq!(
+                paths(&host_schema_dirs(&spelled, scene)),
+                [
+                    "engine/schemas",
+                    "engine/packages/living/schemas",
+                    "schemas",
+                    "engine/packages/music/schemas"
+                ]
+            );
+        });
+        // No kernel manifest: the directory is a game's, and brings nothing
+        let mut files: Vec<_> = engine
+            .iter()
+            .copied()
+            .filter(|(p, _)| *p != "engine/packages/engine/package.toml")
+            .collect();
+        files.push(("flint.toml", manifest));
+        with_files(&files, || {
+            let dirs = schema_dirs(None, NO_FLAGS).unwrap();
+            assert_eq!(paths(&dirs), ["engine/schemas", "schemas"]);
+        });
+        // The engine's own checkout, discovered from its root
+        with_files(
+            &[
+                ("schemas/", ""),
+                ("packages/engine/package.toml", ""),
+                ("packages/living/schemas/", ""),
+            ],
+            || {
+                let dirs = schema_dirs(None, NO_FLAGS).unwrap();
+                assert_eq!(paths(&dirs), ["schemas", "packages/living/schemas"]);
             },
         );
     }

@@ -1,5 +1,7 @@
 # Scenes
 
+> **Package:** `engine`, the kernel: every game has it ([Packages](packages.md)).
+
 A scene in Flint is a TOML file that describes a collection of entities and their data. Scenes are the primary unit of content --- they're what you load, save, query, validate, and render.
 
 ## File Format
@@ -75,6 +77,30 @@ open_angle = 90.0
 
 **Component tables** are nested under the entity. Each component name (e.g., `transform`, `door`, `bounds`) corresponds to a schema in `schemas/components/`.
 
+### A key belongs to the header above it
+
+TOML has no indentation and no closing brackets: every key after a `[table]` header belongs to that table, until the next header. A key meant for the top level, or for an earlier table, has to be written *above* the first header that would claim it. This is easy to get wrong, because the file still parses:
+
+```toml
+[font]
+file = "Tidepool.ttf"
+
+default_ramp = "classic"   # meant for the top level; TOML reads it as font.default_ramp
+```
+
+Move `default_ramp` above `[font]`. The same goes for `[entities.lamp]` followed by a key meant for the lamp's `[entities.lamp.light]`: once the `light` header is written, every key below it is the light's.
+
+What a misplaced key costs depends on the file:
+
+- **Fixed-shape files say so.** `.font.toml`, `.atlas.toml` and `fonts/fonts.toml` warn about every key they don't read, naming the key, its table and the likeliest fix (#282):
+  ```text
+  fonts/hud.font.toml: unknown key `default_ramp` in [font], ignored; it is a top-level key,
+  but TOML puts every key after a `[font]` header into that table, so move it above the header
+  fonts/hud.font.toml: unknown key `spacng` in [font], ignored; did you mean `spacing`? (expected one of: ...)
+  ```
+  A single `[font]` in `fonts.toml`, where the format wants `[[font]]` entries, is called out the same way. Files read with strict parsing, such as `*.glyphs.toml`, palettes and a procgen spec's `[living]` table, refuse an unknown key outright. A loader that reads a new fixed-shape format should describe it with `flint_core::toml_util::Shape` and log what `check_keys` returns.
+- **Scenes are diagnosed.** A component or scene-table field its schema doesn't declare is an `unknown-field` warning at load, from `flint validate` and from `flint check`, with the nearest name (an error under `strict`). The exception is a component whose schema declares no fields, which is open. See [Scene Diagnostics](schemas.md#scene-diagnostics).
+
 ### Transforms
 
 An entity's `transform` places it in its parent's frame (or the world's):
@@ -108,9 +134,9 @@ curve without turning: `{ xz = s }` slides its far end sideways by `s`
 metres per metre while its near and far edges stay square to the road, so
 neighbouring strips meet edge to edge however wide they are. Turning
 (yawing) each strip instead swings its far corners through its
-neighbours. `examples/shear_road.scene.toml` is a scanline road of 22 such
+neighbours. [`flint-examples/shear_road.scene.toml`](https://github.com/chrischaps/flint-examples/blob/main/shear_road.scene.toml) is a scanline road of 22 such
 tiles, each one entity with `{ xz, yz }` for the bend and the hill, and
-`examples/shear_road_yawed.scene.toml` is the same road laid with yaw:
+[`flint-examples/shear_road_yawed.scene.toml`](https://github.com/chrischaps/flint-examples/blob/main/shear_road_yawed.scene.toml) is the same road laid with yaw:
 
 ![A sunset road of sheared tiles, curving right then left, edges and lane line continuous](../images/shear-road.png)
 
@@ -154,13 +180,13 @@ The `flint-scene` crate handles serialization. Scenes are loaded into the ECS wo
 
 When a scene is loaded:
 1. The TOML is parsed into a scene structure. A file that is not TOML is an error that names the file as well as the line
-2. Each entity definition creates an ECS entity with a stable `EntityId`
+2. Each entity definition creates an ECS entity with a stable `EntityId`, in name order, so the ids are the same every load
 3. If the entity names an archetype, the archetype's `defaults` are written in first for every component the entity did not author itself
 4. Every entity is checked against the schemas in one pass: its archetype, each component and each field (see [Scene Diagnostics](schemas.md#scene-diagnostics)). Nothing found here stops the load: the loader logs one summary line and the first five problems through `tracing`, as warnings, and keeps going. An unknown archetype gives the entity no defaults. A scene that loads is not necessarily a scene that validates: `flint validate` prints the whole list and fails on an error.
 5. The authored data is merged field-by-field into whatever the archetype put there (see [Schemas](schemas.md))
 6. For every component the entity explicitly lists, any field that has a `default` in its component schema and is still unset is filled in. Defaults are applied only to components the entity wrote a table for, not to archetype-required components it left out entirely. Step 4 knows about them: a `required` field that an archetype default or the field's own `default` will fill is not reported as missing.
 7. Parent-child relationships are established
-8. The entity ID counter is adjusted to be above any existing ID (preventing collisions on subsequent creates)
+8. The world's id counter is past every entity's id, so an entity spawned later never collides
 
 Step 6 is why scripts can read `get_field(id, "item", "enabled")` and get a bool rather than `()` even when the scene author never wrote the field.
 
@@ -179,6 +205,8 @@ Scene reload is a full re-parse. When `flint edit --watch` detects a file change
 
 This approach is simple and correct --- there's no incremental diffing that could get out of sync. For the scene sizes Flint targets, re-parsing is fast enough.
 
+A user style's files are the exception (#429). Saving a `.wgsl` or `.shader.toml` in a `styles/` folder the scene searches doesn't reload the scene: the style rebuilds its shader in place, and only a changed description, whose parameters the scene's `[post_process.styles.<name>]` has to be read against again, reloads it ([User-authored styles](stylize-passes.md)).
+
 ## Scene as Source of Truth
 
 A key design decision: **the scene file is the source of truth**, not the in-memory state. This means:
@@ -192,7 +220,7 @@ The CLI commands (`entity create`, `entity delete`) modify the scene file, and t
 
 ## Example: The Showcase Scene
 
-The demo scene `examples/showcase.scene.toml` demonstrates the full format:
+The demo scene [`flint-examples/showcase.scene.toml`](https://github.com/chrischaps/flint-examples/blob/main/showcase.scene.toml) demonstrates the full format:
 
 ```toml
 [scene]
@@ -340,7 +368,7 @@ file = "oval_plus.spline.toml"
 
 ### Spline Meshes
 
-The `spline_mesh` component generates geometry by sweeping a rectangular cross-section along a spline:
+The `spline_mesh` component generates geometry by sweeping a cross-section along a spline. The simplest is a box, `width` across and `height` tall:
 
 ```toml
 [entities.road_surface]
@@ -356,7 +384,36 @@ texture = "textures/asphalt.png"
 texture_length = 6.0         # metres of road per texture repeat
 ```
 
-One spline can feed multiple mesh entities (road surface, walls, guardrails) with different cross-section dimensions and colours. The mesh's look is the component's own fields (`color`, `stripe_color`, `metallic`, `roughness`, `texture`, `normal_texture`), and it comes with a triangle-mesh collider unless `collider = false`. `chunk_size` splits a long sweep into child entities. `flint schema spline_mesh` lists every field with its fallback; `spline`, `width` and `height` are required. The mesh is built in world space, so leave the entity's transform at the origin.
+Any other shape is a `profile`: a polygon of `[right, up]` points in metres, in place of `width` and `height`.
+
+```toml
+[entities.hand_rail.spline_mesh]
+spline = "track_path"
+profile = [[0.05, 0.0], [0.035, 0.035], [0.0, 0.05], [-0.035, 0.035],
+           [-0.05, 0.0], [-0.035, -0.035], [0.0, -0.05], [0.035, -0.035]]
+smooth = true                # shade it round: a tube
+offset = [-6.5, 0.9]
+color = [0.86, 0.64, 0.3, 1.0]
+metallic = 1.0
+collider = false
+```
+
+- A **closed** profile (the default) is a solid. Its faces look outward whichever way round the points are listed, and it is capped where the sweep starts and stops: the ends of an open spline and both sides of every gap. A concave profile (an I-beam, an L) is capped correctly.
+- `profile_closed = false` makes it an **open** surface: no closing edge and no caps. It faces to the left of the order the points are listed in, so a road listed from left to right faces up, and a U listed that way faces into its channel.
+- `smooth = true` shades it round, each point's normal the average of its two edges', with texture u running once around the profile. Flat (the default) gives each edge its own normal, and u runs 0..1 across each face, read upward on a wall so the walls on both sides of a road show their texture standing up.
+
+![flint-examples/sweep_garden.scene.toml: one banked loop with a box path, striped kerbs, a brass tube and an open gutter, climbing to a gap](../images/sweep-garden.png)
+
+One spline can feed multiple mesh entities (road surface, walls, guardrails) with different cross-sections and colours. The mesh's look is the component's own fields (`color`, `stripe_color`, `metallic`, `roughness`, `texture`, `normal_texture`), and it comes with a triangle-mesh collider unless `collider = false`. `chunk_size` splits a long sweep into child entities; the texture and the stripes run on across them. `flint schema spline_mesh` lists every field with its fallback; `spline` is required, and `width` and `height` unless there is a `profile`. The mesh is built in world space, so leave the entity's transform at the origin. [`flint-examples/sweep_garden.scene.toml`](https://github.com/chrischaps/flint-examples/blob/main/sweep_garden.scene.toml) sweeps six shapes along one loop.
+
+A spline file with a mistake is named with its line and column, by `flint check` (`bad-spline`) and in the warning a render or the player logs:
+
+```
+splines/ring.spline.toml: 1 error
+  error[bad-spline] 10:1: missing field `position`
+```
+
+To make one model of a swept shape, without a spline file or a collider, use the [`sweep_v1`](procgen.md#sweep_v1) procgen generator: it is the same sweep.
 
 ## Further Reading
 

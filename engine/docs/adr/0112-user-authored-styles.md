@@ -143,7 +143,8 @@ Why this shape:
 ### 3. Params
 
 Each `[params.<name>]` becomes a `StyleParam` (and a `StyleHint` when it
-has a label, help or `integer`). The descriptor's strings and slices are
+has a label, help or `integer`; since #510 those ride on the `StyleParam`
+itself, and `StyleHint` is gone). The descriptor's strings and slices are
 leaked once at load, so a user style is a `&'static StyleDescriptor` like
 a built-in. The registry becomes an append-only snapshot, the built-ins
 followed by user styles in load order. `StyleSet` keys built passes by
@@ -165,7 +166,7 @@ prototype; #275 wires the player and viewer.
 | no `fn style`, a binding, an entry point of the user's own | naga IR check | the same as above |
 | the backend's own compiler refuses what naga passed | `push_error_scope` around the pipeline (blocking natively) | the same as above |
 | a later edit breaks it (hot reload) | rebuild | the **last good build keeps drawing**; the error replaces the old one; fixing it logs "compiles again" |
-| a loop that never ends | **not detectable**, so every loop is **guarded** (#411, natively) | each user loop stops after `LOOP_LIMIT` (4096) turns a run; its pixel draws whatever it had reached, and the frame finishes. A `loop {}` style renders in `flint render` in 0.9 ms of GPU at 960x540. On the web (no naga) the loop runs as written, unguarded |
+| a loop that never ends | **not detectable**, so every loop is **guarded** (#411, natively) | each user loop stops after `LOOP_LIMIT` (4096) turns a run; its pixel draws whatever it had reached, and the frame finishes. A `loop {}` style renders in `flint render` in 0.9 ms of GPU at 960x540. On the web (no naga) the browser builds the guarded module `flint bundle` packed (#550) |
 | many texture reads | check | >32 reads written out are warned |
 | the shader crashes the driver | `catch_unwind` around `create` ([ADR 0111](0111-stylized-rendering.md)) | the style stays off; the renderer reports a lost device |
 
@@ -216,19 +217,37 @@ before. What it costs and shows:
 - The limit is per run of a loop, so nested loops multiply (a 64x64
   kernel is fine). A loop that needs more than 4096 turns a pixel is far
   past what a full-screen pass can afford anyway.
+- **A loop the IR proves short is left alone (#424).** Before the
+  rewrite, `custom/bounded.rs` looks for a counter in each loop: started
+  at a constant (a store just before the loop, or the variable's own init
+  when nothing else writes it), compared with a constant (a literal or a
+  module `const`) by a `for`'s leading `if .. else { break }` or by a
+  `break if`, stepped by a constant in `continuing`, and written nowhere
+  else (no store in the body, no pointer handed to a call). It runs the
+  counter forward on the CPU in its own type, wrapping as the GPU does; a
+  loop that ends within `LOOP_LIMIT` turns could never trip the guard, so
+  it isn't guarded (`Report::bounded`), and a style whose loops are all
+  like that builds its composed text with no rewrite. Octaves and kernel
+  taps, the commonest loops, are such loops. A bound read from a
+  parameter stays guarded: params are clamped to their range where they
+  are written, but a guard that trusts every writer is weaker than one
+  that trusts none. Measured at 1080p on the 4070 (`flint render
+  --gpu-time 240`, main and the branch alternated five times, minimums),
+  with pixels byte-identical: an 11x11 constant kernel 0.946-0.951 ms
+  guarded vs 0.881-0.884 ms as written (-7%), three octaves of noise 0.071
+  vs 0.069-0.070 ms, and `radial_blur` (guarded in both) 0.194-0.195 ms
+  in both. With the guard off, only the loops not proven are warned about.
 - Errors still point into the user's file: they come from the first
   parse, before the rewrite. The guard's own failure (re-validation or
   writing) is reported as a Flint bug and the style draws a passthrough;
   the unguarded text is never built.
 
-**On the web the guard is not run.** The player has no naga on wasm (§6):
-shipping `wgsl-in`, the validator and `wgsl-out` would put most of naga
-into the web build against the 4 MB gzip line (#123), to guard styles that
-`flint bundle` has already checked natively. The cheaper road is for the
-bundle to carry the guarded module, written at pack time, so the browser
-compiles that with no naga at all (#550). Until then a
-runaway loop in a bundle loses the device in the browser, as before (not
-tried here).
+**On the web the guard is not run; its result is packed.** The player has
+no naga on wasm (§6): shipping `wgsl-in`, the validator and `wgsl-out`
+would put most of naga into the web build against the 4 MB gzip line
+(#123), to guard styles that `flint bundle` has already checked natively.
+So the bundle carries the guarded module, written at pack time, and the
+browser compiles that with no naga at all. *Built in #550, below.*
 
 ### 5. Hot reload
 
@@ -254,6 +273,20 @@ scene's `[post_process]` (see "Built in #275" below).
 - **Bundles already carry them.** `flint bundle` packs `.toml` and
   `.wgsl` files that aren't excluded, and every read goes through the
   vfs.
+- **A bundle carries the loop guard too** (#550). For each style pass
+  with a loop to guard, `flint bundle` packs `Report::guarded` as
+  `<style>.guarded.wgsl` (`<style>.<pass>.guarded.wgsl` for a style of
+  several passes) beside the `.shader.toml`, and on wasm `check_pass`
+  returns it as the report's `guarded`, so `CustomPass::rebuild` builds it
+  as it does natively. A style without loops, or whose loops are all
+  bounded (#424), packs nothing. **A stale guarded module can't happen in
+  a bundle**: nothing in it changes after packing, and there is no hot
+  reload on the web. The module still names what it was written from: its
+  first line carries the SHA-256 of the composed text the guard ran on,
+  and the web takes it only when the text it composes hashes the same
+  (`custom::packed_guarded`). A module written by another engine version
+  (a prelude that moved) or beside a WGSL edited afterwards is passed
+  over with a warning, and the pass builds what it composed, unguarded.
 
 ## Alternatives considered
 
@@ -498,6 +531,97 @@ top-level `shader` reads as before.
 Measured: `demo/styles/orton.*` (expose, blur across, blur down at half
 size, screen over the frame) costs 0.032 ms for all four passes at
 1280x720 on an RTX 4070, with 5.3 MB of targets.
+
+**Since then** (#742, [0129](0129-the-style-registry-is-a-value.md)): the registry is a value a renderer or host owns, not one append-only snapshot for the process. A user style is an `Arc` freed when nothing holds it, a style is told by its name and generation (never an address), and a scene's registry holds only the user styles it sees (`StyleRegistry::for_scene`), so `drop_unseen` and the in-place takeover below are gone.
+
+## Addendum (#426): which of two styles of one name wins
+
+**Decided: option 2, scope by folder.** A scene draws the user style
+nearest to it, and only one it can see. The registry stays one for the
+process (an append-only snapshot, indices fixed, as in decision 3); what
+is scoped is which of its entries a scene's tables reach.
+
+The question, from #275: `load_dir` searched `<scene>/styles/` and the
+folder above, but filled a registry that is global for the run. So the
+first scene to load a `glow` decided it for every later scene, the
+player warned "already loaded" again at every transition, and a scene
+could draw a style that only an earlier scene's folder had. Three
+options were on the ticket: keep first-wins and warn once a pair, scope
+by folder, or refuse duplicates.
+
+- **The nearest file wins a name** (built in #781, ADR 0114 step 3).
+  `load_for(&scope)` registers `scope.list(AssetKind::Styles)`, the
+  project's one asset search, nearest of a name first. A file whose name
+  is loaded from another file takes over at the same registry index, as
+  a hot reload does (`install(.., replace = true)`), with an `info!`, not
+  a warning: a transition between two folders is not a mistake, and
+  `flint bundle` must not refuse it. Loading the same file again does
+  nothing, so nothing repeats on a transition. In one `styles/` folder a
+  style is its file's name, so there is only one of a name.
+- **A style the scene can't see is not drawn** (#426).
+  `custom::drop_unseen(&mut tables, &scope)` takes out of a scene's
+  `[post_process.styles]` each table naming a registered user style
+  whose file is in none of the scope's `style_dirs`, with a warning
+  naming the file. The player calls it each time it reads the scene's
+  tables into a config (`scene_post_config`), on a copy, so the scene's
+  own tables keep it: a file the scene can see that appears later takes
+  the name over at the next reload poll, and the table is drawn.
+  `flint check` calls it per scene, so a folder's report doesn't depend
+  on the order it meets the scenes in. It reads no folder (a path compare
+  against `search_dirs`), so a reload can call it on the frame thread.
+- **Not chosen.** First-wins with one warning a pair keeps a scene's look
+  dependent on what was played before it. Refusing duplicates would make
+  two folders' `glow` an error although each scene sees only one of
+  them, and would break a game that keeps a style per level folder.
+  Per-scene registries, or names qualified by folder, would change the
+  registry's indices and the `StyleSet` keyed on them for a case no game
+  has yet.
+
+Proof (#426's PR): a project of two folders, `atelier/` with
+`styles/risograph.*` and `cellar/` naming `risograph` with no styles
+folder. Played atelier then cellar in `flint-player --frame-step`, the
+cellar's frame before this change was drawn in the atelier's risograph;
+after it, it is byte-identical to `flint render` of the cellar alone,
+with the warning. Copying the style into `cellar/styles/` while the
+cellar played drew it there at the next poll. `flint check` of the
+project reported nothing before and the cellar's warning after.
+
+Left as it was: the viewer and `flint render` show one scene a process,
+and `flint render --list-styles` and `flint style list` list every
+registered style, which for one scene is the ones it sees.
+
+## Built in #550: the loop guard on the web
+
+- **The packer writes it, the browser reads it.** After the bundle's check
+  passes, `flint bundle` reads every packed `.shader.toml` from the packed
+  files and calls `custom::guarded_file` for each pass: the native
+  `check_pass`, and when its `guarded` is `Some`, that module under a
+  first line `// flint guarded module (#550): <wgsl> as composed
+  sha256:<hex>`. On wasm `check_pass` composes the pass as before, and
+  `custom::packed_guarded` returns the packed module when the composed
+  text's hash matches the header, logging that it builds it. `rebuild`
+  is unchanged: it builds `report.guarded` on both targets.
+- **Named by the style, not its WGSL.** `spin.shader.toml` packs
+  `spin.guarded.wgsl`; a style of several passes packs
+  `<style>.<pass>.guarded.wgsl` for each pass with a loop to guard. Two
+  styles that share a WGSL file compose it with different preludes, so
+  each gets its own. A game file already at that path refuses the
+  bundle rather than be overwritten.
+- **No bytes against the gzip line** (#123): the wasm gains the hash
+  check (SHA-256 was in the build already, for `pipeline_cache`) and a
+  file read. The bundle gains the module: 4.2 KB for a one-function style.
+- **Measured** (2026-11-17, RTX 4070 laptop, Chrome over CDP, the
+  branch's own trunk build): a `flint init` game whose display style
+  walks forever on the left half of the frame (`loop` with a step that
+  points away from its goal there). In the browser it drew the same
+  split as `flint render`: the left half at the guard's limit, the right
+  where each walk ended. 562 frames in the last 10 s at 28 s,
+  nothing in the console about a lost device. The style's pass read
+  5.33 ms of GPU in `?perf=1` (at idle clocks, which reads high) against
+  0.12 ms for the same tint with no loop: a guarded runaway still costs
+  4096 turns a pixel. The same game without the guarded module was not
+  played: a runaway shader resets the display driver (TDR), which every
+  other GPU job on this machine would have felt.
 
 ## Follow-ups
 

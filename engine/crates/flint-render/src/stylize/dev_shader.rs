@@ -54,7 +54,7 @@ macro_rules! wgsl {
 pub(crate) use wgsl;
 
 /// The variable that turns it on.
-pub const VAR: &str = "FLINT_STYLE_SHADER_DIR";
+pub const VAR: &str = flint_core::env::STYLE_SHADER_DIR.name;
 
 /// How many [`StyleSet::ensure`](super::StyleSet::ensure) calls (frames)
 /// pass between looks at the files' stamps: a quarter second at 60 fps.
@@ -118,9 +118,7 @@ mod imp {
         }
         let mut slot = DIR.write().unwrap_or_else(|e| e.into_inner());
         slot.get_or_insert_with(|| {
-            let dir = std::env::var_os(super::VAR)
-                .filter(|v| !v.is_empty())
-                .map(PathBuf::from)?;
+            let dir = flint_core::env::STYLE_SHADER_DIR.path()?;
             if !flint_core::vfs::is_file(dir.join("invert.wgsl")) {
                 tracing::warn!(
                     "{}={}: no invert.wgsl there; it should name crates/flint-render/src/stylize",
@@ -285,7 +283,10 @@ mod imp {
             .map_err(|e| place(e.location(text).map(|l| l.offset), e.message()))?;
         naga::valid::Validator::new(
             naga::valid::ValidationFlags::all(),
-            naga::valid::Capabilities::default(),
+            // What user styles get too: pack2x16float and quantizeToF16
+            // (ascii_edge_cells.wgsl) need SHADER_FLOAT16_IN_FLOAT32, which
+            // wgpu grants wherever the adapter has SHADER_F16_IN_F32 (#945, #946)
+            crate::stylize::custom::style_capabilities(),
         )
         .validate(&module)
         .map_err(|e| {
@@ -454,8 +455,11 @@ mod tests {
         ];
         let text = parts.concat();
         let e = check(&text, &paths, &parts).unwrap_err();
-        // The parser stops at the `return` after the missing `;`
-        assert!(e.starts_with("style.wgsl:3:5: expected ';'"), "{e}");
+        // The parser stops at the `return` after the missing `;`. The place
+        // is Flint's; the words are naga's (naga 30: "expected `;`, found
+        // "return""), so only the token is held
+        assert!(e.starts_with("style.wgsl:3:5: expected "), "{e}");
+        assert!(e.lines().next().is_some_and(|l| l.contains(';')), "{e}");
         assert!(e.ends_with("    3 |     return x;"), "{e}");
         let good = [parts[0].clone(), parts[0].replace("helper", "two")];
         assert!(check(&good.concat(), &paths, &good).is_ok());

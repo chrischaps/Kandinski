@@ -3,15 +3,23 @@
 //! TOML integers and floats are distinct types — `1` parses as integer, `1.0` as
 //! float. These helpers coerce either form into Rust numeric types so callers
 //! don't have to repeat the `as_float().or_else(|| as_integer().map(...))` dance.
+//!
+//! [`check_keys`] checks a fixed-shape file's keys against a [`Shape`], so a
+//! misspelled or misplaced key is reported instead of silently ignored (#282).
 
 use crate::Vec3;
+
+mod keys;
+pub use keys::{
+    check_keys, closest_key, edit_distance, Hint, IssueKind, KeyIssue, Shape, TablePath,
+};
 
 /// Coerce a TOML integer or float to `f64`.
 ///
 /// The one place runtime code may call `toml::Value::as_float`, which reads
-/// an integer as nothing: the wasm check denies it everywhere else
-/// (`scripts/wasm-clippy/clippy.toml`, #685).
-#[allow(clippy::disallowed_methods)]
+/// an integer as nothing: clippy denies it everywhere else in the crates the
+/// player links (the root `clippy.toml`, #685, #761).
+#[allow(clippy::disallowed_methods)] // the one sanctioned call
 pub fn toml_f64(v: &toml::Value) -> Option<f64> {
     v.as_float().or_else(|| v.as_integer().map(|i| i as f64))
 }
@@ -89,10 +97,59 @@ pub fn toml_to_vec3(v: &toml::Value) -> Option<Vec3> {
     None
 }
 
+/// Whether two values say the same, as a file reads them back: an integer
+/// is its float (`1` is `1.0`), a float within a hair of another is it (an
+/// f32 written as f64 and read back), and arrays and tables compare by
+/// element. What the viewer's undo (#1046) and `flint validate --fix`'s
+/// read-back of the file it wrote (#1116) both ask.
+pub fn reads_same(a: &toml::Value, b: &toml::Value) -> bool {
+    use toml::Value::*;
+    let num = |v: &toml::Value| match v {
+        Integer(i) => Some(*i as f64),
+        Float(f) => Some(*f),
+        _ => None,
+    };
+    match (a, b) {
+        (Array(x), Array(y)) => {
+            x.len() == y.len() && x.iter().zip(y).all(|(p, q)| reads_same(p, q))
+        }
+        (Table(x), Table(y)) => {
+            x.len() == y.len()
+                && x.iter()
+                    .all(|(k, v)| y.get(k).is_some_and(|w| reads_same(v, w)))
+        }
+        _ => match (num(a), num(b)) {
+            (Some(x), Some(y)) => (x - y).abs() <= 1e-6 * x.abs().max(y.abs()).max(1.0),
+            _ => a == b,
+        },
+    }
+}
+
+/// The line and column (both from 1, the column in characters) of byte
+/// `offset` in `text`: where a span a TOML parser hands back stands, as a
+/// diagnostic names it (`Diagnostic::at`).
+pub fn line_column(text: &str, offset: usize) -> (usize, usize) {
+    let mut offset = offset.min(text.len());
+    while !text.is_char_boundary(offset) {
+        offset -= 1;
+    }
+    let before = &text[..offset];
+    let line = before.matches('\n').count() + 1;
+    let line_start = before.rfind('\n').map_or(0, |i| i + 1);
+    let column = text[line_start..offset].chars().count() + 1;
+    (line, column)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use toml::Value;
+
+    #[test]
+    fn columns_count_characters() {
+        assert_eq!(line_column("ab\ncé x", 7), (2, 4));
+        assert_eq!(line_column("ab", 99), (1, 3), "past the end is the end");
+    }
 
     #[test]
     fn f64_from_float() {

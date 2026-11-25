@@ -12,8 +12,7 @@ use flint_ecs::FlintWorld;
 /// Set fields of the entity's `sprite` table, when it has one.
 fn set_sprite(world: &mut FlintWorld, id: EntityId, fields: &[(&str, toml::Value)]) {
     let table = world
-        .get_components_mut(id)
-        .and_then(|comps| comps.get_mut(comp::SPRITE))
+        .get_component_mut(id, comp::SPRITE)
         .and_then(|sprite| sprite.as_table_mut());
     if let Some(table) = table {
         for (key, value) in fields {
@@ -31,7 +30,7 @@ fn set_animator(
     id: EntityId,
     fields: &[(&str, toml::Value)],
 ) -> CallResult<()> {
-    if let Some(comps) = call.world_mut()?.get_components_mut(id) {
+    if let Some(mut comps) = call.world_mut()?.get_components_mut(id) {
         for (key, value) in fields {
             comps.set_field(comp::SPRITE_ANIMATOR, key, value.clone());
         }
@@ -120,15 +119,7 @@ pub(crate) fn register(api: &mut ScriptApi) {
     m.func("get_sprite_layer", "An entity's sprite layer.")
         .arg("id", Entity)
         .returns(Int, "0 without a sprite or a layer")
-        .run(|call, (id,)| {
-            Ok(call
-                .world()?
-                .get_components(id)
-                .and_then(|comps| comps.get(comp::SPRITE))
-                .and_then(|sprite| sprite.get("layer"))
-                .and_then(|v| v.as_integer())
-                .unwrap_or(0))
-        });
+        .run(|call, (id,)| Ok(call.world()?.view(id, comp::SPRITE).i64("layer", 0)));
 
     // ── sprite_animator ──
     // Verb first, like play_clip; each under its name and, for one
@@ -188,11 +179,8 @@ pub(crate) fn register(api: &mut ScriptApi) {
             .run(|call, (id,)| {
                 Ok(call
                     .world()?
-                    .get_components(id)
-                    .and_then(|comps| comps.get(comp::SPRITE_ANIMATOR))
-                    .and_then(|sa| sa.get("playing"))
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false))
+                    .view(id, comp::SPRITE_ANIMATOR)
+                    .bool("playing", false))
             });
     }
 }

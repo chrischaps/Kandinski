@@ -1,5 +1,7 @@
 # Assets
 
+> **Package:** `engine`, the kernel: every game has it ([Packages](packages.md)).
+
 Flint uses a content-addressed asset system with SHA-256 hashing. Every imported file is identified by its content hash, which means identical files are automatically deduplicated and any change to a file produces a new, distinct hash.
 
 ## Content Addressing
@@ -67,7 +69,7 @@ At each of those directories `D`, the file tried is `D/<folder>/<name><extension
 | `animations` | `animations/` | `.anim.toml` | every clip is loaded; `animator.clip = "door_swing"` names one by the `name` inside its file | |
 | `sprite-animations` | `animations/` | `.sprite.toml` | every file is loaded; a `sprite_animator` names a clip inside one | |
 | `sequences` | `animations/` | `.sequence.toml` | every file is loaded; `animator.sequence = "intro"`, `play_sequence` | |
-| `audio` | `D` itself, then `audio/` | a file name as written (`.ogg`, `.wav`, `.mp3`, `.flac`); a name with no extension tries those four | `audio_source.file = "audio/fire.ogg"`; every file in `audio/` is preloaded for `play_sound` | |
+| `audio` | `D` itself, then `audio/` | a file name as written (`.ogg`, `.wav`, `.mp3`, `.flac`); a name with no extension tries those four | `audio_source.file = "audio/fire.ogg"`; every file in `audio/` is preloaded for `play_sound`, and any other name `play_sound` gives is found by this search on its first play | |
 | `scripts` | `scripts/` | a file name as written (`.rhai`) | `script.source = "hud.rhai"` or `"ui/menu.rhai"`; `import "ui_kit"` is the script `lib/ui_kit.rhai` | |
 | `specs` | `specs/`, then `models/`, each with its subfolders | `.procgen.toml`; found by the `[meta] name` inside, not the file's name | every spec the scene can see is indexed; `model.asset = "oak_tree"`, `material.texture = "stone_wall"` ask for one | |
 | `prefabs` | `prefabs/` | `.prefab.toml` | `[prefabs.player] template = "kart"` | |
@@ -75,10 +77,10 @@ At each of those directories `D`, the file tried is `D/<folder>/<name><extension
 | `files` | `D` itself | a path as written | `terrain.heightmap`, `terrain.splat_map`, `grass_ground.mask`, `spline.file`, `[environment] skybox`, `[scene] input_config` (and `config/input.toml` when a scene names none) | |
 | `particle-textures` | `particles/`, then `D` itself | a file name as written | an effect's or a `particle_emitter`'s `texture = "spark.png"` | |
 | `scenes` | `D` itself | a path as written | `load_scene("levels/two.scene.toml")`: the target of a transition, from the current scene | |
-| `palettes` | `palettes/`, then `D` itself | `.palette.toml` | `[post_process.styles.ascii] palette = "dusk"` (or a path, `"art/dusk.palette.toml"`), `--ascii-palette`, a per-entity style's `palette` | `cga`, `cga-warm`, `cga16`, `phosphor`, `amber`, `mono`, `paper`; a file of the name wins |
-| `glyph-sets` | `fonts/`, then `D` itself | `.glyphs.toml` | a style's `font = "terminal"`, `--ascii-font`, `ui_text.font = "terminal"`, a `.font.toml`'s `glyphs` | `builtin`, which is never searched for |
+| `palettes` | `palettes/`, then `D` itself | `.palette.toml` | `[post_process.styles.ascii] palette = "dusk"` (or a path, `"art/dusk.palette.toml"`), `--style ascii:palette=dusk`, a per-entity style's `palette` | `cga`, `cga-warm`, `cga16`, `phosphor`, `amber`, `mono`, `paper`; a file of the name wins |
+| `glyph-sets` | `fonts/`, then `D` itself | `.glyphs.toml` | a style's `font = "terminal"`, `--style ascii:font=terminal`, `ui_text.font = "terminal"`, a `.font.toml`'s `glyphs` | `builtin`, which is never searched for |
 | `fonts` | `D` itself, then `fonts/` | `.font.toml` | `ui_text.font = "fonts/ui.font.toml"` | |
-| `font-faces` | `fonts/` | a file name as written (`.ttf`, `.otf`) | every one is loaded for the script HUD, under its file stem; a `fonts/fonts.toml` alias names one by `file` | |
+| `font-faces` | `fonts/` | a file name as written (`.ttf`, `.otf`) | every one is loaded for the script HUD, under its file stem; a `fonts/fonts.toml` alias names one by `file`, or names a face below or beside `fonts/` by a path from the manifest's folder (`ofl/VT323/VT323-Regular.ttf`) | |
 | `looks` | `styles/`, then `D` itself | `.look.toml` | `[post_process] look = "dusk"`, `--look dusk`, `set_look("dusk")`, or a path, `--look out/tuned.look.toml` | `ascii_noir`, `matrix`, `ink_wash`, `graphite`, `watercolor`, `coloured_pencil`, `blueprint`, `charcoal`, `rotoscope`; a file of the name wins |
 | `papers` | `papers/`, then `D` itself | `.png`, then `.jpg`, `.jpeg` | `paper_image = "cold_press"` or `"scans/linen.jpg"` (pencil, watercolor) | |
 | `strokes` | `strokes/`, then `D` itself | `.png`, then `.jpg`, `.jpeg` | `stroke_image = "graphite"` (pencil) | |
@@ -141,11 +143,11 @@ No path is tried twice, and the list a miss prints is in the order tried, the as
 
 **Built in, after the search.** Three kinds have names the engine carries itself: the palettes `cga`, `cga-warm`, `cga16`, `phosphor`, `amber`, `mono` and `paper`; the looks `ascii_noir`, `matrix`, `ink_wash`, `graphite`, `watercolor`, `coloured_pencil`, `blueprint`, `charcoal` and `rotoscope`; and the glyph set `builtin`. For palettes and looks the search runs first and **a file it finds wins over a built-in of the same name**, so a game's `palettes/amber.palette.toml` replaces the built-in amber for every scene that can see it; the built-in is what is used when no file is found. The glyph set `builtin` is never searched for: it always means the engine's own, and a file named `builtin.glyphs.toml` is not reachable by that name. Paper and stroke images have no built-ins (a style with no image draws its procedural paper and strokes). `flint asset where palettes amber` says when the answer is a built-in. The lists the F4 style editor and `flint render --list-styles` offer for a `palette`, `font`, `paper_image` or `stroke_image` are the built-ins and then exactly the files this search sees from the scene.
 
-**Looks, palettes, glyph sets and images named by a path.** Each of these may be written as a path ending in the kind's extension (`--look out/tuned.look.toml`, `palette = "art/dusk.palette.toml"`, `paper_image = "scans/linen.jpg"`). The path is tried from the scene's directory and then from each directory above it, like any name, which is why "`D` itself" is one of their folders. It is **not** tried from the working directory: a path typed after `--look` or `--ascii-palette` is found when it leads from the scene's folder or from a folder above it (the project root among them, which is where commands are usually run from), and not otherwise. A look path ending `.toml` but not `.look.toml` is searched the same way, as a file named by its path.
+**Looks, palettes, glyph sets and images named by a path.** Each of these may be written as a path ending in the kind's extension (`--look out/tuned.look.toml`, `palette = "art/dusk.palette.toml"`, `paper_image = "scans/linen.jpg"`). The path is tried from the scene's directory and then from each directory above it, like any name, which is why "`D` itself" is one of their folders. It is **not** tried from the working directory: a path typed after `--look` or in `--style ascii:palette=` is found when it leads from the scene's folder or from a folder above it (the project root among them, which is where commands are usually run from), and not otherwise. A look path ending `.toml` but not `.look.toml` is searched the same way, as a file named by its path.
 
 **Files a description names beside itself.** A glyph set's `[font] file`, a user style's WGSL and its `[images]`, and (after the texture search misses) a `.font.toml`'s `texture` are read from the folder of the file that names them. That is not a search: wherever the description was found, its own files are beside it.
 
-**User styles of one name.** Two `styles/` folders may each hold a `glow.shader.toml`. A scene gets the one nearest to it, as with every asset; inside one folder a style is its file's name, so there is only one. The registry of styles is one for the whole run, so when the next scene's nearest `glow` is another file, that file takes the name over (as an edit to the file would), and a style that only an earlier scene's folders had stays registered.
+**User styles of one name.** Two `styles/` folders may each hold a `glow.shader.toml`. A scene gets the one nearest to it, as with every asset; inside one folder a style is its file's name, so there is only one. The registry of styles is one for the whole run, so when the next scene's nearest `glow` is another file, that file takes the name over (as an edit to the file would). A style that only an earlier scene's folders had stays registered, but a scene that can't see its file doesn't draw it: its `[post_process.styles.glow]` is left out with a warning naming the file, so the scene looks the same after a transition as it does loaded first or in `flint render`, and `flint check` of a folder reports it the same in whatever order it meets the scenes. Copy the style into a `styles/` folder the scene searches (`flint asset where styles glow --scene <scene>` lists them); one that appears there while the scene runs is drawn at the next reload.
 
 **Models and textures have two sources ahead of the files.** A name in the [asset catalog](#asset-catalog) resolves to its stored file first, and the player then asks for a [procgen spec](procgen.md) of the same name; the search above is for the file, and is what runs when neither has it. A miss says so under the paths: `and before the files: the asset catalog, a procgen spec of the same name`.
 
@@ -253,6 +255,8 @@ flint asset list --type mesh
 flint asset resolve levels/tavern.scene.toml --strategy strict
 ```
 
+`resolve` reads every field the scene's schemas declare as `asset`. A reference counts as found when the catalog holds its name or the engine's search finds its file. [Which references it reads](ai-generation.md#which-references-it-reads) has the list.
+
 ## glTF/GLB Import
 
 The `flint-import` crate provides full glTF/GLB support, extracting:
@@ -292,12 +296,14 @@ tags = ["furniture", "medieval"]
 
 ## Runtime Catalog Resolution
 
-The player can load the asset catalog at startup for name-based asset resolution. When an entity references an asset by name, the resolution chain is:
+The player reads the [project root](#the-project-root)'s catalog for name-based asset resolution, the one `flint validate` and `flint check` ask, wherever it was started from. When an entity references an asset by name, the resolution chain is:
 
-1. Look up the name in the `AssetCatalog`
+1. Look up the name in the `AssetCatalog` (`<root>/assets/*.asset.toml`)
 2. If found, resolve the content hash
-3. Load from the `ContentStore` path (`.flint/assets/<hash>`)
+3. Load from the `ContentStore` path (`<root>/.flint/assets/<hash>`)
 4. Fall back to file-based loading if not in the catalog
+
+A transition into a scene of another project reads that project's catalog.
 
 This allows scenes to reference both pre-imported and AI-generated assets by name without hardcoding file paths.
 

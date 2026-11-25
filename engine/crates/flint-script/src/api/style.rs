@@ -10,7 +10,7 @@
 //! this frame reads back from the next; without a reader every entity is
 //! unstyled.
 
-use super::builder::kind::{Any, Bool, Entity, Num, Str};
+use super::builder::kind::{Any, Array, Bool, Entity, Num, Str};
 use super::builder::{Call, CallResult, ScriptApi};
 use super::convert::{dynamic_to_toml, toml_to_dynamic};
 use crate::context::{LogLevel, ScriptCommand};
@@ -296,6 +296,20 @@ pub(crate) fn register(api: &mut ScriptApi) {
     .run(|call, (name,)| {
         call.ctx().commands.push(ScriptCommand::SetLook {
             name: look_name(&name),
+            seconds: 0.0,
+        });
+    });
+
+    m.func(
+        "set_look",
+        "Cross-fade from the look drawn now to another over seconds of game time (numbers ease, a style in one look alone fades by its blend); look_faded fires on arrival.",
+    )
+    .arg("name", Str)
+    .arg("seconds", Num)
+    .run(|call, (name, seconds)| {
+        call.ctx().commands.push(ScriptCommand::SetLook {
+            name: look_name(&name),
+            seconds: fade_seconds(seconds),
         });
     });
 
@@ -304,9 +318,53 @@ pub(crate) fn register(api: &mut ScriptApi) {
         "Take the look off: the scene's own post-processing keys alone.",
     )
     .run(|call, ()| {
-        call.ctx()
-            .commands
-            .push(ScriptCommand::SetLook { name: None });
+        call.ctx().commands.push(ScriptCommand::SetLook {
+            name: None,
+            seconds: 0.0,
+        });
+    });
+
+    m.func(
+        "clear_look",
+        "Fade the look off over seconds of game time, to the scene's own post-processing keys.",
+    )
+    .arg("seconds", Num)
+    .run(|call, (seconds,)| {
+        call.ctx().commands.push(ScriptCommand::SetLook {
+            name: None,
+            seconds: fade_seconds(seconds),
+        });
+    });
+
+    m.func(
+        "prepare_look",
+        "Build a look's styles on worker threads now, so the frame that later sets it doesn't stop to: call it well before the look is shown (on_init).",
+    )
+    .arg("name", Str)
+    .run(|call, (name,)| {
+        if let Some(name) = look_name(&name) {
+            call.ctx().commands.push(ScriptCommand::PrepareLook { name });
+        }
+    });
+
+    m.func(
+        "get_look",
+        "The look the scene draws with now: its own, or the last a script or F4 chose (a fade's target from its start).",
+    )
+    .returns(Str, "the look's name as it was asked for; \"\" for none")
+    .run(|call, ()| -> String { call.ctx_ref().look.clone() });
+
+    m.func(
+        "list_looks",
+        "Every look the scene can see: its project's styles/*.look.toml files and the built-ins, by name.",
+    )
+    .returns(Array, "names, sorted")
+    .run(|call, ()| -> rhai::Array {
+        call.ctx_ref()
+            .looks
+            .iter()
+            .map(|name| Dynamic::from(ImmutableString::from(name.as_str())))
+            .collect()
     });
 }
 
@@ -315,6 +373,15 @@ fn warn(message: String) -> ScriptCommand {
     ScriptCommand::Log {
         level: LogLevel::Warn,
         message,
+    }
+}
+
+/// A look fade's length: 0 (a cut) for a negative or non-finite one.
+fn fade_seconds(seconds: f64) -> f64 {
+    if seconds.is_finite() {
+        seconds.max(0.0)
+    } else {
+        0.0
     }
 }
 

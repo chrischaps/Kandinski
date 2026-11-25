@@ -3,6 +3,8 @@
 //! Renders a fullscreen triangle at the far plane, sampling a 2D panorama
 //! texture with equirectangular projection.  No vertex buffers required.
 
+use crate::gpu_counts::CountedDevice;
+use crate::TrustedShader;
 use bytemuck::{Pod, Zeroable};
 
 /// Uniform data for the skybox: inverse view-projection (rotation only)
@@ -21,7 +23,7 @@ pub struct SkyboxPipeline {
 
 impl SkyboxPipeline {
     pub fn new(device: &wgpu::Device, format: wgpu::TextureFormat, sample_count: u32) -> Self {
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        let shader = device.create_trusted_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Skybox Shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("skybox_shader.wgsl").into()),
         });
@@ -68,11 +70,14 @@ impl SkyboxPipeline {
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("Skybox Pipeline Layout"),
-            bind_group_layouts: &[&uniform_bind_group_layout, &texture_bind_group_layout],
-            push_constant_ranges: &[],
+            bind_group_layouts: &[
+                Some(&uniform_bind_group_layout),
+                Some(&texture_bind_group_layout),
+            ],
+            immediate_size: 0,
         });
 
-        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        let pipeline = device.create_render_pipeline_counted(&wgpu::RenderPipelineDescriptor {
             label: Some("Skybox Render Pipeline"),
             layout: Some(&pipeline_layout),
             vertex: wgpu::VertexState {
@@ -102,8 +107,8 @@ impl SkyboxPipeline {
             },
             depth_stencil: Some(wgpu::DepthStencilState {
                 format: wgpu::TextureFormat::Depth32Float,
-                depth_write_enabled: false,
-                depth_compare: wgpu::CompareFunction::LessEqual,
+                depth_write_enabled: Some(false),
+                depth_compare: Some(wgpu::CompareFunction::LessEqual),
                 stencil: wgpu::StencilState::default(),
                 bias: wgpu::DepthBiasState::default(),
             }),
@@ -111,7 +116,7 @@ impl SkyboxPipeline {
                 count: sample_count,
                 ..Default::default()
             },
-            multiview: None,
+            multiview_mask: None,
             cache: None,
         });
 

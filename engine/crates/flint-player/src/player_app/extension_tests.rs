@@ -5,6 +5,7 @@
 
 use super::PlayerApp;
 use crate::extension::{ExtensionCtx, PlayerExtension};
+use flint_debug_ui::run_headless_frame;
 use flint_ecs::FlintWorld;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -327,8 +328,9 @@ fn the_fonts_hook_runs_on_every_install_and_its_families_reach_scripts() {
 
     // egui has the family on the next pass, so laying text out in it from
     // `ui` doesn't panic.
-    let _ = app.hud.egui_ctx.run(egui::RawInput::default(), |ctx| {
-        ctx.fonts(|f| {
+    let _ = run_headless_frame(&app.hud.egui_ctx, egui::RawInput::default(), |ui| {
+        let ctx = &ui.ctx().clone();
+        ctx.fonts_mut(|f| {
             f.layout_no_wrap(
                 "Capitol".into(),
                 egui::FontId::new(14.0, egui::FontFamily::Name("game".into())),
@@ -484,7 +486,7 @@ struct PanelGame {
 
 #[cfg(feature = "debug-hud")]
 impl PlayerExtension for PanelGame {
-    fn ui(&mut self, _ctx: &egui::Context) {
+    fn ui(&mut self, _ui: &mut egui::Ui) {
         self.frame += 1;
     }
     fn debug_panels(&self) -> Vec<String> {
@@ -528,10 +530,9 @@ fn a_game_names_debug_panels_that_f3_opens_and_it_draws() {
         )),
         ..Default::default()
     };
-    let _ = ctx.run(input, |ctx| {
-        for ext in extensions.iter_mut() {
-            ext.ui(ctx);
-        }
+    let _ = run_headless_frame(&ctx, input, |ui| {
+        let ctx = &ui.ctx().clone();
+        crate::extension::draw_ui(&mut extensions, ui);
         super::debug_panels::show_debug_panels(ctx, &mut app.debug_panels, &mut |panel, ui| {
             super::debug_panels::draw_panel(panel, &mut extensions, ui)
         });
@@ -579,6 +580,7 @@ mod scene_tables {
     }
 
     impl PlayerExtension for WeatherReader {
+        #[allow(clippy::disallowed_methods)] // a test asserts on the TOML exactly as written
         fn pre_update(&mut self, ctx: &mut ExtensionCtx) {
             let weather = ctx
                 .scene_table_as::<Weather>("weather")
@@ -747,9 +749,7 @@ position = [0, 0, 0]
 /// the passes; `create` is never called.
 mod game_styles {
     use super::*;
-    use flint_render::stylize::{
-        self, StyleDescriptor, StyleDevice, StyleParam, StylePass, StyleStage,
-    };
+    use flint_render::stylize::{StyleDescriptor, StyleDevice, StyleParam, StylePass, StyleStage};
 
     fn never_built(_: &StyleDevice) -> Box<dyn StylePass> {
         unreachable!("a headless test builds no style")
@@ -790,12 +790,15 @@ mod game_styles {
         app.apply_scene_settings(&scene);
         app.add_extension(Box::new(Sepia));
 
-        let sepia = stylize::find("utest_ext_sepia").expect("registered by add_extension");
+        let styles = &app.core.styles;
+        let sepia = styles
+            .find("utest_ext_sepia")
+            .expect("registered by add_extension");
         assert!(std::ptr::eq(sepia, &SEPIA));
-        assert!(stylize::is_game_style("utest_ext_sepia"));
+        assert!(styles.is_game_style("utest_ext_sepia"));
         // The built-in kept its place
-        assert_eq!(stylize::find("invert").unwrap().label, "Invert");
-        assert!(!stylize::is_game_style("invert"));
+        assert_eq!(styles.find("invert").unwrap().label, "Invert");
+        assert!(!styles.is_game_style("invert"));
 
         let config = app.scene_post_config();
         assert!(config.styles.is_enabled("utest_ext_sepia"));
@@ -806,14 +809,191 @@ mod game_styles {
         let config = app.scene_post_config();
         assert_eq!(config.styles.param("utest_ext_sepia", "warmth"), Some(0.25));
 
-        // A second player in the process, the same extension: no error, one
-        // entry
+        // A second player in the process has a registry of its own (#742):
+        // without the extension it doesn't know the style, and with it
+        // added twice it holds one entry, no error
         let mut again = headless_app();
+        assert!(again.core.styles.find("utest_ext_sepia").is_none());
         again.add_extension(Box::new(Sepia));
-        let entries = stylize::registry()
+        again.add_extension(Box::new(Sepia));
+        let entries = again
+            .core
+            .styles
             .iter()
             .filter(|d| d.name == "utest_ext_sepia")
             .count();
         assert_eq!(entries, 1);
+        assert!(app.core.styles.find("utest_ext_sepia").is_some());
+    }
+}
+
+/// A game's side panel through `ui` (ADR 0121): shown on the frame's root
+/// `Ui`, it takes its room from the whole window.
+struct SidePanelGame {
+    log: Log,
+}
+
+impl PlayerExtension for SidePanelGame {
+    fn ui(&mut self, ui: &mut egui::Ui) {
+        let panel = egui::Panel::left("inventory")
+            .exact_size(200.0)
+            .show(ui, |ui| ui.label("Inventory"));
+        self.log.lock().unwrap().push(format!(
+            "panel {} {:?}",
+            panel.response.rect.width(),
+            panel.response.layer_id.order
+        ));
+        // What the panel leaves is what's left of the window
+        self.log
+            .lock()
+            .unwrap()
+            .push(format!("left {}", ui.available_rect_before_wrap().left()));
+    }
+}
+
+/// Takes `&egui::Context` the way an extension did before ADR 0121.
+fn install_theme(ctx: &egui::Context) {
+    ctx.data_mut(|d| d.insert_temp(egui::Id::new("theme"), true));
+}
+
+/// A game's floating window through `ui`, written as a pre-0121 body with
+/// only the parameter's type changed: `ctx` is the root `Ui`, and every use
+/// of it as a `Context` goes through the `Deref`.
+struct WindowGame {
+    log: Log,
+    kept: Option<egui::Context>,
+    left: f32,
+}
+
+impl PlayerExtension for WindowGame {
+    fn ui(&mut self, ctx: &mut egui::Ui) {
+        install_theme(ctx);
+        self.kept.get_or_insert_with(|| ctx.clone());
+        let seen_time = ctx.input(|i| i.time) >= 0.0;
+        let window = egui::Window::new("Quests")
+            .default_pos(egui::pos2(400.0, 100.0))
+            .show(ctx, |ui| ui.label("none yet"))
+            .expect("open");
+        self.log.lock().unwrap().push(format!(
+            "window {:?} input={seen_time}",
+            window.response.layer_id.order
+        ));
+        self.left = window.response.rect.left();
+    }
+}
+
+/// Overrides the deprecated `root_ui`, as a game written against #946 did.
+struct RootUiGame {
+    log: Log,
+}
+
+// rustc doesn't warn on implementing a deprecated trait method (only on
+// calling one), so this compiles clean, as such a game does.
+impl PlayerExtension for RootUiGame {
+    fn root_ui(&mut self, ui: &mut egui::Ui) {
+        egui::Panel::top("status")
+            .exact_size(30.0)
+            .show(ui, |ui| ui.label("Status"));
+        self.log.lock().unwrap().push("root_ui".into());
+    }
+}
+
+/// Two headless egui frames at 800x600 through `draw_ui`, the call the
+/// frame makes, as the player would run them: a window's first frame is
+/// egui's invisible sizing pass. Returns the texts the second drew, and
+/// leaves only its entries in `log`.
+fn draw_extensions(extensions: &mut [Box<dyn PlayerExtension>], log: &Log) -> Vec<String> {
+    let ctx = egui::Context::default();
+    let input = || egui::RawInput {
+        screen_rect: Some(egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(800.0, 600.0),
+        )),
+        ..Default::default()
+    };
+    let _ = run_headless_frame(&ctx, input(), |ui| {
+        crate::extension::draw_ui(extensions, ui)
+    });
+    log.lock().unwrap().clear();
+    let out = run_headless_frame(&ctx, input(), |ui| {
+        crate::extension::draw_ui(extensions, ui)
+    });
+    out.shapes
+        .iter()
+        .filter_map(|c| match &c.shape {
+            egui::Shape::Text(t) => Some(t.galley.text().to_string()),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn a_games_side_panel_is_shown_through_ui_on_the_root_ui() {
+    let log = Log::default();
+    let mut extensions: Vec<Box<dyn PlayerExtension>> =
+        vec![Box::new(SidePanelGame { log: log.clone() })];
+    let texts = draw_extensions(&mut extensions, &log);
+    // On the background layer, the root Ui's, with the rest of the window
+    // left to the right of it
+    assert_eq!(*log.lock().unwrap(), ["panel 200 Background", "left 200"]);
+    assert!(texts.iter().any(|t| t == "Inventory"), "{texts:?}");
+}
+
+#[test]
+fn a_games_floating_window_is_shown_through_ui() {
+    let log = Log::default();
+    let mut game = WindowGame {
+        log: log.clone(),
+        kept: None,
+        left: 0.0,
+    };
+    // Two frames on one Context: the game keeps what it cloned
+    let ctx = egui::Context::default();
+    for _ in 0..2 {
+        let _ = run_headless_frame(&ctx, egui::RawInput::default(), |ui| game.ui(ui));
+    }
+    assert!(
+        game.kept.as_ref() == Some(&ctx),
+        "ctx.clone() is the Context"
+    );
+    let themed = ctx.data(|d| d.get_temp::<bool>(egui::Id::new("theme")));
+    assert_eq!(themed, Some(true), "passed on as a &Context");
+    // A window floats on Middle, over the panels and under the debug panels
+    assert_eq!(log.lock().unwrap()[0], "window Middle input=true");
+    assert_eq!(game.left, 400.0, "where the game put it");
+
+    let mut extensions: Vec<Box<dyn PlayerExtension>> = vec![Box::new(game)];
+    let texts = draw_extensions(&mut extensions, &log);
+    assert!(texts.iter().any(|t| t == "Quests"), "{texts:?}");
+    assert!(texts.iter().any(|t| t == "none yet"), "{texts:?}");
+}
+
+/// Kept from #946, which added `root_ui`: a game's panel on the root `Ui`,
+/// a game's window, and a game still overriding `root_ui` all draw in one
+/// pass, in the order they were added.
+#[test]
+fn a_games_panel_is_shown_on_the_root_ui_and_ui_still_runs() {
+    let log = Log::default();
+    let mut extensions: Vec<Box<dyn PlayerExtension>> = vec![
+        Box::new(SidePanelGame { log: log.clone() }),
+        Box::new(WindowGame {
+            log: log.clone(),
+            kept: None,
+            left: 0.0,
+        }),
+        Box::new(RootUiGame { log: log.clone() }),
+    ];
+    let texts = draw_extensions(&mut extensions, &log);
+    assert_eq!(
+        *log.lock().unwrap(),
+        [
+            "panel 200 Background",
+            "left 200",
+            "window Middle input=true",
+            "root_ui"
+        ]
+    );
+    for text in ["Inventory", "Quests", "none yet", "Status"] {
+        assert!(texts.iter().any(|t| t == text), "{text} in {texts:?}");
     }
 }

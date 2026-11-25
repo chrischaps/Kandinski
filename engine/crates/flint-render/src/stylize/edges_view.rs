@@ -18,9 +18,10 @@
 //! `needs: &[StyleNeed::Edges]`, and [`StyleFrame::edges_bind`] for the
 //! bind group.
 
+use crate::gpu_counts::CountedQueue;
 use super::kit;
 use super::{
-    StyleDescriptor, StyleDevice, StyleFrame, StyleHint, StyleInput, StyleNeed, StyleParam,
+    StyleDescriptor, StyleDevice, StyleFrame, StyleInput, StyleNeed, StyleParam,
     StylePass, StyleStage,
 };
 use bytemuck::{Pod, Zeroable};
@@ -30,28 +31,17 @@ pub(super) static STYLE: StyleDescriptor =
         // A debug view of the whole frame (#384)
         .draws_over_entities()
         .params(&[
-            StyleParam::new("dim", 0.3, 0.0..=1.0),
-            StyleParam::new("threshold", 1.0, 0.1..=4.0),
-            StyleParam::new("ghost", 0.5, 0.0..=1.0),
+            StyleParam::new("dim", 0.3, 0.0..=1.0)
+                .label("Scene dim")
+                .help("Brightness of the grey scene under the edges"),
+            StyleParam::new("threshold", 1.0, 0.1..=4.0)
+                .label("Threshold")
+                .help("Strength that counts as an edge; 1 is the shared edge_depth / edge_normal"),
+            StyleParam::new("ghost", 0.5, 0.0..=1.0)
+                .label("Near misses")
+                .help("How much a strength under the threshold shows"),
         ])
-        .needs(&[StyleNeed::Edges])
-        .hints(&[
-            StyleHint::new(
-                "dim",
-                "Scene dim",
-                "Brightness of the grey scene under the edges",
-            ),
-            StyleHint::new(
-                "threshold",
-                "Threshold",
-                "Strength that counts as an edge; 1 is the shared edge_depth / edge_normal",
-            ),
-            StyleHint::new(
-                "ghost",
-                "Near misses",
-                "How much a strength under the threshold shows",
-            ),
-        ]);
+        .needs(&[StyleNeed::Edges]);
 
 fn create(d: &StyleDevice) -> Box<dyn StylePass> {
     let device = d.device;
@@ -62,7 +52,7 @@ fn create(d: &StyleDevice) -> Box<dyn StylePass> {
         pipeline: kit::fullscreen_pipeline(
             device,
             "Edges View Pipeline",
-            &kit::shader(device, "Edges View Shader", kit::wgsl!("edges_view.wgsl")),
+            &kit::shader(device, "Edges View Shader", kit::wgsl!("prelude_core.wgsl", "edges_view.wgsl")),
             &[&uniform_bgl, &input_bgl, &edges_bgl],
             d.format,
         ),
@@ -83,7 +73,7 @@ struct EdgesViewUniforms {
 }
 
 struct EdgesView {
-    pipeline: wgpu::RenderPipeline,
+    pipeline: std::sync::Arc<wgpu::RenderPipeline>,
     uniforms: wgpu::Buffer,
     uniform_bgl: wgpu::BindGroupLayout,
     input_bgl: wgpu::BindGroupLayout,
@@ -112,7 +102,7 @@ impl StylePass for EdgesView {
         };
         frame
             .queue
-            .write_buffer(&self.uniforms, 0, bytemuck::cast_slice(&[uniforms]));
+            .write_buffer_counted(&self.uniforms, 0, bytemuck::cast_slice(&[uniforms]));
         kit::fullscreen_pass(
             encoder,
             "Edges View Pass",

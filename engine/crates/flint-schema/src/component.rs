@@ -10,20 +10,21 @@
 //! | `f32`, `f64` | a number (an integer is taken) |
 //! | `string` | a string |
 //! | `entity` | the name of an entity in the scene; `""` is "not set" |
-//! | `asset` | the name of a file of `kind`, found by the project's asset search; `""` is "not set" |
+//! | `asset` | the name of a file of `kind`, found by the project's asset search, or one of `builtins`; `""` is "not set" |
 //! | `vec2`, `vec3`, `vec4` | exactly that many numbers (`vec3` also `{ x, y, z }`) |
 //! | `color` | `[r, g, b]` or `[r, g, b, a]` |
 //! | `transform` | a table of `position`, `rotation`, `scale` |
 //! | `enum` | one of `values` |
 //! | `array` | a list of `element` |
 //! | `table` | a table; with `fields`, a table of those fields |
+//! | `any` | any value: the component's reader judges its form |
 //!
 //! [`OLD_TYPE_NAMES`] are the spellings that still load and that
 //! [`lint`](crate::lint) reports.
 
 use flint_core::project::AssetKind;
 use serde::Deserialize;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 /// The one spelling of each field type, and what a value of it is. The book's
 /// table (concepts/schemas.md) and `flint schema --format json`'s `types` follow it.
@@ -41,7 +42,8 @@ pub const TYPE_NAMES: &[(&str, &str)] = &[
     (
         "asset",
         "the name of a file of `kind` (a kind of `flint asset where`, or a list of them), \
-         checked through the project's asset search; \"\" is not set",
+         checked through the project's asset search, or one of `builtins` (names its reader \
+         takes with no file: a built-in palette, `none`); \"\" is not set",
     ),
     ("vec2", "exactly 2 numbers"),
     ("vec3", "exactly 3 numbers, or { x, y, z }"),
@@ -56,6 +58,10 @@ pub const TYPE_NAMES: &[(&str, &str)] = &[
     (
         "table",
         "a table; with `fields`, a table of those fields, checked like a component's",
+    ),
+    (
+        "any",
+        "any value, its form left to the component's reader (a number or [min, max], a curve)",
     ),
 ];
 
@@ -101,10 +107,14 @@ pub enum FieldType {
     /// `kinds` (ADR 0114). Validated as a string here; `flint_scene::diagnose`
     /// runs the search (`missing-asset`, with the paths tried). An empty
     /// string is "not set". `unless` names a sibling `bool` field that, when
-    /// true, says no file is looked for (`model.runtime`).
+    /// true, says no file is looked for (`model.runtime`). `builtins` are
+    /// the names its reader takes with no file (#1063): a built-in palette
+    /// or glyph set, `"none"` for a paper image. None is looked for (a file
+    /// of the name, which the loader would take first, needs no check).
     Asset {
         kinds: Vec<AssetKind>,
         unless: Option<String>,
+        builtins: Vec<String>,
     },
     /// Exactly 2 numbers.
     Vec2,
@@ -114,8 +124,9 @@ pub enum FieldType {
     Vec4,
     Transform,
     /// `[r, g, b]` or `[r, g, b, a]`, what `flint_core::toml_util::toml_color`
-    /// reads. The older `{ r, g, b }` table and `0xRRGGBB` integer still
-    /// validate; no engine reader takes them.
+    /// reads, and nothing else: the older `{ r, g, b }` table and
+    /// `0xRRGGBB` integer are `bad-type`, as no engine reader takes them
+    /// (#804).
     Color,
     /// A TOML table with no fixed shape (one animator layer, say). Validated
     /// only as "is a table"; the component that reads it checks its keys.
@@ -132,6 +143,11 @@ pub enum FieldType {
     Array {
         element: Box<FieldType>,
     },
+    /// Any value: a key its component's reader takes in forms no one type
+    /// above names (a number or `[min, max]`, a curve, a name or a table).
+    /// Declared so the key is known and documented; the reader checks the
+    /// form (`particle_emitter`'s, #1051).
+    Any,
 }
 
 impl FieldType {
@@ -154,18 +170,27 @@ impl FieldType {
             FieldType::Table | FieldType::Fields { .. } => "table",
             FieldType::Enum { .. } => "enum",
             FieldType::Array { .. } => "array",
+            FieldType::Any => "any",
         }
     }
 
     /// The type as a person reads it: `enum[a, b]`, `array<vec3>`,
-    /// `asset<models|specs>`, `table{xy, xz}`. What `flint schema` prints.
+    /// `asset<models|specs>`, `asset<papers> or none`, `table{xy, xz}`.
+    /// What `flint schema` prints.
     pub fn describe(&self) -> String {
         match self {
             FieldType::Enum { values } => format!("enum[{}]", values.join(", ")),
             FieldType::Array { element } => format!("array<{}>", element.describe()),
-            FieldType::Asset { kinds, .. } => {
+            FieldType::Asset {
+                kinds, builtins, ..
+            } => {
                 let labels: Vec<&str> = kinds.iter().map(|k| k.label()).collect();
-                format!("asset<{}>", labels.join("|"))
+                let asset = format!("asset<{}>", labels.join("|"));
+                if builtins.is_empty() {
+                    asset
+                } else {
+                    format!("{asset} or {}", builtins.join(", "))
+                }
             }
             FieldType::Fields { fields } => {
                 let mut names: Vec<&str> = fields.keys().map(String::as_str).collect();
@@ -208,6 +233,12 @@ pub struct ComponentSchema {
     pub name: String,
     pub description: Option<String>,
     pub fields: HashMap<String, FieldSchema>,
+    /// Its F3 panel, when a field says what it is on one (#744; `panel.rs`).
+    pub panel: Option<crate::panel::PanelSpec>,
+    /// Fields it no longer has, each with why and what to do instead
+    /// (`[component.<name>.retired]`, #1212): a scene still writing one is
+    /// told that, in place of the nearest field's name.
+    pub retired: BTreeMap<String, String>,
 }
 
 impl ComponentSchema {
@@ -256,8 +287,23 @@ pub struct ComponentSchemaFile {
 pub struct ComponentSchemaDefinition {
     #[serde(default)]
     pub description: Option<String>,
+    /// In the order they are written, which is a panel's row order.
     #[serde(default)]
-    pub fields: HashMap<String, FieldSchemaDefinition>,
+    pub fields: indexmap::IndexMap<String, FieldSchemaDefinition>,
+    /// `[component.<name>.panel]`: the F3 panel's own keys (#744).
+    #[serde(default)]
+    pub panel: Option<toml::Value>,
+    /// `extend = true` (#794): these fields are added to the component an
+    /// earlier schema layer declared, rather than replacing it whole. A field
+    /// the earlier layer declared too is redefined. Without it a later
+    /// layer's component of the same name replaces the earlier one.
+    #[serde(default)]
+    pub extend: bool,
+    /// `[component.<name>.retired]` (#1212): fields taken out, each as
+    /// `name = "why, and what to write instead"`. An extension's are added
+    /// to the declaring layer's.
+    #[serde(default)]
+    pub retired: BTreeMap<String, String>,
     /// Keys beside `description` and `fields`, which the loader refuses
     /// (#792): eleven engine files once declared their fields here, under
     /// `[component.x]` instead of `[component.x.fields]`, and loaded empty.
@@ -267,7 +313,7 @@ pub struct ComponentSchemaDefinition {
 
 /// The keys a `[component.<name>]` table may hold; any other is ignored by
 /// the loader and reported by [`lint`](crate::lint).
-pub const COMPONENT_KEYS: &[&str] = &["description", "fields"];
+pub const COMPONENT_KEYS: &[&str] = &["description", "fields", "panel", "extend", "retired"];
 
 /// The keys a field definition may hold ([`DetailedFieldSchema`]).
 pub const FIELD_KEYS: &[&str] = &[
@@ -281,7 +327,9 @@ pub const FIELD_KEYS: &[&str] = &[
     "element",
     "kind",
     "unless",
+    "builtins",
     "fields",
+    "panel",
 ];
 
 /// Field definition as it appears in TOML files
@@ -335,12 +383,27 @@ pub struct DetailedFieldSchema {
     /// An asset's sibling `bool` field that turns the search off.
     #[serde(default)]
     pub unless: Option<String>,
+    /// The names an asset field takes with no file (#1063).
+    #[serde(default)]
+    pub builtins: Option<Vec<String>>,
     /// A table's own fields.
     #[serde(default)]
     pub fields: Option<HashMap<String, FieldSchemaDefinition>>,
+    /// What the field is on its component's F3 panel (#744). Boxed: most
+    /// fields have none, and every field definition carries the slot.
+    #[serde(default)]
+    pub panel: Option<Box<toml::Value>>,
 }
 
 impl FieldSchemaDefinition {
+    /// The field's `panel` key, if it has one.
+    pub fn panel(&self) -> Option<&toml::Value> {
+        match self {
+            FieldSchemaDefinition::Simple(_) => None,
+            FieldSchemaDefinition::Detailed(d) => d.panel.as_deref(),
+        }
+    }
+
     pub fn to_field_schema(self) -> FieldSchema {
         match self {
             FieldSchemaDefinition::Simple(type_str) => {
@@ -412,6 +475,7 @@ fn parse_field_type(type_str: &str, detail: Option<&DetailedFieldSchema>) -> Fie
                 })
                 .unwrap_or_default(),
             unless: detail.and_then(|d| d.unless.clone()),
+            builtins: detail.and_then(|d| d.builtins.clone()).unwrap_or_default(),
         },
         Some("vec2") => FieldType::Vec2,
         Some("vec3") => FieldType::Vec3,
@@ -427,6 +491,7 @@ fn parse_field_type(type_str: &str, detail: Option<&DetailedFieldSchema>) -> Fie
             },
             None => FieldType::Table,
         },
+        Some("any") => FieldType::Any,
         Some("enum") => FieldType::Enum {
             values: detail.and_then(|d| d.values.clone()).unwrap_or_default(),
         },
@@ -529,7 +594,8 @@ mod tests {
             parsed("type = \"asset\"\nkind = \"models\"").field_type,
             FieldType::Asset {
                 kinds: vec![AssetKind::Models],
-                unless: None
+                unless: None,
+                builtins: vec![],
             }
         );
         assert_eq!(
@@ -537,7 +603,8 @@ mod tests {
                 .field_type,
             FieldType::Asset {
                 kinds: vec![AssetKind::Models, AssetKind::Specs],
-                unless: Some("runtime".into())
+                unless: Some("runtime".into()),
+                builtins: vec![],
             }
         );
         // A kind that is none is dropped; `lint` reports it
@@ -545,9 +612,21 @@ mod tests {
             parsed("type = \"asset\"\nkind = \"modles\"").field_type,
             FieldType::Asset {
                 kinds: vec![],
-                unless: None
+                unless: None,
+                builtins: vec![],
             }
         );
+        // #1063: names the reader takes with no file
+        let paper = parsed("type = \"asset\"\nkind = \"papers\"\nbuiltins = [\"none\"]");
+        assert_eq!(
+            paper.field_type,
+            FieldType::Asset {
+                kinds: vec![AssetKind::Papers],
+                unless: None,
+                builtins: vec!["none".into()],
+            }
+        );
+        assert_eq!(paper.field_type.describe(), "asset<papers> or none");
     }
 
     #[test]

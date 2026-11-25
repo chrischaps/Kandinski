@@ -3,13 +3,18 @@
 //! Each method examines one entity type and pushes draw calls into the
 //! appropriate draw-list on `SceneRenderer`.
 
-use super::helpers::{extract_bounds_info, mat4_inv_transpose, parse_blend_mode, MaterialOverride};
+use super::helpers::{
+    extract_bounds_info, mat4_inv_transpose, parse_blend_mode, MaterialOverride, BLEND_MODES,
+};
 use super::{
-    hash_parts, transform_aabb, CachedBoneBind, EchoDrawCall, SceneRenderer, SkinnedDrawCall,
-    SHADOW_BONE_KEY, SKINNED_DRAW_KEY,
+    draw_list::echo_order, hash_parts, transform_aabb, Blend, CachedBoneBind, Draw, DrawItem,
+    EchoDrawCall, Layer, SceneRenderer, SkinnedDrawCall, SHADOW_BONE_KEY, SKINNED_DRAW_KEY,
 };
 use crate::billboard_pipeline::{BillboardDrawCall, BillboardUniforms, SpriteInstance};
-use crate::bitmap_font::{anchor_origin, apply_fill};
+use crate::bitmap_font::{
+    anchor_origin, apply_fill, FILL_DIRECTIONS, SCREEN_ANCHORS, SPRITE_MODES, TEXT_ALIGNS,
+};
+use crate::gpu_counts::CountedDevice;
 use crate::pipeline::{BlendMode, MaterialUniforms, TransformUniforms};
 use crate::primitives::{
     create_box_mesh, create_wireframe_box_mesh, generate_normal_arrows,
@@ -18,12 +23,9 @@ use crate::primitives::{
 use crate::sprite2d_pipeline::Sprite2dInstanceGpu;
 use crate::texture_cache::TextureCache;
 use flint_core::components as comp;
-use flint_core::toml_util::{toml_color as extract_color, toml_f32, toml_vec4};
 use flint_core::EntityId;
-use flint_ecs::DynamicComponents;
-use flint_ecs::FlintWorld;
+use flint_ecs::{ComponentView, FlintWorld};
 use std::sync::Arc;
-use wgpu::util::DeviceExt;
 
 impl SceneRenderer {
     /// The colour that replaces a model entity's base colour, from its
@@ -90,8 +92,8 @@ impl SceneRenderer {
     /// three or none; white when neither sets one. Negatives count as 0.
     pub(super) fn ecs_vertex_tint(world: &FlintWorld, entity_id: EntityId) -> [f32; 4] {
         let read = |id: EntityId| {
-            let m = world.get_components(id)?.get(comp::MATERIAL)?;
-            let c = |k: &str| m.get(k).and_then(toml_f32).map(|v| v.max(0.0));
+            let m = world.view(id, comp::MATERIAL);
+            let c = |k: &str| m.opt_f32(k).map(|v| v.max(0.0));
             Some([
                 c("vertex_tint_r")?,
                 c("vertex_tint_g")?,
@@ -108,13 +110,7 @@ impl SceneRenderer {
     /// like `cast_shadows`: true draws its base colour times its
     /// `emissive_scale`, with no lighting. False when neither sets one.
     pub(super) fn ecs_unlit(world: &FlintWorld, entity_id: EntityId) -> bool {
-        let read = |id: EntityId| {
-            world
-                .get_components(id)
-                .and_then(|c| c.get(comp::MATERIAL))
-                .and_then(|m| m.get("unlit"))
-                .and_then(|v| v.as_bool())
-        };
+        let read = |id: EntityId| world.view(id, comp::MATERIAL).opt_bool("unlit");
         read(entity_id)
             .or_else(|| world.get_parent(entity_id).and_then(read))
             .unwrap_or(false)
@@ -127,18 +123,28 @@ impl SceneRenderer {
         }
     }
 
+    /// A bounds box's own light (#797): its `material.emissive`, linear RGB
+    /// added after lighting (above 1 is what bloom takes up), times
+    /// `material.emissive_scale`. Unset leaves the uniforms as they were, so
+    /// a box without it draws the same bytes as before.
+    fn apply_box_emission(
+        world: &FlintWorld,
+        entity_id: EntityId,
+        material: &mut MaterialUniforms,
+    ) {
+        let Some([r, g, b, _]) = world.view(entity_id, comp::MATERIAL).opt_color("emissive") else {
+            return;
+        };
+        material.emissive = [r.max(0.0), g.max(0.0), b.max(0.0), 0.0];
+        material.scale_emission(Self::ecs_emissive_scale(world, entity_id));
+    }
+
     /// ECS `material.cast_shadows` for an entity (ADR 0100): false keeps
     /// its draws out of the shadow cascades, opaque, transparent and
     /// skinned alike. True when neither it nor its parent sets one, so a GLB
     /// expanded into child nodes stops casting as one.
     pub(super) fn ecs_casts_shadow(world: &FlintWorld, entity_id: EntityId) -> bool {
-        let read = |id: EntityId| {
-            world
-                .get_components(id)
-                .and_then(|c| c.get(comp::MATERIAL))
-                .and_then(|m| m.get("cast_shadows"))
-                .and_then(|v| v.as_bool())
-        };
+        let read = |id: EntityId| world.view(id, comp::MATERIAL).opt_bool("cast_shadows");
         read(entity_id)
             .or_else(|| world.get_parent(entity_id).and_then(read))
             .unwrap_or(true)
@@ -148,13 +154,7 @@ impl SceneRenderer {
     /// multi-node model's nodes are children of the entity that named it).
     /// Zero, negative or absent: no limit.
     pub(super) fn ecs_draw_distance(world: &FlintWorld, entity_id: EntityId) -> Option<f32> {
-        let read = |id: EntityId| {
-            world
-                .get_components(id)
-                .and_then(|c| c.get("lod"))
-                .and_then(|l| l.get("draw_distance"))
-                .and_then(toml_f32)
-        };
+        let read = |id: EntityId| world.view(id, "lod").opt_f32("draw_distance");
         read(entity_id)
             .or_else(|| world.get_parent(entity_id).and_then(read))
             .filter(|d| *d > 0.0)
@@ -190,13 +190,7 @@ impl SceneRenderer {
     /// A number in the `material` component of `entity_id`, or else of its
     /// parent.
     fn ecs_material_f32(world: &FlintWorld, entity_id: EntityId, key: &str) -> Option<f32> {
-        let read = |id: EntityId| {
-            world
-                .get_components(id)
-                .and_then(|c| c.get(comp::MATERIAL))
-                .and_then(|m| m.get(key))
-                .and_then(toml_f32)
-        };
+        let read = |id: EntityId| world.view(id, comp::MATERIAL).opt_f32(key);
         read(entity_id).or_else(|| world.get_parent(entity_id).and_then(read))
     }
 
@@ -226,13 +220,11 @@ impl SceneRenderer {
             if depth > 32 || found.is_full() {
                 break;
             }
-            if let Some(v) = world
-                .get_components(id)
-                .and_then(|c| c.get(comp::MATERIAL_OVERRIDES))
-                .and_then(|m| m.get(material_name))
-            {
-                found.fill_from(v, gltf_alpha);
-            }
+            found.fill_from(
+                &world.view(id, comp::MATERIAL_OVERRIDES),
+                material_name,
+                gltf_alpha,
+            );
             cur = world.get_parent(id);
             depth += 1;
         }
@@ -257,19 +249,19 @@ impl SceneRenderer {
         };
 
         let inv_transpose = mat4_inv_transpose(&model_matrix);
-        let first_echo_draw = self.echo_draws.len();
+        let first_echo_draw = self.draws.layer(Layer::Echo).len();
         // All of an entity's echoes read the transform of its first part, as
         // every part's holds the same matrices.
         let mut echo_transform: Option<Arc<wgpu::BindGroup>> = None;
         // Debug views are for the geometry itself, and return an alpha of 1.
         let echoes = match self.debug_state.mode {
-            crate::debug::DebugMode::Pbr => self.entity_echoes.get(&entity_id),
+            crate::debug::DebugMode::Pbr => self.skinning.echoes.get(&entity_id),
             _ => None,
         };
-        let echoes_lighten = self.entity_echo_lighten.contains(&entity_id);
+        let echoes_lighten = self.skinning.echo_lighten.contains(&entity_id);
         // A soft silhouette (#582). Debug views are of the geometry, opaque.
         let part_softness = match self.debug_state.mode {
-            crate::debug::DebugMode::Pbr => self.entity_part_softness.get(&entity_id),
+            crate::debug::DebugMode::Pbr => self.skinning.part_softness.get(&entity_id),
             _ => None,
         };
 
@@ -339,7 +331,8 @@ impl SceneRenderer {
             material_uniforms.glow_surface = Self::ecs_glow_surface(world, entity_id);
             material_uniforms.vertex_tint = Self::ecs_vertex_tint(world, entity_id);
             if let Some(tint) = self
-                .entity_part_tints
+                .skinning
+                .part_tints
                 .get(&entity_id)
                 .and_then(|tints| tints.get(mesh_index))
             {
@@ -427,7 +420,12 @@ impl SceneRenderer {
                     mr_view,
                     em_view,
                 );
-                self.echo_draws.push(EchoDrawCall {
+                let blend = if echoes_lighten {
+                    Blend::Lighten
+                } else {
+                    Blend::Alpha
+                };
+                let draw = EchoDrawCall {
                     vertex_buffer: gpu_mesh.vertex_buffer.clone(),
                     index_buffer: gpu_mesh.index_buffer.clone(),
                     index_count: gpu_mesh.index_count,
@@ -437,14 +435,20 @@ impl SceneRenderer {
                     material_buffer: buffer,
                     material_bind_group: bind_group,
                     bone_bind_group: copy.bind_group.clone(),
-                    lighten: echoes_lighten,
                     origin: [model_matrix[3][0], model_matrix[3][1], model_matrix[3][2]],
                     echo,
                     sort_depth: 0.0,
-                });
+                };
+                // An echo casts nothing: the shadow is the prop's own
+                self.draws.push(DrawItem::new(
+                    Some(entity_id),
+                    blend,
+                    false,
+                    Draw::Echo(draw),
+                ));
             }
 
-            let entity_bones = self.entity_bone_buffers.get(&entity_id);
+            let entity_bones = self.skinning.bone_buffers.get(&entity_id);
             let from_entity = entity_bones.is_some();
             let bone_layout = &self
                 .pipelines
@@ -453,7 +457,8 @@ impl SceneRenderer {
                 .unwrap()
                 .bone_bind_group_layout;
             let stale = self
-                .skinned_bone_binds
+                .skinning
+                .bone_binds
                 .get(&key)
                 .is_none_or(|b| b.from_entity != from_entity);
             if stale {
@@ -462,7 +467,7 @@ impl SceneRenderer {
                     bone_layout,
                     entity_bones.unwrap_or(&gpu_mesh.bone_buffer),
                 );
-                self.skinned_bone_binds.insert(
+                self.skinning.bone_binds.insert(
                     key,
                     CachedBoneBind {
                         from_entity,
@@ -471,17 +476,18 @@ impl SceneRenderer {
                     },
                 );
             }
-            let bone = self.skinned_bone_binds.get_mut(&key).unwrap();
+            let bone = self.skinning.bone_binds.get_mut(&key).unwrap();
             bone.touched = self.extract_frame;
             let bone_bind_group = bone.bind_group.clone();
 
             // Most draws' shadows follow the bones they're drawn with.
-            let shadow_bone_bind_group = match self.entity_shadow_bone_buffers.get(&entity_id) {
+            let shadow_bone_bind_group = match self.skinning.shadow_bone_buffers.get(&entity_id) {
                 None => bone_bind_group.clone(),
                 Some(bones) => {
                     let shadow_key = (entity_id, key.1 | SHADOW_BONE_KEY);
                     let shadow = self
-                        .skinned_bone_binds
+                        .skinning
+                        .bone_binds
                         .entry(shadow_key)
                         .or_insert_with(|| {
                             let layout = &self
@@ -503,26 +509,12 @@ impl SceneRenderer {
 
             // Check transparency from glTF material and ECS material component
             let gltf_alpha = gpu_mesh.material.base_color[3];
-            let ecs_opacity = world
-                .get_components(entity_id)
-                .and_then(|c| c.get(comp::MATERIAL))
-                .and_then(|m| m.get("opacity"))
-                .and_then(toml_f32)
-                .unwrap_or(1.0);
-            let ecs_blend_mode_str = world
-                .get_components(entity_id)
-                .and_then(|c| c.get(comp::MATERIAL))
-                .and_then(|m| m.get("blend_mode"))
-                .and_then(|v| v.as_str().map(String::from))
-                .unwrap_or_default();
-            let blend_mode = parse_blend_mode(&ecs_blend_mode_str);
+            let ecs_material = world.view(entity_id, comp::MATERIAL);
+            let ecs_opacity = ecs_material.f32("opacity", 1.0);
+            let blend_mode =
+                parse_blend_mode(ecs_material.choice("blend_mode", BLEND_MODES, "alpha"));
             material_uniforms.opacity = ecs_opacity;
-            material_uniforms.texture_scale = world
-                .get_components(entity_id)
-                .and_then(|c| c.get(comp::MATERIAL))
-                .and_then(|m| m.get("texture_scale"))
-                .and_then(toml_f32)
-                .unwrap_or(1.0);
+            material_uniforms.texture_scale = ecs_material.f32("texture_scale", 1.0);
 
             let see_through = ecs_opacity < 1.0
                 || gltf_alpha < 1.0
@@ -541,11 +533,12 @@ impl SceneRenderer {
                 if wire_indices.is_empty() {
                     (None, 0)
                 } else {
-                    let buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                        label: Some("Skinned Wireframe Index Buffer"),
-                        contents: bytemuck::cast_slice(&wire_indices),
-                        usage: wgpu::BufferUsages::INDEX,
-                    });
+                    let buf =
+                        device.create_buffer_init_counted(&wgpu::util::BufferInitDescriptor {
+                            label: Some("Skinned Wireframe Index Buffer"),
+                            contents: bytemuck::cast_slice(&wire_indices),
+                            usage: wgpu::BufferUsages::INDEX,
+                        });
                     (Some(buf), wire_indices.len() as u32)
                 }
             } else {
@@ -566,34 +559,31 @@ impl SceneRenderer {
                 wire_index_count,
                 model: model_matrix,
                 model_inv_transpose: inv_transpose,
-                entity_id: Some(entity_id),
-                blend_mode,
                 sort_depth: 0.0,
-                casts_shadow: Self::ecs_casts_shadow(world, entity_id),
                 world_aabb: {
                     let bones = self
-                        .entity_bone_matrices
+                        .skinning
+                        .bone_matrices
                         .get(&entity_id)
-                        .or_else(|| self.asset_bone_matrices.get(asset_name))
+                        .or_else(|| self.skinning.asset_bone_matrices.get(asset_name))
                         .map_or(&[][..], Vec::as_slice);
                     let (lo, hi) = super::posed_aabb(bones, gpu_mesh.aabb_min, gpu_mesh.aabb_max);
                     Some(transform_aabb(&model_matrix, lo, hi))
                 },
-                wooze: None,
                 double_sided: gpu_mesh.material.double_sided,
                 soft_edge_only,
             };
-
-            if is_transparent {
-                self.transparent_skinned_draws.push(skinned_draw);
-            } else {
-                self.skinned_entity_draws.push(skinned_draw);
-            }
+            self.draws.push(DrawItem::new(
+                Some(entity_id),
+                Blend::of_mesh(is_transparent, blend_mode),
+                Self::ecs_casts_shadow(world, entity_id),
+                Draw::Skinned(skinned_draw),
+            ));
         }
 
         // They came a part at a time: a whole echo at a time, in its order,
         // is what keeps overlapping copies from flickering.
-        self.echo_draws[first_echo_draw..].sort_by_key(|draw| draw.echo);
+        self.draws.layer_mut(Layer::Echo)[first_echo_draw..].sort_by_key(echo_order);
 
         true
     }
@@ -689,26 +679,12 @@ impl SceneRenderer {
             material_uniforms.has_emissive_tex = if has_em { 1 } else { 0 };
 
             // Read opacity and blend_mode from ECS material component
-            let ecs_opacity = world
-                .get_components(entity_id)
-                .and_then(|c| c.get(comp::MATERIAL))
-                .and_then(|m| m.get("opacity"))
-                .and_then(toml_f32)
-                .unwrap_or(1.0);
-            let ecs_blend_mode_str = world
-                .get_components(entity_id)
-                .and_then(|c| c.get(comp::MATERIAL))
-                .and_then(|m| m.get("blend_mode"))
-                .and_then(|v| v.as_str().map(String::from))
-                .unwrap_or_default();
-            let blend_mode = parse_blend_mode(&ecs_blend_mode_str);
+            let ecs_material = world.view(entity_id, comp::MATERIAL);
+            let ecs_opacity = ecs_material.f32("opacity", 1.0);
+            let blend_mode =
+                parse_blend_mode(ecs_material.choice("blend_mode", BLEND_MODES, "alpha"));
             material_uniforms.opacity = ecs_opacity;
-            material_uniforms.texture_scale = world
-                .get_components(entity_id)
-                .and_then(|c| c.get(comp::MATERIAL))
-                .and_then(|m| m.get("texture_scale"))
-                .and_then(toml_f32)
-                .unwrap_or(1.0);
+            material_uniforms.texture_scale = ecs_material.f32("texture_scale", 1.0);
 
             let gltf_alpha = gpu_mesh.material.base_color[3];
             let is_transparent = ecs_opacity < 1.0
@@ -768,10 +744,8 @@ impl SceneRenderer {
                 binds,
                 model_matrix,
                 inv_transpose,
-                entity_id,
-                blend_mode,
             );
-            draw.casts_shadow = Self::ecs_casts_shadow(world, entity_id);
+            let casts_shadow = Self::ecs_casts_shadow(world, entity_id);
             draw.double_sided = gpu_mesh.material.double_sided;
             draw.world_aabb = Some(transform_aabb(
                 &model_matrix,
@@ -785,11 +759,12 @@ impl SceneRenderer {
                 draw.world_aabb,
             );
 
-            if is_transparent {
-                self.transparent_draws.push(draw);
-            } else {
-                self.entity_draws.push(draw);
-            }
+            self.draws.push(DrawItem::new(
+                Some(entity_id),
+                Blend::of_mesh(is_transparent, blend_mode),
+                casts_shadow,
+                Draw::Static(draw),
+            ));
 
             // Generate wireframe overlay for imported meshes
             if need_overlay {
@@ -865,19 +840,14 @@ impl SceneRenderer {
         tex_cache: &TextureCache,
         world: &FlintWorld,
         entity_id: flint_core::EntityId,
-        components: &DynamicComponents,
-        sprite: &toml::Value,
+        sprite: &ComponentView<'_>,
         world_pos: [f32; 3],
         sprite2d_collected: &mut Vec<(String, i32, Sprite2dInstanceGpu)>,
     ) {
-        let visible = sprite
-            .get("visible")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(true);
-        let mode = sprite
-            .get("mode")
-            .and_then(|v| v.as_str())
-            .unwrap_or("billboard");
+        // Every field through the typed view (ADR 0115): a wrong type or an
+        // unknown mode reads as the default and is reported once
+        let visible = sprite.bool("visible", true);
+        let mode = sprite.choice("mode", SPRITE_MODES, "billboard");
 
         if visible && mode == "sprite2d" {
             // ── Sprite2D path: collect for batched instanced rendering ──
@@ -885,7 +855,6 @@ impl SceneRenderer {
                 tex_cache,
                 world,
                 entity_id,
-                components,
                 sprite,
                 world_pos,
                 sprite2d_collected,
@@ -900,41 +869,22 @@ impl SceneRenderer {
     fn extract_sprite2d(
         &mut self,
         tex_cache: &TextureCache,
-        _world: &FlintWorld,
-        _entity_id: flint_core::EntityId,
-        components: &DynamicComponents,
-        sprite: &toml::Value,
+        world: &FlintWorld,
+        entity_id: flint_core::EntityId,
+        sprite: &ComponentView<'_>,
         world_pos: [f32; 3],
         sprite2d_collected: &mut Vec<(String, i32, Sprite2dInstanceGpu)>,
     ) {
-        let tex_name = sprite.get("texture").and_then(|v| v.as_str()).unwrap_or("");
-        let width = sprite.get("width").and_then(toml_f32).unwrap_or(1.0);
-        let height = sprite.get("height").and_then(toml_f32).unwrap_or(1.0);
-        let anchor_y = sprite.get("anchor_y").and_then(toml_f32).unwrap_or(0.0);
-        let layer = sprite
-            .get("layer")
-            .and_then(|v| v.as_integer())
-            .unwrap_or(0) as i32;
-        let flip_x = sprite
-            .get("flip_x")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
-        let flip_y = sprite
-            .get("flip_y")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
-
-        // Read tint color
-        let tint = sprite
-            .get("tint")
-            .and_then(toml_vec4)
-            .unwrap_or([1.0, 1.0, 1.0, 1.0]);
-
-        // Read source_rect [x, y, w, h] in pixels
-        let source_rect = sprite
-            .get("source_rect")
-            .and_then(toml_vec4)
-            .unwrap_or([0.0, 0.0, 0.0, 0.0]);
+        let tex_name = sprite.str("texture", "");
+        let width = sprite.f32("width", 1.0);
+        let height = sprite.f32("height", 1.0);
+        let anchor_y = sprite.f32("anchor_y", 0.0);
+        let layer = sprite.i64("layer", 0) as i32;
+        let flip_x = sprite.bool("flip_x", false);
+        let flip_y = sprite.bool("flip_y", false);
+        let tint = sprite.vec4("tint", [1.0, 1.0, 1.0, 1.0]);
+        // [x, y, w, h] in pixels
+        let source_rect = sprite.vec4("source_rect", [0.0, 0.0, 0.0, 0.0]);
 
         // Convert source_rect to UV coordinates
         let uv_rect = if source_rect[2] > 0.0 && source_rect[3] > 0.0 {
@@ -954,14 +904,12 @@ impl SceneRenderer {
         };
 
         // ── Screen anchor vs parallax position ──
-        let screen_anchor = components.get(comp::SCREEN_ANCHOR);
-        let (adjusted_x, adjusted_y, skip_tiling) = if let Some(sa) = screen_anchor {
-            let anchor_name = sa
-                .get("anchor")
-                .and_then(|v| v.as_str())
-                .unwrap_or("center");
-            let off_x = sa.get("offset_x").and_then(toml_f32).unwrap_or(0.0);
-            let off_y = sa.get("offset_y").and_then(toml_f32).unwrap_or(0.0);
+        let sa = world.view(entity_id, comp::SCREEN_ANCHOR);
+        let parallax = world.view(entity_id, comp::PARALLAX);
+        let (adjusted_x, adjusted_y, skip_tiling) = if sa.exists() {
+            let anchor_name = sa.choice("anchor", SCREEN_ANCHORS, "center");
+            let off_x = sa.f32("offset_x", 0.0);
+            let off_y = sa.f32("offset_y", 0.0);
             let half_w = self.ortho_height * self.aspect_ratio * 0.5;
             let half_h = self.ortho_height * 0.5;
             let (ax, ay) = anchor_origin(anchor_name, half_w, half_h);
@@ -971,11 +919,7 @@ impl SceneRenderer {
                 true,
             )
         } else {
-            let parallax = components.get("parallax");
-            let scroll_rate = parallax
-                .and_then(|p| p.get("scroll_rate"))
-                .and_then(toml_f32)
-                .unwrap_or(1.0);
+            let scroll_rate = parallax.f32("scroll_rate", 1.0);
             (
                 world_pos[0] + self.camera_offset[0] * (1.0 - scroll_rate),
                 world_pos[1] + self.camera_offset[1] * (1.0 - scroll_rate),
@@ -985,12 +929,16 @@ impl SceneRenderer {
 
         // ── ui_fill clipping ──
         let (uv_rect, width, height, fill_x_off, fill_y_off) =
-            if let Some(fill) = components.get(comp::UI_FILL) {
-                let value = fill.get("value").and_then(toml_f32).unwrap_or(1.0);
-                let direction = fill
-                    .get("direction")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("left_to_right");
+            if let Some(fill) = Some(world.view(entity_id, comp::UI_FILL)).filter(|f| f.exists()) {
+                let value = fill.f32("value", 1.0);
+                // An unknown direction has always clipped nothing; a value
+                // that is no string fills left to right
+                let direction = match fill.raw("direction") {
+                    Some(v) if v.is_str() => {
+                        fill.opt_choice("direction", FILL_DIRECTIONS).unwrap_or("")
+                    }
+                    _ => fill.choice("direction", FILL_DIRECTIONS, "left_to_right"),
+                };
                 apply_fill(uv_rect, width, height, value, direction)
             } else {
                 (uv_rect, width, height, 0.0, 0.0)
@@ -1001,15 +949,8 @@ impl SceneRenderer {
 
         // ── Parallax tiling (skipped for screen-anchored sprites) ──
         if !skip_tiling {
-            let parallax = components.get("parallax");
-            let repeat_x = parallax
-                .and_then(|p| p.get("repeat_x"))
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false);
-            let repeat_y = parallax
-                .and_then(|p| p.get("repeat_y"))
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false);
+            let repeat_x = parallax.bool("repeat_x", false);
+            let repeat_y = parallax.bool("repeat_y", false);
 
             if repeat_x || repeat_y {
                 let viewport_h = self.ortho_height;
@@ -1075,18 +1016,13 @@ impl SceneRenderer {
         sprite2d_collected.push((tex_name.to_string(), layer, instance));
 
         // ── ui_text: expand text to glyph sprite instances ──
-        if let Some(ui_text) = components.get(comp::UI_TEXT) {
-            let font_path_str = ui_text.get("font").and_then(|v| v.as_str()).unwrap_or("");
-            let text = ui_text.get("text").and_then(|v| v.as_str()).unwrap_or("");
-            let text_size = ui_text.get("size").and_then(toml_f32).unwrap_or(1.0);
-            let text_color = ui_text
-                .get("color")
-                .and_then(toml_vec4)
-                .unwrap_or([1.0, 1.0, 1.0, 1.0]);
-            let align = ui_text
-                .get("align")
-                .and_then(|v| v.as_str())
-                .unwrap_or("left");
+        let ui_text = world.view(entity_id, comp::UI_TEXT);
+        if ui_text.exists() {
+            let font_path_str = ui_text.str("font", "");
+            let text = ui_text.str("text", "");
+            let text_size = ui_text.f32("size", 1.0);
+            let text_color = ui_text.vec4("color", [1.0, 1.0, 1.0, 1.0]);
+            let align = ui_text.choice("align", TEXT_ALIGNS, "left");
 
             if !font_path_str.is_empty() && !text.is_empty() {
                 // Fonts load and upload with the scene's textures
@@ -1106,7 +1042,7 @@ impl SceneRenderer {
         device: &wgpu::Device,
         tex_cache: &TextureCache,
         entity_id: flint_core::EntityId,
-        sprite: &toml::Value,
+        sprite: &ComponentView<'_>,
         world_pos: [f32; 3],
     ) {
         let bp = match &self.pipelines.billboard {
@@ -1114,26 +1050,14 @@ impl SceneRenderer {
             None => return,
         };
 
-        let tex_name = sprite.get("texture").and_then(|v| v.as_str()).unwrap_or("");
-        let width = sprite.get("width").and_then(toml_f32).unwrap_or(1.0);
-        let height = sprite.get("height").and_then(toml_f32).unwrap_or(1.0);
-        let frame = sprite
-            .get("frame")
-            .and_then(|v| v.as_integer())
-            .unwrap_or(0) as u32;
-        let frames_x = sprite
-            .get("frames_x")
-            .and_then(|v| v.as_integer())
-            .unwrap_or(1) as u32;
-        let frames_y = sprite
-            .get("frames_y")
-            .and_then(|v| v.as_integer())
-            .unwrap_or(1) as u32;
-        let anchor_y = sprite.get("anchor_y").and_then(toml_f32).unwrap_or(0.0);
-        let fullbright = sprite
-            .get("fullbright")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(true);
+        let tex_name = sprite.str("texture", "");
+        let width = sprite.f32("width", 1.0);
+        let height = sprite.f32("height", 1.0);
+        let frame = sprite.i64("frame", 0) as u32;
+        let frames_x = sprite.i64("frames_x", 1) as u32;
+        let frames_y = sprite.i64("frames_y", 1) as u32;
+        let anchor_y = sprite.f32("anchor_y", 0.0);
+        let fullbright = sprite.bool("fullbright", true);
 
         let sprite_instance = SpriteInstance {
             world_pos,
@@ -1148,6 +1072,8 @@ impl SceneRenderer {
             _pad1: 0.0,
         };
 
+        let world_aabb = crate::billboard_pipeline::sprite_bounds(&sprite_instance);
+
         // Billboard uniforms will be filled during render (need camera)
         let billboard_uniforms = BillboardUniforms {
             view_proj: [[0.0; 4]; 4],
@@ -1157,19 +1083,20 @@ impl SceneRenderer {
             _pad1: 0.0,
         };
 
-        let billboard_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Billboard Uniform Buffer"),
-            contents: bytemuck::cast_slice(&[billboard_uniforms]),
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-        });
+        let billboard_buffer =
+            device.create_buffer_init_counted(&wgpu::util::BufferInitDescriptor {
+                label: Some("Billboard Uniform Buffer"),
+                contents: bytemuck::cast_slice(&[billboard_uniforms]),
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            });
 
-        let sprite_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        let sprite_buffer = device.create_buffer_init_counted(&wgpu::util::BufferInitDescriptor {
             label: Some("Sprite Instance Buffer"),
             contents: bytemuck::cast_slice(&[sprite_instance]),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
 
-        let billboard_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        let billboard_bind_group = device.create_bind_group_counted(&wgpu::BindGroupDescriptor {
             layout: &bp.billboard_bind_group_layout,
             entries: &[
                 wgpu::BindGroupEntry {
@@ -1195,7 +1122,7 @@ impl SceneRenderer {
             &tex_cache.default_white,
         );
 
-        let texture_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        let texture_bind_group = device.create_bind_group_counted(&wgpu::BindGroupDescriptor {
             layout: &bp.texture_bind_group_layout,
             entries: &[
                 wgpu::BindGroupEntry {
@@ -1210,13 +1137,19 @@ impl SceneRenderer {
             label: Some("Billboard Texture Bind Group"),
         });
 
-        self.billboard_draws.push(BillboardDrawCall {
-            billboard_buffer,
-            sprite_buffer,
-            billboard_bind_group,
-            texture_bind_group,
-            entity_id: Some(entity_id),
-        });
+        // Opaque: its alpha only cuts it out, and it writes depth
+        self.draws.push(DrawItem::new(
+            Some(entity_id),
+            Blend::Opaque,
+            false,
+            Draw::Billboard(BillboardDrawCall {
+                billboard_buffer,
+                sprite_buffer,
+                billboard_bind_group,
+                texture_bind_group,
+                world_aabb,
+            }),
+        ));
     }
 
     /// Extract a standalone `ui_text` entity (without a sprite component).
@@ -1224,50 +1157,40 @@ impl SceneRenderer {
     pub(super) fn extract_ui_text_entity(
         &mut self,
         tex_cache: &TextureCache,
+        world: &FlintWorld,
         entity_id: flint_core::EntityId,
-        components: &DynamicComponents,
         world_pos: [f32; 3],
         sprite2d_collected: &mut Vec<(String, i32, Sprite2dInstanceGpu)>,
     ) -> bool {
-        let has_sprite = components.get(comp::SPRITE).is_some();
-        if has_sprite {
+        if world.get_component(entity_id, comp::SPRITE).is_some() {
             return false;
         }
 
-        let ui_text = match components.get(comp::UI_TEXT) {
-            Some(ut) => ut,
-            None => return false,
-        };
+        // Through the typed view (ADR 0115): a wrong type or an unknown
+        // `align` reads as the default and is reported once
+        let ui_text = world.view(entity_id, comp::UI_TEXT);
+        if !ui_text.exists() {
+            return false;
+        }
 
-        let font_path_str = ui_text.get("font").and_then(|v| v.as_str()).unwrap_or("");
-        let text = ui_text.get("text").and_then(|v| v.as_str()).unwrap_or("");
+        let font_path_str = ui_text.str("font", "");
+        let text = ui_text.str("text", "");
 
         if font_path_str.is_empty() || text.is_empty() {
             return false;
         }
 
-        let text_size = ui_text.get("size").and_then(toml_f32).unwrap_or(1.0);
-        let text_color = ui_text
-            .get("color")
-            .and_then(toml_vec4)
-            .unwrap_or([1.0, 1.0, 1.0, 1.0]);
-        let align = ui_text
-            .get("align")
-            .and_then(|v| v.as_str())
-            .unwrap_or("left");
-        let layer = ui_text
-            .get("layer")
-            .and_then(|v| v.as_integer())
-            .unwrap_or(0) as i32;
+        let text_size = ui_text.f32("size", 1.0);
+        let text_color = ui_text.vec4("color", [1.0, 1.0, 1.0, 1.0]);
+        let align = ui_text.choice("align", TEXT_ALIGNS, "left");
+        let layer = ui_text.i64("layer", 0) as i32;
 
         // Compute position from screen_anchor or world pos
-        let (text_x, text_y) = if let Some(sa) = components.get(comp::SCREEN_ANCHOR) {
-            let anchor_name = sa
-                .get("anchor")
-                .and_then(|v| v.as_str())
-                .unwrap_or("center");
-            let off_x = sa.get("offset_x").and_then(toml_f32).unwrap_or(0.0);
-            let off_y = sa.get("offset_y").and_then(toml_f32).unwrap_or(0.0);
+        let sa = world.view(entity_id, comp::SCREEN_ANCHOR);
+        let (text_x, text_y) = if sa.exists() {
+            let anchor_name = sa.choice("anchor", SCREEN_ANCHORS, "center");
+            let off_x = sa.f32("offset_x", 0.0);
+            let off_y = sa.f32("offset_y", 0.0);
             let half_w = self.ortho_height * self.aspect_ratio * 0.5;
             let half_h = self.ortho_height * 0.5;
             let (ax, ay) = anchor_origin(anchor_name, half_w, half_h);
@@ -1285,7 +1208,6 @@ impl SceneRenderer {
             sprite2d_collected.extend(glyphs);
         }
 
-        let _ = entity_id; // used for future selection support
         true
     }
 
@@ -1296,22 +1218,17 @@ impl SceneRenderer {
         tex_cache: &TextureCache,
         world: &FlintWorld,
         entity_id: flint_core::EntityId,
-        visual: &super::ArchetypeVisual,
+        visual: &flint_schema::ArchetypeVisual,
         model_matrix: [[f32; 4]; 4],
         need_overlay: bool,
         need_normals: bool,
         arrow_length: f32,
     ) {
-        // Fall back to procedural shapes
-        let (size, bounds_center) = if let Some(components) = world.get_components(entity_id) {
-            if let Some(bounds) = components.get(comp::BOUNDS) {
-                extract_bounds_info(bounds).unwrap_or((visual.default_size, [0.0, 0.0, 0.0]))
-            } else {
-                (visual.default_size, [0.0, 0.0, 0.0])
-            }
-        } else {
-            (visual.default_size, [0.0, 0.0, 0.0])
-        };
+        // The entity's `bounds` box (the caller draws only entities that
+        // have one); a `min` or `max` that isn't three numbers is a unit box
+        // about the origin, which the archetype no longer sizes (#751)
+        let (size, bounds_center) = extract_bounds_info(&world.view(entity_id, comp::BOUNDS))
+            .unwrap_or(([1.0, 1.0, 1.0], [0.0, 0.0, 0.0]));
 
         // The box geometry is uploaded once per distinct size/colour/wireframe
         // and shared; the CPU-side mesh is only built for the debug overlays.
@@ -1372,31 +1289,16 @@ impl SceneRenderer {
         };
 
         // Check for material.texture to use file-based textures on procedural geometry
-        let material_component = world
-            .get_components(entity_id)
-            .and_then(|components| components.get(comp::MATERIAL).cloned());
-
-        let material_texture = material_component
-            .as_ref()
-            .and_then(|m| m.get("texture").and_then(|v| v.as_str().map(String::from)));
+        // Through the typed view (ADR 0115): a wrong type or an unknown
+        // blend mode reads as the default and is reported once
+        let material_component = world.view(entity_id, comp::MATERIAL);
+        let material_texture = material_component.opt_str("texture").map(String::from);
 
         // Extract opacity and blend_mode for procedural geometry
-        let proc_opacity = material_component
-            .as_ref()
-            .and_then(|m| m.get("opacity"))
-            .and_then(toml_f32)
-            .unwrap_or(1.0);
-        let proc_texture_scale = material_component
-            .as_ref()
-            .and_then(|m| m.get("texture_scale"))
-            .and_then(toml_f32)
-            .unwrap_or(1.0);
-        let proc_blend_mode_str = material_component
-            .as_ref()
-            .and_then(|m| m.get("blend_mode"))
-            .and_then(|v| v.as_str().map(String::from))
-            .unwrap_or_default();
-        let proc_blend_mode = parse_blend_mode(&proc_blend_mode_str);
+        let proc_opacity = material_component.f32("opacity", 1.0);
+        let proc_texture_scale = material_component.f32("texture_scale", 1.0);
+        let proc_blend_mode =
+            parse_blend_mode(material_component.choice("blend_mode", BLEND_MODES, "alpha"));
         let proc_is_transparent = proc_opacity < 1.0 || proc_blend_mode != BlendMode::Alpha;
         let casts_shadow = Self::ecs_casts_shadow(world, entity_id);
 
@@ -1409,16 +1311,8 @@ impl SceneRenderer {
                 );
 
                 if has_bc {
-                    let metallic = material_component
-                        .as_ref()
-                        .and_then(|m| m.get("metallic"))
-                        .and_then(toml_f32)
-                        .unwrap_or(0.0);
-                    let roughness = material_component
-                        .as_ref()
-                        .and_then(|m| m.get("roughness"))
-                        .and_then(toml_f32)
-                        .unwrap_or(0.7);
+                    let metallic = material_component.f32("metallic", 0.0);
+                    let roughness = material_component.f32("roughness", 0.7);
 
                     // Try companion PBR maps (e.g. tavern_brick_normal, tavern_brick_roughness)
                     let normal_name = format!("{}_normal", tex_name);
@@ -1441,6 +1335,7 @@ impl SceneRenderer {
                     material_uniforms.has_metallic_roughness_tex = if has_mr { 1 } else { 0 };
                     material_uniforms.opacity = proc_opacity;
                     material_uniforms.texture_scale = proc_texture_scale;
+                    Self::apply_box_emission(world, entity_id, &mut material_uniforms);
                     Self::apply_unlit(world, entity_id, &mut material_uniforms);
 
                     let material_key = hash_parts(&[
@@ -1470,18 +1365,17 @@ impl SceneRenderer {
                         binds,
                         model,
                         inv_transpose,
-                        entity_id,
-                        proc_blend_mode,
                     );
-                    draw.casts_shadow = casts_shadow;
                     draw.style_aabb = box_aabb;
-                    if proc_is_transparent {
-                        self.transparent_draws.push(draw);
-                    } else {
-                        self.entity_draws.push(draw);
-                    }
+                    self.draws.push(DrawItem::new(
+                        Some(entity_id),
+                        Blend::of_mesh(proc_is_transparent, proc_blend_mode),
+                        casts_shadow,
+                        Draw::Static(draw),
+                    ));
                 } else {
                     let mut material_uniforms = MaterialUniforms::procedural();
+                    Self::apply_box_emission(world, entity_id, &mut material_uniforms);
                     Self::apply_unlit(world, entity_id, &mut material_uniforms);
                     let material_key =
                         hash_parts(&[b"procedural", bytemuck::bytes_of(&material_uniforms)]);
@@ -1507,37 +1401,29 @@ impl SceneRenderer {
                         binds,
                         model,
                         inv_transpose,
-                        entity_id,
-                        BlendMode::Alpha,
                     );
-                    draw.casts_shadow = casts_shadow;
                     draw.style_aabb = box_aabb;
-                    self.entity_draws.push(draw);
+                    self.draws.push(DrawItem::new(
+                        Some(entity_id),
+                        Blend::Opaque,
+                        casts_shadow,
+                        Draw::Static(draw),
+                    ));
                 }
             } else {
                 // Use material.color for PBR base color if present
-                let mat_color = material_component
-                    .as_ref()
-                    .and_then(|m| m.get("color"))
-                    .and_then(|v| extract_color(v));
+                let mat_color = material_component.opt_color("color");
 
                 let mut mat_uniforms = if let Some(color) = mat_color {
-                    let metallic = material_component
-                        .as_ref()
-                        .and_then(|m| m.get("metallic"))
-                        .and_then(toml_f32)
-                        .unwrap_or(0.0);
-                    let roughness = material_component
-                        .as_ref()
-                        .and_then(|m| m.get("roughness"))
-                        .and_then(toml_f32)
-                        .unwrap_or(0.7);
+                    let metallic = material_component.f32("metallic", 0.0);
+                    let roughness = material_component.f32("roughness", 0.7);
                     MaterialUniforms::from_pbr(color, metallic, roughness)
                 } else {
                     MaterialUniforms::procedural()
                 };
                 mat_uniforms.opacity = proc_opacity;
                 mat_uniforms.texture_scale = proc_texture_scale;
+                Self::apply_box_emission(world, entity_id, &mut mat_uniforms);
                 Self::apply_unlit(world, entity_id, &mut mat_uniforms);
 
                 let material_key = hash_parts(&[b"colour", bytemuck::bytes_of(&mat_uniforms)]);
@@ -1563,16 +1449,14 @@ impl SceneRenderer {
                     binds,
                     model,
                     inv_transpose,
-                    entity_id,
-                    proc_blend_mode,
                 );
-                draw.casts_shadow = casts_shadow;
                 draw.style_aabb = box_aabb;
-                if proc_is_transparent {
-                    self.transparent_draws.push(draw);
-                } else {
-                    self.entity_draws.push(draw);
-                }
+                self.draws.push(DrawItem::new(
+                    Some(entity_id),
+                    Blend::of_mesh(proc_is_transparent, proc_blend_mode),
+                    casts_shadow,
+                    Draw::Static(draw),
+                ));
             }
         } else {
             let material_uniforms = MaterialUniforms::procedural();
@@ -1599,10 +1483,13 @@ impl SceneRenderer {
                 binds,
                 model,
                 inv_transpose,
-                entity_id,
-                BlendMode::Alpha,
             );
-            self.entity_draws.push(draw);
+            self.draws.push(DrawItem::new(
+                Some(entity_id),
+                Blend::Opaque,
+                true,
+                Draw::Static(draw),
+            ));
         }
 
         // Debug overlays are rebuilt every frame; they only exist in the
@@ -1706,20 +1593,22 @@ impl SceneRenderer {
                 .map(|(_, _, inst)| *inst)
                 .collect();
 
-            let instance_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("Sprite2D Instance Buffer"),
-                contents: bytemuck::cast_slice(&instances),
-                usage: wgpu::BufferUsages::STORAGE,
-            });
+            let instance_buffer =
+                device.create_buffer_init_counted(&wgpu::util::BufferInitDescriptor {
+                    label: Some("Sprite2D Instance Buffer"),
+                    contents: bytemuck::cast_slice(&instances),
+                    usage: wgpu::BufferUsages::STORAGE,
+                });
 
-            let instance_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                layout: &sp.instance_bind_group_layout,
-                entries: &[wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: instance_buffer.as_entire_binding(),
-                }],
-                label: Some("Sprite2D Instance Bind Group"),
-            });
+            let instance_bind_group =
+                device.create_bind_group_counted(&wgpu::BindGroupDescriptor {
+                    layout: &sp.instance_bind_group_layout,
+                    entries: &[wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: instance_buffer.as_entire_binding(),
+                    }],
+                    label: Some("Sprite2D Instance Bind Group"),
+                });
 
             // Resolve texture
             let (tex_view, tex_sampler, _) = Self::resolve_texture(
@@ -1732,7 +1621,7 @@ impl SceneRenderer {
                 &tex_cache.default_white,
             );
 
-            let texture_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            let texture_bind_group = device.create_bind_group_counted(&wgpu::BindGroupDescriptor {
                 layout: &sp.texture_bind_group_layout,
                 entries: &[
                     wgpu::BindGroupEntry {
@@ -1770,6 +1659,47 @@ mod tests {
         let data: toml::Value = toml::from_str(text).unwrap();
         world.set_component(id, comp::MATERIAL, data).unwrap();
         (world, id)
+    }
+
+    /// #797: a bounds box's `material.emissive` is its light, times
+    /// `emissive_scale`; unset leaves the uniforms' bytes as they were, so a
+    /// box without it keeps its cached material and draws as before.
+    #[test]
+    fn a_box_gives_off_its_emissive_and_none_when_unset() {
+        let emission = |text: &str| {
+            let (world, id) = world_with_material(text);
+            let mut uniforms = MaterialUniforms::procedural();
+            SceneRenderer::apply_box_emission(&world, id, &mut uniforms);
+            assert!(world.read_reports().is_empty(), "{text}");
+            uniforms
+        };
+        assert_eq!(
+            emission("emissive = [9, 6, 2.5]").emissive,
+            [9.0, 6.0, 2.5, 0.0]
+        );
+        assert_eq!(
+            emission("emissive = [2.0, 1.0, 0.5]\nemissive_scale = 0.5").emissive,
+            [1.0, 0.5, 0.25, 0.0]
+        );
+        assert_eq!(
+            emission("emissive = [1.0, -1.0, 0.0, 1.0]").emissive,
+            [1.0, 0.0, 0.0, 0.0],
+            "a fourth number is ignored, a negative one is no light"
+        );
+        let plain = MaterialUniforms::procedural();
+        for text in ["roughness = 0.8", "emissive_scale = 3.0"] {
+            assert_eq!(
+                bytemuck::bytes_of(&emission(text)),
+                bytemuck::bytes_of(&plain),
+                "{text}"
+            );
+        }
+        // A wrong type is no light, reported once
+        let (world, id) = world_with_material("emissive = \"bright\"");
+        let mut uniforms = MaterialUniforms::procedural();
+        SceneRenderer::apply_box_emission(&world, id, &mut uniforms);
+        assert_eq!(uniforms.emissive, [0.0; 4]);
+        assert_eq!(world.read_reports().len(), 1);
     }
 
     /// #685: each channel was read with `as_float`, so one integer channel
@@ -1842,6 +1772,76 @@ mod tests {
         assert_eq!(
             SceneRenderer::ecs_base_color_override(&world, id),
             Some([0.1, 0.9, 0.1, 1.0])
+        );
+    }
+
+    /// Each reader's allowed values are its schema's `values` (#802): the
+    /// two lists are written twice, so this holds them together.
+    #[test]
+    #[allow(clippy::disallowed_methods)] // a test reads the checkout's schema files
+    fn each_readers_choices_are_its_schemas_values() {
+        use crate::bitmap_font::{FILL_DIRECTIONS, SCREEN_ANCHORS, SPRITE_MODES, TEXT_ALIGNS};
+        let schemas = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../schemas");
+        let values = |component: &str, field: &str| -> Vec<String> {
+            let file = schemas.join(format!("components/{component}.toml"));
+            let text = std::fs::read_to_string(&file).unwrap();
+            let doc: toml::Table = toml::from_str(&text).unwrap();
+            doc["component"][component]["fields"][field]["values"]
+                .as_array()
+                .unwrap_or_else(|| panic!("{component}.{field} lists no values"))
+                .iter()
+                .map(|v| v.as_str().unwrap().to_string())
+                .collect()
+        };
+        for (component, field, reader) in [
+            (comp::SPRITE, "mode", SPRITE_MODES),
+            (comp::MATERIAL, "blend_mode", BLEND_MODES),
+            (comp::SCREEN_ANCHOR, "anchor", SCREEN_ANCHORS),
+            (comp::UI_FILL, "direction", FILL_DIRECTIONS),
+            (comp::UI_TEXT, "align", TEXT_ALIGNS),
+        ] {
+            assert_eq!(
+                values(component, field),
+                reader,
+                "{component}.{field}: the schema's values and the reader's differ"
+            );
+        }
+    }
+
+    #[test]
+    fn material_flags_and_lod_report_a_wrong_type_once_and_fall_to_the_parent() {
+        let (mut world, child) = world_with_material("cast_shadows = \"no\"\nunlit = 1");
+        let parent = world.spawn("shelf").unwrap();
+        let data: toml::Value = toml::from_str("cast_shadows = false").unwrap();
+        world.set_component(parent, comp::MATERIAL, data).unwrap();
+        world.set_parent(child, parent).unwrap();
+        let lod: toml::Value = toml::from_str("draw_distance = \"far\"").unwrap();
+        world.set_component(child, "lod", lod).unwrap();
+        for _ in 0..3 {
+            // A wrong value on the child is as if unset: the parent's is used
+            assert!(!SceneRenderer::ecs_casts_shadow(&world, child));
+            assert!(!SceneRenderer::ecs_unlit(&world, child));
+            assert_eq!(SceneRenderer::ecs_draw_distance(&world, child), None);
+        }
+        let said: Vec<String> = world
+            .read_reports()
+            .snapshot()
+            .iter()
+            .map(|d| {
+                format!(
+                    "{}.{}",
+                    d.component.as_deref().unwrap(),
+                    d.field.as_deref().unwrap()
+                )
+            })
+            .collect();
+        assert_eq!(
+            said,
+            [
+                "material.cast_shadows",
+                "material.unlit",
+                "lod.draw_distance"
+            ]
         );
     }
 

@@ -6,6 +6,8 @@
 use super::dev_shader;
 pub(crate) use super::dev_shader::wgsl;
 pub use super::dev_shader::Wgsl;
+use crate::gpu_counts::CountedDevice;
+use crate::TrustedShader;
 
 /// A fragment-stage uniform buffer at binding 0.
 pub fn uniform_layout(device: &wgpu::Device, label: &str) -> wgpu::BindGroupLayout {
@@ -95,62 +97,149 @@ pub fn uint_layout(device: &wgpu::Device, label: &str) -> wgpu::BindGroupLayout 
 
 /// A pipeline drawing one full-screen triangle with `module`'s `vs_main`
 /// and `fs_main` into `format`, unblended.
-pub fn fullscreen_pipeline(
+///
+/// Returned as the caller's own `wgpu::RenderPipeline`, or as an
+/// `Arc<wgpu::RenderPipeline>` that a style's `create` may share with the
+/// next renderer on the device while [`crate::pipeline_cache`] is on
+/// (#911): the type it is stored as picks which ([`KitPipeline`]). Only a
+/// [`shader`]'s module is shared, since its text is the key.
+pub fn fullscreen_pipeline<P: KitPipeline>(
     device: &wgpu::Device,
     label: &str,
-    module: &wgpu::ShaderModule,
+    module: &impl ShaderText,
     layouts: &[&wgpu::BindGroupLayout],
     format: wgpu::TextureFormat,
-) -> wgpu::RenderPipeline {
+) -> P {
     fullscreen_pipeline_with(device, label, module, "fs_main", layouts, format, None)
 }
 
 /// [`fullscreen_pipeline`] with the fragment entry point `fragment`, for a
 /// module that has more than one.
-pub fn fullscreen_pipeline_entry(
+pub fn fullscreen_pipeline_entry<P: KitPipeline>(
     device: &wgpu::Device,
     label: &str,
-    module: &wgpu::ShaderModule,
+    module: &impl ShaderText,
     fragment: &str,
     layouts: &[&wgpu::BindGroupLayout],
     format: wgpu::TextureFormat,
-) -> wgpu::RenderPipeline {
+) -> P {
     fullscreen_pipeline_entry_targets(device, label, module, fragment, layouts, &[format], None)
 }
 
 /// [`fullscreen_pipeline_entry`] with a blend: a style with several passes
 /// in one module (a bloom chain's threshold, downsample, additive upsample
 /// and composite, #321).
-pub fn fullscreen_pipeline_with(
+pub fn fullscreen_pipeline_with<P: KitPipeline>(
     device: &wgpu::Device,
     label: &str,
-    module: &wgpu::ShaderModule,
+    module: &impl ShaderText,
     fragment: &str,
     layouts: &[&wgpu::BindGroupLayout],
     format: wgpu::TextureFormat,
     blend: Option<wgpu::BlendState>,
-) -> wgpu::RenderPipeline {
+) -> P {
     fullscreen_pipeline_entry_targets(device, label, module, fragment, layouts, &[format], blend)
 }
 
 /// [`fullscreen_pipeline`] writing one target per format, `fs_main`'s
 /// `@location(i)` into the i-th (#313).
-pub fn fullscreen_pipeline_targets(
+pub fn fullscreen_pipeline_targets<P: KitPipeline>(
     device: &wgpu::Device,
     label: &str,
-    module: &wgpu::ShaderModule,
+    module: &impl ShaderText,
     layouts: &[&wgpu::BindGroupLayout],
     formats: &[wgpu::TextureFormat],
-) -> wgpu::RenderPipeline {
+) -> P {
     fullscreen_pipeline_entry_targets(device, label, module, "fs_main", layouts, formats, None)
 }
 
-/// The full-screen pipelines' one maker: entry point `fragment`, a target
-/// per format, each with `blend`.
-fn fullscreen_pipeline_entry_targets(
+/// [`fullscreen_pipeline`] with the vertex entry point `vertex`, for a
+/// pass whose vertex stage hands the fragment more than the position: the
+/// instance index of [`fullscreen_pass_instances_in`], say (#929). It
+/// still draws the full-screen triangle (vertices 0..3).
+pub fn fullscreen_pipeline_vertex<P: KitPipeline>(
+    device: &wgpu::Device,
+    label: &str,
+    module: &impl ShaderText,
+    vertex: &str,
+    layouts: &[&wgpu::BindGroupLayout],
+    format: wgpu::TextureFormat,
+) -> P {
+    fullscreen_pipeline_stages(
+        device,
+        label,
+        module,
+        vertex,
+        "fs_main",
+        layouts,
+        &[format],
+        None,
+    )
+}
+
+/// The full-screen pipelines' maker with `vs_main`: entry point
+/// `fragment`, a target per format, each with `blend`.
+fn fullscreen_pipeline_entry_targets<P: KitPipeline>(
+    device: &wgpu::Device,
+    label: &str,
+    module: &impl ShaderText,
+    fragment: &str,
+    layouts: &[&wgpu::BindGroupLayout],
+    formats: &[wgpu::TextureFormat],
+    blend: Option<wgpu::BlendState>,
+) -> P {
+    fullscreen_pipeline_stages(
+        device, label, module, "vs_main", fragment, layouts, formats, blend,
+    )
+}
+
+/// The full-screen pipelines' one maker.
+#[allow(clippy::too_many_arguments)]
+fn fullscreen_pipeline_stages<P: KitPipeline>(
+    device: &wgpu::Device,
+    label: &str,
+    module: &impl ShaderText,
+    vertex: &str,
+    fragment: &str,
+    layouts: &[&wgpu::BindGroupLayout],
+    formats: &[wgpu::TextureFormat],
+    blend: Option<wgpu::BlendState>,
+) -> P {
+    // Everything but the layouts' entries, which the style's scope stands
+    // for (`pipeline_cache::in_scope`): one create makes the same ones. The
+    // vertex entry is named only when it isn't `vs_main`
+    let stages = if vertex == "vs_main" {
+        fragment.to_string()
+    } else {
+        format!("{vertex}>{fragment}")
+    };
+    let key = module.text().map(|text| {
+        format!(
+            "{label}|{}|{stages}|{formats:?}|{blend:?}|{} layouts",
+            crate::pipeline_cache::text_key(text),
+            layouts.len()
+        )
+    });
+    P::make(device, label, key, || {
+        build_fullscreen(
+            device,
+            label,
+            module.module(),
+            vertex,
+            fragment,
+            layouts,
+            formats,
+            blend,
+        )
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_fullscreen(
     device: &wgpu::Device,
     label: &str,
     module: &wgpu::ShaderModule,
+    vertex: &str,
     fragment: &str,
     layouts: &[&wgpu::BindGroupLayout],
     formats: &[wgpu::TextureFormat],
@@ -168,15 +257,15 @@ fn fullscreen_pipeline_entry_targets(
         .collect();
     let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some(label),
-        bind_group_layouts: layouts,
-        push_constant_ranges: &[],
+        bind_group_layouts: &layouts.iter().copied().map(Some).collect::<Vec<_>>(),
+        immediate_size: 0,
     });
-    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+    device.create_render_pipeline_counted(&wgpu::RenderPipelineDescriptor {
         label: Some(label),
         layout: Some(&layout),
         vertex: wgpu::VertexState {
             module,
-            entry_point: Some("vs_main"),
+            entry_point: Some(vertex),
             buffers: &[],
             compilation_options: Default::default(),
         },
@@ -192,24 +281,128 @@ fn fullscreen_pipeline_entry_targets(
         },
         depth_stencil: None,
         multisample: wgpu::MultisampleState::default(),
-        multiview: None,
+        multiview_mask: None,
         cache: None,
     })
+}
+
+/// What a kit pipeline function returns (#911): a `wgpu::RenderPipeline`
+/// of the caller's own, always built, or an `Arc<wgpu::RenderPipeline>`,
+/// which a style's `create` keeps for the next renderer on the device
+/// while [`crate::pipeline_cache`] is on. The built-in styles store the
+/// `Arc`; a game's style that stores the pipeline itself builds as before.
+pub trait KitPipeline: Sized {
+    /// Build with `build`, or take the pipeline kept under `key` (the
+    /// module's text and the rest; `None` for a module with no text).
+    #[doc(hidden)]
+    fn make(
+        device: &wgpu::Device,
+        label: &str,
+        key: Option<String>,
+        build: impl FnOnce() -> wgpu::RenderPipeline,
+    ) -> Self;
+}
+
+impl KitPipeline for wgpu::RenderPipeline {
+    fn make(
+        _device: &wgpu::Device,
+        label: &str,
+        _key: Option<String>,
+        build: impl FnOnce() -> wgpu::RenderPipeline,
+    ) -> Self {
+        crate::pipeline_cache::built(label);
+        crate::pipeline_cache::timed(label, build)
+    }
+}
+
+impl KitPipeline for std::sync::Arc<wgpu::RenderPipeline> {
+    fn make(
+        device: &wgpu::Device,
+        label: &str,
+        key: Option<String>,
+        build: impl FnOnce() -> wgpu::RenderPipeline,
+    ) -> Self {
+        match key {
+            Some(key) => crate::pipeline_cache::scoped(device, label, key, build),
+            None => {
+                crate::pipeline_cache::built(label);
+                std::sync::Arc::new(crate::pipeline_cache::timed(label, build))
+            }
+        }
+    }
+}
+
+/// A shader module and the WGSL it was made from: what [`shader`] returns.
+/// It derefs to the `wgpu::ShaderModule`; the text is what a shared
+/// pipeline is keyed by (#911), so a swapped shader file is a new key.
+pub struct Shader {
+    module: wgpu::ShaderModule,
+    text: std::borrow::Cow<'static, str>,
+}
+
+impl Shader {
+    /// The WGSL the module was made from.
+    pub fn text(&self) -> &str {
+        &self.text
+    }
+
+    /// The module alone, for a field of type `wgpu::ShaderModule`.
+    pub fn into_module(self) -> wgpu::ShaderModule {
+        self.module
+    }
+}
+
+impl std::ops::Deref for Shader {
+    type Target = wgpu::ShaderModule;
+
+    fn deref(&self) -> &wgpu::ShaderModule {
+        &self.module
+    }
+}
+
+/// A module a kit pipeline function takes: a [`Shader`], which a shared
+/// pipeline is keyed by, or a bare `wgpu::ShaderModule`, never shared.
+pub trait ShaderText {
+    fn module(&self) -> &wgpu::ShaderModule;
+    /// The WGSL the module was made from, when it is known.
+    fn text(&self) -> Option<&str>;
+}
+
+impl ShaderText for wgpu::ShaderModule {
+    fn module(&self) -> &wgpu::ShaderModule {
+        self
+    }
+
+    fn text(&self) -> Option<&str> {
+        None
+    }
+}
+
+impl ShaderText for Shader {
+    fn module(&self) -> &wgpu::ShaderModule {
+        &self.module
+    }
+
+    fn text(&self) -> Option<&str> {
+        Some(&self.text)
+    }
 }
 
 /// A WGSL module: a [`wgsl!`] (or a bare string). With
 /// `FLINT_STYLE_SHADER_DIR` set, natively, a [`wgsl!`]'s files are read
 /// from that folder instead and hot-reload (#418, [`dev_shader`]).
-pub fn shader(device: &wgpu::Device, label: &str, source: impl Into<Wgsl>) -> wgpu::ShaderModule {
-    device.create_shader_module(wgpu::ShaderModuleDescriptor {
+pub fn shader(device: &wgpu::Device, label: &str, source: impl Into<Wgsl>) -> Shader {
+    let text = dev_shader::source(label, source.into());
+    let module = device.create_trusted_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some(label),
-        source: wgpu::ShaderSource::Wgsl(dev_shader::source(label, source.into())),
-    })
+        source: wgpu::ShaderSource::Wgsl(text.clone()),
+    });
+    Shader { module, text }
 }
 
 /// A uniform buffer the size of `T`, written with `queue.write_buffer`.
 pub fn uniform_buffer<T>(device: &wgpu::Device, label: &str) -> wgpu::Buffer {
-    device.create_buffer(&wgpu::BufferDescriptor {
+    device.create_buffer_counted(&wgpu::BufferDescriptor {
         label: Some(label),
         size: std::mem::size_of::<T>() as u64,
         usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
@@ -245,12 +438,27 @@ pub fn fullscreen_pass_targets(
     pipeline: &wgpu::RenderPipeline,
     groups: &[&wgpu::BindGroup],
 ) {
+    fullscreen_pass_targets_in(encoder, label, targets, pipeline, groups, None);
+}
+
+/// [`fullscreen_pass_targets`] drawn only inside `rects` (each already
+/// inside the targets; empty ones skipped), the rest left cleared; `None`
+/// draws everything.
+pub fn fullscreen_pass_targets_in(
+    encoder: &mut wgpu::CommandEncoder,
+    label: &str,
+    targets: &[&wgpu::TextureView],
+    pipeline: &wgpu::RenderPipeline,
+    groups: &[&wgpu::BindGroup],
+    rects: Option<&[PixelRect]>,
+) {
     let attachments: Vec<Option<wgpu::RenderPassColorAttachment>> = targets
         .iter()
         .map(|view| {
             Some(wgpu::RenderPassColorAttachment {
                 view,
                 resolve_target: None,
+                depth_slice: None,
                 ops: wgpu::Operations {
                     load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
                     store: wgpu::StoreOp::Store,
@@ -264,12 +472,66 @@ pub fn fullscreen_pass_targets(
         depth_stencil_attachment: None,
         timestamp_writes: None,
         occlusion_query_set: None,
+        multiview_mask: None,
     });
+    if rects.is_some_and(|r| r.iter().all(PixelRect::is_empty)) {
+        return;
+    }
     pass.set_pipeline(pipeline);
     for (i, group) in groups.iter().enumerate() {
         pass.set_bind_group(i as u32, *group, &[]);
     }
-    pass.draw(0..3, 0..1);
+    match rects {
+        None => pass.draw(0..3, 0..1),
+        Some(rects) => {
+            for r in rects.iter().filter(|r| !r.is_empty()) {
+                pass.set_scissor_rect(r.x, r.y, r.width, r.height);
+                pass.draw(0..3, 0..1);
+            }
+        }
+    }
+}
+
+/// One target, cleared to black first, drawn only inside each of `draws`'
+/// rects (empty ones skipped) with its instance index: a pass whose
+/// pipeline ([`fullscreen_pipeline_vertex`]) hands the instance to the
+/// fragment, so each rect is told what it holds (#929: a snapping grid's
+/// band, by its first variant's slot).
+pub fn fullscreen_pass_instances_in(
+    encoder: &mut wgpu::CommandEncoder,
+    label: &str,
+    target: &wgpu::TextureView,
+    pipeline: &wgpu::RenderPipeline,
+    groups: &[&wgpu::BindGroup],
+    draws: &[(PixelRect, u32)],
+) {
+    let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+        label: Some(label),
+        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+            view: target,
+            resolve_target: None,
+            depth_slice: None,
+            ops: wgpu::Operations {
+                load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                store: wgpu::StoreOp::Store,
+            },
+        })],
+        depth_stencil_attachment: None,
+        timestamp_writes: None,
+        occlusion_query_set: None,
+        multiview_mask: None,
+    });
+    if draws.iter().all(|(r, _)| r.is_empty()) {
+        return;
+    }
+    pass.set_pipeline(pipeline);
+    for (i, group) in groups.iter().enumerate() {
+        pass.set_bind_group(i as u32, *group, &[]);
+    }
+    for (r, instance) in draws.iter().filter(|(r, _)| !r.is_empty()) {
+        pass.set_scissor_rect(r.x, r.y, r.width, r.height);
+        pass.draw(0..3, *instance..*instance + 1);
+    }
 }
 
 /// A rectangle of a target in whole pixels, from the top left: where a
@@ -428,7 +690,7 @@ impl PixelRect {
 /// own input layout (a [`sampled_layout`]), so the style's input bind
 /// group binds it.
 pub struct Blit {
-    pipeline: wgpu::RenderPipeline,
+    pipeline: std::sync::Arc<wgpu::RenderPipeline>,
 }
 
 impl Blit {
@@ -471,6 +733,32 @@ pub fn scissored_pass(
     blit: &Blit,
     input: &wgpu::BindGroup,
 ) {
+    scissored_pass_around(
+        encoder,
+        label,
+        target,
+        size,
+        (pipeline, groups),
+        rect,
+        (&blit.pipeline, &[input]),
+    );
+}
+
+/// [`scissored_pass`] whose bands around `rect` are drawn by `around`, a
+/// pipeline and its bind groups, rather than a [`Blit`] (#538). For a style
+/// whose passthrough isn't a `textureLoad` of the pixel (watercolor samples
+/// its input; a user style's goes through its epilogue): `around` is that
+/// passthrough itself, an entry point of the same text over the same
+/// vertex stage, so the bands are its bytes by construction.
+pub fn scissored_pass_around(
+    encoder: &mut wgpu::CommandEncoder,
+    label: &str,
+    target: &wgpu::TextureView,
+    size: [u32; 2],
+    (pipeline, groups): (&wgpu::RenderPipeline, &[&wgpu::BindGroup]),
+    rect: Option<PixelRect>,
+    (around, around_groups): (&wgpu::RenderPipeline, &[&wgpu::BindGroup]),
+) {
     let [width, height] = size;
     let rect = match rect.map(|r| r.clamp_to(width, height)) {
         Some(r) if !r.covers(width, height) => r,
@@ -481,6 +769,7 @@ pub fn scissored_pass(
         color_attachments: &[Some(wgpu::RenderPassColorAttachment {
             view: target,
             resolve_target: None,
+            depth_slice: None,
             ops: wgpu::Operations {
                 load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
                 store: wgpu::StoreOp::Store,
@@ -489,9 +778,12 @@ pub fn scissored_pass(
         depth_stencil_attachment: None,
         timestamp_writes: None,
         occlusion_query_set: None,
+        multiview_mask: None,
     });
-    pass.set_pipeline(&blit.pipeline);
-    pass.set_bind_group(0, input, &[]);
+    pass.set_pipeline(around);
+    for (i, group) in around_groups.iter().enumerate() {
+        pass.set_bind_group(i as u32, *group, &[]);
+    }
     for band in rect.outside(width, height) {
         pass.set_scissor_rect(band.x, band.y, band.width, band.height);
         pass.draw(0..3, 0..1);
@@ -528,6 +820,7 @@ pub fn fullscreen_pass_in(
         color_attachments: &[Some(wgpu::RenderPassColorAttachment {
             view: target,
             resolve_target: None,
+            depth_slice: None,
             ops: wgpu::Operations {
                 load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
                 store: wgpu::StoreOp::Store,
@@ -536,6 +829,7 @@ pub fn fullscreen_pass_in(
         depth_stencil_attachment: None,
         timestamp_writes: None,
         occlusion_query_set: None,
+        multiview_mask: None,
     });
     if rect.is_empty() {
         return;

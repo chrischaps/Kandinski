@@ -18,8 +18,13 @@ pub(super) enum TransitionPhase {
     Idle,
     /// Playing exit transition — scripts draw fade-out visuals
     Exiting { target_scene: String, elapsed: f32 },
-    /// Loading the new scene (synchronous, happens in one frame)
-    Loading { target_scene: String },
+    /// Loading the new scene (synchronous, happens in one frame).
+    /// `covered`: a script ended the Exiting phase with
+    /// `complete_transition()`, so the load's long frame is drawn under its
+    /// fade and its hitch is counted as `loading` (#1125). A transition no
+    /// script covers (it goes straight through) or one the timeout ended
+    /// is not: the player may see the stall.
+    Loading { target_scene: String, covered: bool },
     /// Playing enter transition — scripts draw fade-in visuals
     Entering { elapsed: f32 },
 }
@@ -57,10 +62,10 @@ impl PlayerApp {
                 let target = target_scene.clone();
                 let elapsed = elapsed + self.core.clock.delta_time as f32;
                 let over = if !self.core.script.can_complete_transition() {
-                    println!("[transition] No script completes transitions: loading now");
+                    tracing::info!(target: "transition", "No script completes transitions: loading now");
                     true
                 } else if elapsed >= TRANSITION_PHASE_TIMEOUT {
-                    tracing::warn!(
+                    tracing::warn!(target: "transition",
                         "[transition] still exiting after {TRANSITION_PHASE_TIMEOUT} s with no \
                          complete_transition() from a script: loading {target} now"
                     );
@@ -71,8 +76,11 @@ impl PlayerApp {
                 if over {
                     // Loaded this frame, as a script's complete_transition
                     // last frame would have it
+                    // No cover: nothing drew one, or nothing said it was
+                    // drawn
                     self.transition_phase = TransitionPhase::Loading {
                         target_scene: target,
+                        covered: false,
                     };
                     self.advance_transition();
                 } else {
@@ -82,8 +90,14 @@ impl PlayerApp {
                     };
                 }
             }
-            TransitionPhase::Loading { target_scene } => {
+            TransitionPhase::Loading {
+                target_scene,
+                covered,
+            } => {
                 let target = target_scene.clone();
+                if *covered {
+                    self.stats.perf.loading_behind_cover();
+                }
                 // Either way the scripts fade back in: over the new scene,
                 // or over this one when the next didn't load (#723)
                 self.execute_scene_transition(&target);
@@ -91,7 +105,7 @@ impl PlayerApp {
                 self.transition_phase = if self.core.script.can_complete_transition() {
                     TransitionPhase::Entering { elapsed: 0.0 }
                 } else {
-                    println!("[transition] Transition complete");
+                    tracing::info!(target: "transition", "Transition complete");
                     TransitionPhase::Idle
                 };
             }
@@ -99,10 +113,10 @@ impl PlayerApp {
                 let elapsed = elapsed + self.core.clock.delta_time as f32;
                 self.transition_phase = if !self.core.script.can_complete_transition() {
                     // A hot reload took the call out
-                    println!("[transition] Transition complete");
+                    tracing::info!(target: "transition", "Transition complete");
                     TransitionPhase::Idle
                 } else if elapsed >= TRANSITION_PHASE_TIMEOUT {
-                    tracing::warn!(
+                    tracing::warn!(target: "transition",
                         "[transition] still entering after {TRANSITION_PHASE_TIMEOUT} s with no \
                          complete_transition() from a script: ending the transition"
                     );
@@ -117,9 +131,20 @@ impl PlayerApp {
     /// Load a chunk TOML file as additional entities with offset.
     pub(super) fn load_chunk(&mut self, path: &str, offset_x: f32, offset_y: f32, chunk_id: &str) {
         if self.loaded_chunks.contains_key(chunk_id) {
-            tracing::warn!("Chunk '{}' already loaded, skipping", chunk_id);
+            tracing::warn!(target: "transition", "Chunk '{}' already loaded, skipping", chunk_id);
             return;
         }
+        flint_core::scope!("load_chunk", chunk_id);
+        // A chunk streamed in has a table of its own, unless it arrives
+        // inside another load (a scene's on_init), which it is part of
+        let own_report = self.launch.load_report && !flint_core::load_report::recording();
+        if own_report {
+            self.begin_load_report(flint_core::load_report::LoadKind::Chunk, chunk_id);
+        }
+        let _note =
+            flint_core::frame_notes::begin(flint_core::frame_notes::NoteKind::ChunkLoad, || {
+                format!("{chunk_id} ({path})")
+            });
 
         // A path the script names: found by the project's one search
         // (`AssetKind::Files`), from the scene's directory first. A miss is
@@ -131,14 +156,14 @@ impl PlayerApp {
         let content = match vfs::read_to_string(&chunk_path) {
             Ok(c) => c,
             Err(e) => {
-                tracing::error!("Failed to read chunk '{}': {}", chunk_path.display(), e);
+                tracing::error!(target: "transition", "Failed to read chunk '{}': {}", chunk_path.display(), e);
                 return;
             }
         };
         let scene_file: flint_scene::SceneFile = match toml::from_str(&content) {
             Ok(s) => s,
             Err(e) => {
-                tracing::error!("Failed to parse chunk '{}': {}", chunk_path.display(), e);
+                tracing::error!(target: "transition", "Failed to parse chunk '{}': {}", chunk_path.display(), e);
                 return;
             }
         };
@@ -160,7 +185,7 @@ impl PlayerApp {
             let id = match self.core.world.spawn(prefixed_name.clone()) {
                 Ok(id) => id,
                 Err(e) => {
-                    tracing::error!("Failed to spawn chunk entity '{}': {:?}", prefixed_name, e);
+                    tracing::error!(target: "transition", "Failed to spawn chunk entity '{}': {:?}", prefixed_name, e);
                     continue;
                 }
             };
@@ -168,8 +193,8 @@ impl PlayerApp {
 
             // Set archetype + defaults
             if let Some(archetype) = &entity_def.archetype {
-                if let Some(comps) = self.core.world.get_components_mut(id) {
-                    comps.archetype = Some(archetype.clone());
+                if let Some(mut comps) = self.core.world.get_components_mut(id) {
+                    comps.set_archetype(Some(archetype.clone()));
                     if let Some(arch_schema) = registry.get_archetype(archetype) {
                         for (comp_name, defaults) in &arch_schema.defaults {
                             if !comps.has(comp_name) {
@@ -193,7 +218,7 @@ impl PlayerApp {
                 let new_x = transform.position.x + offset_x;
                 let new_y = transform.position.y + offset_y;
                 let new_z = transform.position.z;
-                if let Some(comps) = self.core.world.get_components_mut(id) {
+                if let Some(mut comps) = self.core.world.get_components_mut(id) {
                     comps.set_field(
                         comp::TRANSFORM,
                         "position",
@@ -206,7 +231,7 @@ impl PlayerApp {
                 }
             } else {
                 // Entity has no transform yet — create one with the offset
-                if let Some(comps) = self.core.world.get_components_mut(id) {
+                if let Some(mut comps) = self.core.world.get_components_mut(id) {
                     comps.set_field(
                         comp::TRANSFORM,
                         "position",
@@ -220,7 +245,17 @@ impl PlayerApp {
             }
         }
 
-        // Re-sync physics for new entities
+        // Re-sync physics for new entities, the chunk's mesh colliders
+        // given their models' triangles first (#729)
+        let collider_meshes: Vec<_> = super::collider_meshes::requests(&self.core.world)
+            .into_iter()
+            .filter(|(id, _)| spawned_ids.contains(id))
+            .collect();
+        // The chunk's models (#1107), after the colliders have asked for
+        // their triangles (a model of several nodes leaves its parent with
+        // no `model`) and inside the chunk's note and load report
+        self.load_late_models();
+        self.prepare_physics(&collider_meshes);
         self.core
             .physics
             .sync_new_entities(&mut self.core.world, &spawned_ids);
@@ -237,8 +272,7 @@ impl PlayerApp {
         let sources: Vec<(flint_core::EntityId, String)> = spawned_ids
             .iter()
             .filter_map(|&id| {
-                let source = self.core.world.get_components(id)?.get(comp::SCRIPT)?;
-                let source = source.get("source")?.as_str()?;
+                let source = self.core.world.view(id, comp::SCRIPT).opt_str("source")?;
                 (!source.is_empty()).then(|| (id, source.to_string()))
             })
             .collect();
@@ -256,7 +290,9 @@ impl PlayerApp {
                 .load_script_named(id, &source, chunk_dir)
                 .or_else(|_| self.core.script.load_script_named(id, &source, scene_dir));
             match (&found, old) {
-                (Err(not_found), None) => tracing::warn!("chunk '{chunk_id}': {not_found}"),
+                (Err(not_found), None) => {
+                    tracing::warn!(target: "transition", "chunk '{chunk_id}': {not_found}")
+                }
                 (found, Some(old)) => {
                     let new = found.as_ref().ok().cloned();
                     if new.as_deref().map(flint_core::vfs::normalize)
@@ -280,14 +316,18 @@ impl PlayerApp {
             .script
             .initialize_entities(&mut self.core.world, &spawned_ids);
 
-        println!(
-            "[chunk] Loaded '{}' ({} entities) at offset ({}, {})",
+        tracing::info!(target: "transition", chunk = chunk_id, entities = spawned_ids.len(),
+            "Loaded chunk '{}' ({} entities) at offset ({}, {})",
             chunk_id,
             spawned_ids.len(),
             offset_x,
             offset_y
         );
         self.loaded_chunks.insert(chunk_id.to_string(), spawned_ids);
+        if own_report {
+            flint_core::load_report::set_name(chunk_id);
+            flint_core::load_report::bring_up_done();
+        }
     }
 
     /// Unload a previously loaded chunk by despawning all its entities.
@@ -299,9 +339,9 @@ impl PlayerApp {
                 self.core.script.remove_entity(*id);
                 let _ = self.core.world.despawn(*id);
             }
-            println!("[chunk] Unloaded '{}' ({} entities)", chunk_id, count);
+            tracing::info!(target: "transition", chunk = chunk_id, entities = count, "Unloaded chunk '{}' ({} entities)", chunk_id, count);
         } else {
-            tracing::warn!("Chunk '{}' not loaded, cannot unload", chunk_id);
+            tracing::warn!(target: "transition", "Chunk '{}' not loaded, cannot unload", chunk_id);
         }
     }
 
@@ -310,13 +350,32 @@ impl PlayerApp {
     /// it was read from and why, and makes the run end non-zero
     /// (`run_failure`, #723). Returns whether the new scene was entered.
     pub(super) fn execute_scene_transition(&mut self, target_scene: &str) -> bool {
-        let next = match self.read_scene(target_scene) {
+        flint_core::scope!("scene_transition", target_scene);
+        // Its load report, to the new scene's first frame (#1092)
+        self.begin_load_report(flint_core::load_report::LoadKind::Transition, target_scene);
+        // One frame does all of it: a frame note (#1077), with the models,
+        // textures, scripts and pipelines it loaded noted inside it
+        let _note = flint_core::frame_notes::begin(
+            flint_core::frame_notes::NoteKind::SceneTransition,
+            || target_scene.to_string(),
+        );
+        // The new scene's load summary counts from here (#716)
+        self.begin_load_count();
+        let read =
+            flint_core::frame_notes::begin(flint_core::frame_notes::NoteKind::SceneRead, || {
+                target_scene.to_string()
+            });
+        let next = self.read_scene(target_scene);
+        drop(read);
+        let next = match next {
             Ok(next) => next,
             Err(e) => {
-                tracing::error!("[transition] {e}; staying in {}", self.core.scene_path);
+                tracing::error!(target: "transition", "{e}; staying in {}", self.core.scene_path);
                 if self.outcome.scene_failure.is_none() {
                     self.outcome.scene_failure = Some(e);
                 }
+                // Nothing was loaded: no table for it
+                flint_core::load_report::abandon();
                 return false;
             }
         };
@@ -324,7 +383,11 @@ impl PlayerApp {
         // Teardown: scripts told, subsystems let go (the music's stems stop
         // BEFORE audio.clear(), ADR 0017's producer→handles→device order),
         // systems/world/terrain/transient render state cleared.
-        self.teardown_current_scene();
+        flint_core::frame_notes::timed(
+            flint_core::frame_notes::NoteKind::SceneTeardown,
+            String::new,
+            || self.teardown_current_scene(),
+        );
 
         // The outgoing scene's on_scene_exit has run: persist whatever it
         // (and the scene before it) stored, before the path changes.
@@ -334,14 +397,14 @@ impl PlayerApp {
 
         // The one bring-up startup uses too (`scene_entry.rs`)
         if let Err(e) = self.enter_scene(super::scene_entry::SceneEntry::Transition) {
-            tracing::warn!("[transition] {e:#}");
+            tracing::warn!(target: "transition", "{e:#}");
         }
-        println!("[transition] Scene loaded: {}", self.core.scene_path);
+        tracing::debug!(target: "transition", "Scene loaded: {}", self.core.scene_path);
         true
     }
 
     fn teardown_current_scene(&mut self) {
-        println!("[transition] Unloading current scene...");
+        tracing::debug!(target: "transition", "Unloading the current scene");
 
         // Call on_scene_exit on all scripts
         {
@@ -357,9 +420,13 @@ impl PlayerApp {
         // audio system clears (ADR 0017's producer→handles→device order)
         self.subsystems_leave_scene();
 
-        // A render mode a script held on: the next frame would
-        // otherwise switch the new scene's authored mode off
-        self.post.mode_was_active = false;
+        // A render mode a script held on: the next frame would otherwise
+        // put the old scene's settings back over the new scene's
+        self.post.mode_shim.forget();
+        // A look's fade eases toward this scene's config, not the next's
+        self.style.look_fade = None;
+        // Its looks as read at its entry (#1159): the next scene reads its own
+        self.style.preloaded_looks.clear();
 
         // Clear all systems
         self.core.script.clear();
@@ -374,8 +441,9 @@ impl PlayerApp {
         #[cfg(feature = "procgen")]
         self.core.procgen_resolver.clear_queue();
 
-        // Clear world
-        self.core.world = FlintWorld::new();
+        // Clear world, keeping its ids: nothing spawned before the next
+        // scene's world is installed reuses one
+        self.core.world = FlintWorld::after(&self.core.world);
 
         // Clear terrain
         self.terrain = None;
@@ -392,8 +460,10 @@ impl PlayerApp {
         self.hud.draw_commands.clear();
         self.hud.world_texts.clear();
         self.loaded_chunks.clear();
-        // Style tweens name the old scene's entities (#370)
+        // Style tweens name the old scene's entities (#370), as field
+        // tweens do (#734)
         self.core.style_tweens.clear();
+        self.core.field_tweens.clear();
     }
 
     /// The registry for `scene`, after asking the one resolver (ADR 0114)
@@ -418,7 +488,7 @@ impl PlayerApp {
     /// The error names the target as written, the path it was read from
     /// and why it failed.
     fn read_scene(&mut self, target_scene: &str) -> Result<NextScene, String> {
-        println!("[transition] Loading scene: {}", target_scene);
+        tracing::info!(target: "transition", scene = target_scene, "Loading scene: {}", target_scene);
 
         // Resolve scene path relative to current scene
         let path = resolve_scene_path(&self.core.project, &self.core.scene_path, target_scene);
@@ -429,14 +499,19 @@ impl PlayerApp {
         let registry = self.schemas_for_scene(&path);
 
         // Living props' tables are checked and their preset filled in, as at
-        // the first load (#686): a scene that won't settle doesn't load
-        let loaded = flint_scene::load_scene(&path, &registry).and_then(|(world, mut file)| {
-            #[cfg(feature = "living")]
-            flint_procgen::settle_scene(&mut file, Path::new(&path))?;
-            #[cfg(not(feature = "living"))]
-            let _ = &mut file;
-            Ok((world, file))
-        });
+        // the first load (#686): a scene that won't settle doesn't load.
+        // Its ids start past the scene playing's (#688), so an id a script
+        // kept (a persistent value, an event that outlives the scene) names
+        // nothing in the next one, as it did under the old global counter
+        let loaded = flint_scene::load_scene_after(&path, &registry, &self.core.world).and_then(
+            |(world, mut file)| {
+                #[cfg(feature = "living")]
+                flint_procgen::settle_scene(&mut file, Path::new(&path))?;
+                #[cfg(not(feature = "living"))]
+                let _ = &mut file;
+                Ok((world, file))
+            },
+        );
         match loaded {
             Ok((world, file)) => Ok(NextScene { path, world, file }),
             Err(e) => {

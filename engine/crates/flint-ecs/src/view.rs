@@ -167,6 +167,18 @@ pub struct ComponentView<'a> {
     component: &'a str,
     data: Option<&'a toml::Value>,
     reports: &'a ReadReports,
+    /// For a table inside the component: where it is, so a report names
+    /// `layers[1].mode` or `Glass.emissive`.
+    within: Option<Within<'a>>,
+}
+
+/// Where a nested view's table sits in its component.
+#[derive(Clone, Copy)]
+enum Within<'a> {
+    /// Entry `.1` of the array of tables `.0` ([`ComponentView::tables`]).
+    Entry(&'a str, usize),
+    /// The table field `.0` ([`ComponentView::table`]).
+    Key(&'a str),
 }
 
 impl FlintWorld {
@@ -179,6 +191,7 @@ impl FlintWorld {
             component,
             data,
             reports: self.read_reports(),
+            within: None,
         };
         view.check_is_table();
         view
@@ -199,6 +212,7 @@ impl<'a> ComponentView<'a> {
             component,
             data,
             reports,
+            within: None,
         };
         view.check_is_table();
         view
@@ -343,6 +357,67 @@ impl<'a> ComponentView<'a> {
         )
     }
 
+    // -- arrays of tables ------------------------------------------------
+
+    /// Each entry of an array of tables (`animator.layers`), as a view of
+    /// its own whose reports name the entry: `animator.layers[1].mode`.
+    /// Missing is no entries, in silence. A field that is not an array is
+    /// no entries and a report; an entry that is not a table reads as all
+    /// defaults (so indices stay put) and is reported.
+    pub fn tables(&self, field: &'a str) -> Vec<ComponentView<'a>> {
+        let Some(value) = self.raw(field) else {
+            return Vec::new();
+        };
+        let Some(entries) = value.as_array() else {
+            self.wrong_type(field, "an array of tables", value, None);
+            return Vec::new();
+        };
+        entries
+            .iter()
+            .enumerate()
+            .map(|(i, entry)| {
+                let view = ComponentView {
+                    data: Some(entry),
+                    within: Some(Within::Entry(field, i)),
+                    ..*self
+                };
+                if !entry.is_table() {
+                    view.report("", || {
+                        Diagnostic::error(
+                            codes::BAD_TYPE,
+                            format!("each entry of `{field}` is a table, got {}", shown(entry)),
+                        )
+                        .hint("this entry reads as all defaults")
+                    });
+                    return ComponentView { data: None, ..view };
+                }
+                view
+            })
+            .collect()
+    }
+
+    /// A table the component holds under `field` (`material_overrides.Glass`),
+    /// as a view of its own whose reports name it: `material_overrides`
+    /// `Glass.emissive`. Missing is a view that doesn't [`exist`](Self::exists),
+    /// in silence; a value that is not a table is the same, and reported.
+    ///
+    /// For a component's own field: a table inside an entry of
+    /// [`tables`](Self::tables), or inside another `table`, reports under
+    /// its own key alone.
+    pub fn table(&self, field: &'a str) -> ComponentView<'a> {
+        let value = self.raw(field);
+        if let Some(value) = value {
+            if !value.is_table() {
+                self.wrong_type(field, "a table", value, None);
+            }
+        }
+        ComponentView {
+            data: value.filter(|v| v.is_table()),
+            within: Some(Within::Key(field)),
+            ..*self
+        }
+    }
+
     // -- reporting -------------------------------------------------------
 
     /// Report something a reader found that no typed read covers (a value
@@ -350,6 +425,23 @@ impl<'a> ComponentView<'a> {
     /// this entity, component and `field`. `make` builds the diagnostic; the
     /// entity, component and field are filled in.
     pub fn report(&self, field: &str, make: impl FnOnce() -> Diagnostic) {
+        // Only a report gets here, so the entry's path may allocate
+        let path;
+        let field = match self.within {
+            None => field,
+            Some(within) => {
+                let at = match within {
+                    Within::Entry(array, i) => format!("{array}[{i}]"),
+                    Within::Key(key) => key.to_string(),
+                };
+                path = if field.is_empty() {
+                    at
+                } else {
+                    format!("{at}.{field}")
+                };
+                path.as_str()
+            }
+        };
         self.with_entity(|entity| {
             self.reports.once(entity, self.component, field, || {
                 let d = make().entity(entity).component(self.component);
@@ -587,7 +679,7 @@ mod tests {
         assert_eq!(none.f32("mass", 1.0), 1.0);
         assert!(!none.bool("mode_2d", false));
 
-        let nobody = world.view(EntityId::new(), comp::RIGIDBODY);
+        let nobody = world.view(EntityId::from_raw(u64::MAX), comp::RIGIDBODY);
         assert_eq!(nobody.f32("mass", 1.0), 1.0);
         assert!(world.read_reports().is_empty());
     }
@@ -778,6 +870,81 @@ mod tests {
         assert!(said[0].hint.as_deref().unwrap().contains("`music`"));
         assert_eq!(said[1].field.as_deref(), Some("file"));
         assert_eq!(view.component(), comp::AUDIO_SOURCE);
+    }
+
+    #[test]
+    fn an_array_of_tables_reports_each_entry_by_index() {
+        let (world, id) = world_with(
+            "hero",
+            comp::ANIMATOR,
+            "layers = [{ clip = \"wave\", weight = 0.5 }, 3, { clip = \"nod\", weight = \"half\" }]",
+        );
+        let view = world.view(id, comp::ANIMATOR);
+        let layers = view.tables("layers");
+        assert_eq!(layers.len(), 3, "a bad entry keeps its index");
+        assert_eq!(layers[0].f32("weight", 1.0), 0.5);
+        assert!(
+            !layers[1].exists(),
+            "an entry that is no table is all defaults"
+        );
+        assert_eq!(layers[2].f32("weight", 1.0), 1.0);
+        assert_eq!(layers[2].f32("weight", 1.0), 1.0);
+        let lines: Vec<String> = world
+            .read_reports()
+            .snapshot()
+            .iter()
+            .map(|d| d.to_string())
+            .collect();
+        assert_eq!(
+            lines,
+            [
+                "error[bad-type] entity 'hero' animator.layers[1]: each entry of `layers` is a \
+                 table, got integer 3",
+                "error[bad-type] entity 'hero' animator.layers[2].weight: expected a number, \
+                 got string \"half\"",
+            ]
+        );
+        // Missing is nothing; a field that is no array is reported
+        assert!(view.tables("absent").is_empty());
+        let (world, id) = world_with("hero", comp::ANIMATOR, "layers = \"wave\"");
+        assert!(world.view(id, comp::ANIMATOR).tables("layers").is_empty());
+        assert_eq!(world.read_reports().len(), 1);
+    }
+
+    #[test]
+    fn a_table_field_reports_by_its_key() {
+        let (world, id) = world_with(
+            "lamp",
+            comp::MATERIAL_OVERRIDES,
+            "Glass = { emissive = \"bright\", emissive_strength = 4 }\nRim = 3",
+        );
+        let view = world.view(id, comp::MATERIAL_OVERRIDES);
+        let glass = view.table("Glass");
+        assert!(glass.exists());
+        for _ in 0..3 {
+            assert_eq!(glass.opt_color("emissive"), None);
+            assert_eq!(glass.opt_f32("emissive_strength"), Some(4.0));
+        }
+        let rim = view.table("Rim");
+        assert!(!rim.exists(), "a value that is no table reads as no table");
+        assert_eq!(rim.opt_f32("emissive_strength"), None);
+        let absent = view.table("Steel");
+        assert!(!absent.exists());
+        let lines: Vec<String> = world
+            .read_reports()
+            .snapshot()
+            .iter()
+            .map(|d| d.to_string())
+            .collect();
+        assert_eq!(
+            lines,
+            [
+                "error[bad-type] entity 'lamp' material_overrides.Glass.emissive: expected a \
+                 colour, [r, g, b] or [r, g, b, a], got string \"bright\"",
+                "error[bad-type] entity 'lamp' material_overrides.Rim: expected a table, got \
+                 integer 3",
+            ]
+        );
     }
 
     #[test]

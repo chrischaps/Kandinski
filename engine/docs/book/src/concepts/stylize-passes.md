@@ -1,5 +1,7 @@
 # Stylize Passes
 
+> **Package:** `engine`: every game has it. Its stylize render feature is grouped in the engine's manifest as the package it becomes in a later phase, with no switch yet ([Packages](packages.md)).
+
 A stylize pass is a full-screen effect that changes how the picture looks rather than how the light behaves: the painterly Kuwahara filter, ASCII, the pencil sketch and watercolor (epic #260). They share one framework in `flint-render` (`crates/flint-render/src/stylize/`), so a new style is mostly a shader and a parameter list.
 
 This page is the reference. For choosing between a whole-frame and a per-entity style, which grid glyphs sit on and which stage a style runs at, with the captures the choice was made from, see the guide [Stylized Rendering](../guides/stylized-rendering.md) and [ADR 0111](https://github.com/chrischaps/flint/blob/main/docs/adr/0111-stylized-rendering.md).
@@ -25,18 +27,27 @@ WARN styles.ascii.color: unknown value 'plaid'; it takes: source, tint, raw, mon
 WARN styles.invert.strength=3 is outside its range 0..1; kept as written, past what the style is tuned for
 ```
 
+An entity's own style component is held to the same ranges (#492). A built-in style's (`ascii_style`, `pencil_style`, `watercolor_style`) has a schema whose fields carry its parameters' ranges, colours' channels included, so the scene loader warns and `flint check` and `flint validate` report an `out-of-range` error, naming the entity, the field and the range. A user style's `<name>_style` has no schema file, since it loads at run time, so the engine makes its schema from the style's `.shader.toml` (#556): each `[params]` entry a number with its range, each option one of its choices, plus `enabled`, `blend` and `blend_source`. `flint check` and `flint validate` hold the scene to it as to a built-in's, so a misspelt field (`glwo = 2`) is an `unknown-field` warning naming the nearest field, a string where a number goes a `bad-type` error, and a value past its range `out-of-range`. A host that draws the scene (`flint play`, `flint render`, `flint edit`) says the same lines when it binds the scene, and the player again for a style whose `.shader.toml` you save while it runs. A built-in style gets the value as written (and may clamp it or draw it badly: ASCII at `cell = 400` is two flat blocks); a user style clamps it into its range, so `glow = 90` draws exactly as `glow = 2` would, which is why it is said:
+
+```text
+error[out-of-range] entity 'bench' ascii_style.cell: 400 is above the maximum 32
+error[out-of-range] entity 'crate' ascii_style.tint[0]: 3 is above the maximum 1
+error[out-of-range] entity 'barrel' hologram_style.glow: 90 is above the maximum 2
+warning[unknown-field] entity 'drum' hologram_style.glwo: `hologram_style` has no field `glwo`
+```
+
 Kuwahara's table is `[post_process.styles.kuwahara]`, and the contour's `[post_process.styles.contour]`. Scenes from before the tables spell them `kuwahara_enabled`, `kuwahara_radius`, `contour_width` and so on in `[post_process]`; those keys are folded into the tables when the scene loads (see [Post-Processing](post-processing.md#kuwahara-painterly-filter)).
 
 From the command line, `--style name[:key=value,...]` turns any registered style on over a scene without editing it (#271), on `flint render` and on `flint edit <model or effect> --render`:
 
 ```bash
-flint render examples/pbr_test.scene.toml --style ascii
-flint render examples/stylize_props.scene.toml --style ascii:ramp=detailed,color=tint,cell=10
-flint render examples/pbr_test.scene.toml --style invert:strength=0.5 --style kuwahara:radius=6
-flint render examples/stylize_props.scene.toml --style ascii:color=tint,tint=#ffb340   # a colour: #rrggbb or r/g/b
+flint render flint-examples/pbr_test.scene.toml --style ascii
+flint render flint-examples/stylize_props.scene.toml --style ascii:ramp=detailed,color=tint,cell=10
+flint render flint-examples/pbr_test.scene.toml --style invert:strength=0.5 --style kuwahara:radius=6
+flint render flint-examples/stylize_props.scene.toml --style ascii:color=tint,tint=#ffb340   # a colour: #rrggbb or r/g/b
 flint render levels/tavern.scene.toml --style ascii:off       # off everywhere: the table and every entity's ascii_style (#376)
-flint edit examples/models/barrel.glb --render barrel.png --style ascii:cell=6
-flint render examples/pbr_test.scene.toml --style help            # every style and its keys
+flint edit flint-examples/models/barrel.glb --render barrel.png --style ascii:cell=6
+flint render flint-examples/pbr_test.scene.toml --style help            # every style and its keys
 ```
 
 A word is checked before anything draws, and a mistake stops the command with what would have worked: an unknown style or key names the ones that exist, and a number outside its parameter's range names the range (#355), as `--sweep` does for each column:
@@ -45,12 +56,14 @@ A word is checked before anything draws, and a mistake stops the command with wh
 error: invalid value 'ascii:cell=400' for '--style <STYLES>': ascii: cell=400 is outside its range 4..32
 ```
 
+`flint render --set <style>.<key>=<value>` sets one key of a style's table and leaves the style on or off as the scene has it (#708): `--set ascii.cell=12` writes `cell = 12` into `[post_process.styles.ascii]`, and a table that said `enabled = false` still does. `--set` takes the keys `--sweep` takes, one value each; `--set post.<key>=<value>` is the same for a `[post_process]` key ([Post-Processing](post-processing.md#cli-flags)).
+
 The windowed hosts take the same words (#328): `flint play`, `flint-player` and the scene viewer (`flint edit scene.toml`), with `--style-time` beside them. They write the words over the scene's `[post_process]` when it loads and again after each scene transition (the player), each hot reload and each authored/default swap in F4 (the viewer), so the command line keeps winning over the file. F4 and the F3 Styles panel still edit the live result, and their Authored button goes back to what the scene says. On the web the query takes them as `?style=ascii:cell=12`, repeated for more than one (`?style=ascii&style=invert`).
 
 ```bash
-flint play examples/stylize_props.scene.toml --style ascii
-flint-player examples/stylize_props.scene.toml --style pencil:spacing=5 --style-time 1.5
-flint edit examples/stylize_props.scene.toml --watch --style ascii:cell=10
+flint play flint-examples/stylize_props.scene.toml --style ascii
+flint-player flint-examples/stylize_props.scene.toml --style pencil:spacing=5 --style-time 1.5
+flint edit flint-examples/stylize_props.scene.toml --watch --style ascii:cell=10
 ```
 
 ### Listing the styles
@@ -59,7 +72,7 @@ flint edit examples/stylize_props.scene.toml --watch --style ascii:cell=10
 
 ```bash
 flint render --list-styles
-flint render examples/user_styles.scene.toml --list-styles --json
+flint render flint-examples/user_styles.scene.toml --list-styles --json
 ```
 
 ```text
@@ -79,8 +92,9 @@ The keys are checked against the style's declaration: a number for a parameter, 
 
 In the player and the scene viewer, **F4 → Styles** lists every style that reads the table, each in a section of its own drawn from the style's declaration (#268). A style needs no UI code to appear there:
 
-- **A row per setting.** A combo per option with a list of choices, a text field per option that takes any name (it applies on Enter), a slider per parameter, and one colour picker for each `<base>_r`, `<base>_g`, `<base>_b` triple (ASCII's `tint`). The rows are labelled, explained on hover, and step by whole numbers where the style says so ([hints](#writing-a-style)). A setting the current options don't read is greyed out, and its hover line says why: in ASCII's `source` colour mode, Tint and Palette are both idle until `color` is `tint` or `palette`.
+- **A row per setting.** A combo per option with a list of choices, a text field per option that takes any name (it applies on Enter), a slider per parameter, and one colour picker for each `<base>_r`, `<base>_g`, `<base>_b` triple (ASCII's `tint`). The rows are labelled, explained on hover, and step by whole numbers where the style says so (each setting's own [label and help](#writing-a-style)). A setting the current options don't read is greyed out, and its hover line says why: in ASCII's `source` colour mode, Tint and Palette are both idle until `color` is `tint` or `palette`.
 - **The scene's own files** (#322). An option can find its choices at run time (`StyleOption::discovered`), and ASCII's do: `palette` offers the built-ins, then every `palettes/*.palette.toml` the scene can see; `font` offers `builtin`, then every `fonts/*.glyphs.toml` it can see; and `ramp` offers the ramps the chosen font has, so a project's set lists its own names rather than the built-in four. "Can see" is [the one asset search](assets.md#where-the-engine-looks-for-a-file): the folder beside the scene, in each directory above it up to the project root, then in the mounted engine, a nearer file hiding a farther one of its name. The list is the resolver's own (`Project::list`), so every name offered is one the style will find, and a scene two folders down is offered the project's palettes. The folders are read through the vfs, so a bundle on the web lists the same files. The list is found when the scene loads (and reloads) and when another option it depends on changes, not every frame. A value the scene names that isn't listed (a palette by its path) still shows, selected. `flint render <scene> --list-styles` lists the same choices.
+- **Blend** (#521) heads every section: a slider from 0 to 1 for the table's [`blend`](#blending-a-whole-frame-style), how much of the style shows over the frame it read. Like the Reveal group it is the framework's, so every style has it with nothing declared. At 1, the default, the table says nothing of it.
 - **↺** beside a value that isn't the default puts it back.
 - **Defaults** clears the style's values. **Authored** puts back what the scene says, on and off included. **Copy TOML** puts the `[post_process.styles.<name>]` block that reproduces what's on screen on the clipboard, with only the values that differ from the defaults, so a look tuned by eye goes back into the scene in one paste:
 
@@ -93,7 +107,7 @@ In the player and the scene viewer, **F4 → Styles** lists every style that rea
   glow = 0.77
   ```
 
-- **Commit to scene** (#364) writes that same block into the scene file, as the Grass, Ocean and Camera panels' Commit to File do for theirs. It works key by key through `toml_edit` (`SceneDocument::set_style_table`). A changed value is rewritten in place and keeps its comments. A key back at its default is removed, and a comment on its own line above that key goes with it. A key the style doesn't know is left alone. Comments and key order elsewhere in the file survive. A style that is off with nothing else set loses its table, and on Kuwahara and contour the old `kuwahara_*` / `contour_*` keys in `[post_process]` are removed. After the write the editor's authored settings are the committed ones, so the *edited* marker and the dots clear. The viewer reloads the file as it does any scene edit. Because that reload would drop entity edits not yet saved, the button is greyed out until Ctrl+S. A scene played from a bundle (`flint-player --bundle`, the web) has no file to write, so the button isn't drawn there.
+- **Commit to scene** (#364) writes that same block into the scene file, as the Grass, Ocean and Camera panels' Commit to File do for theirs. It works key by key through `toml_edit` (`SceneDocument::set_style_table`). A changed value is rewritten in place and keeps its comments. A key back at its default is removed, and a comment on its own line above that key goes with it. A key the style doesn't know is left alone. Comments and key order elsewhere in the file survive. A style that is off with nothing else set loses its table, and on Kuwahara and contour the old `kuwahara_*` / `contour_*` keys in `[post_process]` are removed. After the write the editor's authored settings are the committed ones, so the *edited* marker and the dots clear. The viewer reloads the file as it does any scene edit. Because that reload would drop entity edits not yet saved, the button is greyed out until Ctrl+S. Only the one style is written, and the reload the commit causes leaves the post-process on screen as it was (#516): a bloom, fog or SSAO value tuned in F4, or another style's settings, stays as tuned but is still not in the file; write it into `[post_process]` by hand to keep it. Any other reload, an edit of the file in a text editor among them, takes the file's `[post_process]` as before. A scene played from a bundle (`flint-player --bundle`, the web) has no file to write, so the button isn't drawn there.
 - **Against the scene.** The header says *edited* while the style differs from the scene's own table, and a dot marks each value that does (hover it for the scene's value).
 
 ![F4's Styles section in the player: the meadow under an authored amber ASCII look, with cell size, tone bands and glow tuned by eye. Each tuned value has a dot because it now differs from the scene, and Copy TOML has just copied the block above](../images/f4-styles-editor.png)
@@ -117,15 +131,15 @@ The same editor is the player's **F3 Styles** panel, which appears with the othe
 
 The full-screen ASCII style (#265) turns every cell of one screen grid into a glyph from a [glyph set](glyph-atlas.md). The cell's luminance picks a step of the ramp, so glyph density carries brightness, and the glyph is inked in the cell's colour or a tint.
 
-![examples/ascii_lantern.scene.toml: two crates under a lamp post, a barrel and a figure on a black ground, against a thin band of dusk under a starred sky, in the classic ramp at 8 px cells](../images/ascii-lantern.png)
+![flint-examples/ascii_lantern.scene.toml: two crates under a lamp post, a barrel and a figure on a black ground, against a thin band of dusk under a starred sky, in the classic ramp at 8 px cells](../images/ascii-lantern.png)
 
-*`flint render examples/ascii_lantern.scene.toml --width 1280 --height 720`, with no other flags: the scene's `[camera]` frames it and its `[post_process.styles.ascii]` block sets the look.*
+*`flint render flint-examples/ascii_lantern.scene.toml --width 1280 --height 720`, with no other flags: the scene's `[camera]` frames it and its `[post_process.styles.ascii]` block sets the look.*
 
-The style rewards value contrast. Glyph density follows luminance, so a scene lit for PBR, mid-greys everywhere, turns into an even field of `=` and `-`. `examples/ascii_lantern.scene.toml` (#316) is authored for glyphs instead: a near-black ground that stays empty, crates lit warm from one side by a lamp so each has a bright face and a dark one, and a figure and a barrel standing against the last band of a low sun under a dark, starred sky. Its block raises `contrast` to 1.5, which pushes the dim sky to black and keeps the glyphs for what is lit. The ground's top sits 2 cm above y = 0, so the editor grid `flint render` draws by default is hidden under it instead of lifting the empty ground into dashes. The same scene in each built-in ramp:
+The style rewards value contrast. Glyph density follows luminance, so a scene lit for PBR, mid-greys everywhere, turns into an even field of `=` and `-`. [`flint-examples/ascii_lantern.scene.toml`](https://github.com/chrischaps/flint-examples/blob/main/ascii_lantern.scene.toml) (#316) is authored for glyphs instead: a near-black ground that stays empty, crates lit warm from one side by a lamp so each has a bright face and a dark one, and a figure and a barrel standing against the last band of a low sun under a dark, starred sky. Its block raises `contrast` to 1.5, which pushes the dim sky to black and keeps the glyphs for what is lit. The ground's top sits 2 cm above y = 0, so the editor grid `flint render` draws by default is hidden under it instead of lifting the empty ground into dashes. The same scene in each built-in ramp:
 
 ![The lantern scene in the classic, blocks, minimal and detailed ramps](../images/ascii-lantern-ramps.png)
 
-*`flint render examples/ascii_lantern.scene.toml --sweep ascii.ramp=classic,blocks,minimal,detailed`*
+*`flint render flint-examples/ascii_lantern.scene.toml --sweep ascii.ramp=classic,blocks,minimal,detailed`*
 
 ```toml
 [post_process.styles.ascii]
@@ -139,9 +153,9 @@ glow = 0.0              # halo around bright glyphs
 ```
 
 ```bash
-flint render examples/ascii_lantern.scene.toml --width 1280 --height 720   # authored for the style
-flint render examples/pbr_test.scene.toml --ascii --width 1280 --height 720
-flint render examples/mesh_meadow.scene.toml --ascii --ascii-ramp blocks --ascii-tint 1,0.7,0.25
+flint render flint-examples/ascii_lantern.scene.toml --width 1280 --height 720   # authored for the style
+flint render flint-examples/pbr_test.scene.toml --style ascii --width 1280 --height 720
+flint render flint-examples/mesh_meadow.scene.toml --style ascii:ramp=blocks,tint=1/0.7/0.25,color=tint
 ```
 
 | Key | Default | |
@@ -150,7 +164,7 @@ flint render examples/mesh_meadow.scene.toml --ascii --ascii-ramp blocks --ascii
 | `font` | `builtin` | The glyph set: `builtin`, a set name (`fonts/<name>.glyphs.toml`, found by [the one asset search](assets.md#where-the-engine-looks-for-a-file)) or a `.glyphs.toml` path from the scene's folder or one above it. One that fails to load falls back to the built-in set, with a warning that lists every path tried |
 | `ramp` | the set's default | A ramp of the set. The built-in set has `classic`, `blocks`, `minimal`, `detailed`, `quadrants` and `braille`. An unknown name warns once and uses the default |
 | `color` | `source` | `source`: the cell's hue at full value. `tint`: one colour (`tint`, default phosphor green). `raw`: the cell's colour as it is, dark cells dark. `mono`: white glyphs on grey. `palette`: the inks of `palette` (see [Colour modes](#colour-modes)) |
-| `tint` | `[0.35, 1.0, 0.45]` | With `color = "tint"`: the ink, a [colour](#colours) (`[r, g, b]` 0--1 in display values, or `"#59ff73"`). `--ascii-tint r,g,b` sets it |
+| `tint` | `[0.35, 1.0, 0.45]` | With `color = "tint"`: the ink, a [colour](#colours) (`[r, g, b]` 0--1 in display values, or `"#59ff73"`). `--style ascii:tint=r/g/b,color=tint` sets it from the command line |
 | `palette` | `phosphor` | With `color = "palette"`: `cga`, `cga-warm`, `cga16`, `phosphor`, `amber`, `mono`, `paper` (with `ground = "inverse"`), or a palette file. One that can't be found warns once and uses `phosphor` |
 | `chroma` | `1` | With a `nearest` palette: scale each cell's saturation (OKLab a/b) before its ink is matched, so a muted scene reaches the palette's colours (0--4; 0 matches on lightness alone). See [Palettes](#palettes-match-in-oklab) |
 | `palette_dither` | `0` | With a `nearest` palette: mix each cell's two nearest inks by a 4x4 Bayer pattern on the cell grid, in proportion to how far the cell sits between them (0--1), so a gradient steps through inks instead of banding into one |
@@ -158,8 +172,8 @@ flint render examples/mesh_meadow.scene.toml --ascii --ascii-ramp blocks --ascii
 | `glow` | `0` | A halo around each glyph, stronger on bright cells (0--2; 0.6 reads as a phosphor tube). It's drawn in the pass, since a display-stage style runs after bloom, so it stops at the cell's edge: for glow that crosses cells, add [display bloom](#display-bloom) |
 | `background` | `0.15` | How much of the cell's colour fills behind its glyph: 0 is black, 1 the cell's colour |
 | `brightness`, `contrast` | `0`, `1` | Luminance remap before the ramp: contrast about mid-grey, then an offset |
-| `exposure` | `0` | Stops of gain on each cell's colour, in linear light, before its glyph and ink are picked (-4--4, `--ascii-exposure`). See [dark props](#dark-props-exposure-and-normalize) |
-| `normalize` | `0` | Stretch the style's own luminance range over the ramp, measured from the same frame: the whole frame's, or each styled entity's (0--1, `--ascii-normalize`; #289) |
+| `exposure` | `0` | Stops of gain on each cell's colour, in linear light, before its glyph and ink are picked (-4--4). See [dark props](#dark-props-exposure-and-normalize) |
+| `normalize` | `0` | Stretch the style's own luminance range over the ramp, measured from the same frame: the whole frame's, or each styled entity's (0--1; #289) |
 | `ink` | `1` | Glyph brightness |
 | `levels` | `0` | Quantize the tone to this many bands (0 keeps every step of the ramp) |
 | `footprint` | `1` | Average each cell's colour over this many cells (wider settles texture noise) |
@@ -174,29 +188,54 @@ flint render examples/mesh_meadow.scene.toml --ascii --ascii-ramp blocks --ascii
 | `edge_tint` | `0` | For `edge_ink = "color"`: mix the colour toward the near side's hue (0--1) |
 | `outline` | `1` | Per-entity only: ink a styled entity's own pixels this many points from its silhouette (0--4, at least one pixel when on; 0 = off), so features thinner than a cell keep their shape ([Silhouettes](#silhouettes), #288) |
 | `min_coverage` | `0.5` | Per-entity only: the least ink of the pixels in a cell the entity only grazes (0--1) |
-| `silhouette` | `"pixel"` | Per-entity only: `pixel` cuts the glyphs at the entity's exact edge; `cell` draws every edge cell whole, as the entity's glyph or as the scene, by how much of it the entity covers ([Whole-cell silhouettes](#whole-cell-silhouettes), #338) |
-| `cell_share` | `0.5` | Per-entity only, with `silhouette = "cell"`: the share of a cell's 16 colour samples the entity must cover for the cell to be its (1/16--1) |
+| `silhouette` | `"pixel"` | `pixel` cuts the glyphs at the entity's exact edge; `cell` draws every edge cell whole, as the entity's glyph or as the scene, by how much of it the entity covers ([Whole-cell silhouettes](#whole-cell-silhouettes), #338). Set for the whole frame, `cell` also snaps the edge of another style's entity to whole glyphs (#534) |
+| `cell_share` | `0.5` | With `silhouette = "cell"`: the share of a cell's 16 colour samples the entity must cover for the cell to be its (1/16--1); for the whole frame, the share that must not be another style's entity for the cell to stay a glyph |
 | `temporal` | `on` | Temporal stability (#277), below. `off` draws every frame as if it were the first. `reproject` reads each cell's past where its surface was last frame ([Reprojected history](#reprojected-history), #344) |
-| `smoothing` | `0.6` | How much of last frame's colour a cell keeps, per 60 Hz frame (0--0.95): at 120 Hz each frame keeps its square root, at 30 Hz its square, so a change settles in the same game time at any frame rate (#342). A cell whose colour jumps takes the new one at once, so nothing trails |
-| `hysteresis` | `0.35` | How far, in ramp steps, a cell's tone may stray from its glyph's band before the glyph changes (0--1) |
-| `dither` | `0` | Ordered (4x4 Bayer) dither before the ramp, fixed to the grid: gradients break into a still pattern instead of one hard edge (0--1, `--ascii-dither`) |
+| `smoothing` | `0.6` | How much of last frame's colour a cell keeps, per 60 Hz frame (0--0.95): at 120 Hz each frame keeps its square root, at 30 Hz its square, so a change settles in the same game time at any frame rate (#342). A cell whose colour jumps takes the new one at once, so nothing trails. Edge cells keep its square root of their edge's length, direction and place ([Edge glyphs in motion](#edge-glyphs-in-motion), #477) |
+| `hysteresis` | `0.35` | How far, in ramp steps, a cell's tone may stray from its glyph's band before the glyph changes (0--1). It also sets how far an edge's length, direction and place may stray before its line glyph changes (#477) |
+| `dither` | `0` | Ordered (4x4 Bayer) dither before the ramp, fixed to the grid: gradients break into a still pattern instead of one hard edge (0--1) |
 
 ### Temporal stability
 
 In motion, a cell whose tone sits on a ramp boundary tips to the neighbouring glyph and back at the slightest change, and the whole picture crawls. So the style draws in two passes: a cell pass writes each cell's colour and glyph into a small state texture (one texel a cell), and the glyph pass draws from it. The state is kept for the next frame. A cell blends in part of last frame's colour (`smoothing`, scaled by the frame's length in game time: the player's clock, so the fixed step under `--frame-step`) and keeps last frame's glyph until its tone has clearly moved on (`hysteresis`).
 
-On `examples/ascii_motion.scene.toml`, a slow orbit of the meadow clearing captured at 1280x720 with `--frame-step 0.0166667` for 3 s (181 frames, 14,400 cells), `python tools/ascii_flips.py` counted:
+On [`flint-examples/ascii_motion.scene.toml`](https://github.com/chrischaps/flint-examples/blob/main/ascii_motion.scene.toml), a slow orbit of the meadow clearing captured at 1280x720 with `--frame-step 0.0166667` for 3 s (181 frames, 14,400 cells), `python tools/ascii_flips.py` counts glyph flips and reversals (A, B, A) per frame. Each column is a player built from that commit (re-measured 2026-11-13, #481):
 
-| | glyph flips per frame | reversals per frame (A, B, A) |
+| | #277 (266f1803) | edge glyphs, #267 (bbd0fc34) | edge history, #477 (4fc9606d) |
+|---|---|---|---|
+| `off`: flips | 408.3 (2.84% of cells) | 508.8 (3.53%) | 384.3 (2.67%) |
+| `off`: reversals | 100.6 (0.70%) | 118.3 (0.82%) | 84.1 (0.58%) |
+| `on`: flips | 122.7 (0.85%) | 272.8 (1.89%) | 121.3 (0.84%) |
+| `on`: reversals | **0.1** (0.00%) | **35.4** (0.25%) | **1.6** (0.01%) |
+| `on`, `edges = 0`: reversals | (no edges yet) | 0.1 | 0.0 |
+
+Reversals, where a glyph changes and changes back two frames later, are the shimmer itself. #277's history took them from 100.6 a frame to 0.1. The flips that remain are the scene really moving.
+
+The edge glyphs that came next (#267) brought 35 a frame back: they were picked fresh every frame, outside the history. Bisecting between the two found no other cause (#481). The commit before #267 gives #277's numbers, and #267 with `edges = 0` gives them too, to the decimal (118.3 flips, 0.1 reversals). #267 with edges on gives what main still measured months later at b3448e5 (273.2 and 35.5), so nothing in between moved them: not tone normalisation (#289), the palette matcher (#320, #324) or the variant table (#336). #477 gave the edge glyphs a history of their own ([below](#edge-glyphs-in-motion)). The tone glyphs alone now reverse 0.0 times a frame. Of the 1.6 left with edges on, nearly all are a line glyph showing in one cell for a single frame (or missing for one): a thin line grazes a cell that had none, and a line entering an empty cell is drawn on its first frame. The headless count below shows it on the grid itself: 158 of its 164 reversals are a line glyph and a tone glyph trading places, most often `│` with `:` or `.`, in 156 different cells. No cell shimmers. The scene and the renderer changed between the columns, so compare within a column.
+
+`flint render --frames 181 --orbit 6.8755 --flip-stats` measures the same thing headlessly and exactly, from the style's own grid ([Frame sequences](../guides/headless-rendering.md#frame-sequences), #345). With `edges = 0` it gives 54.6 flips and 0.0 reversals a frame with the history on, against 203.7 and 36.2 with it off; with edges on, 101.9 and 0.9 against 319.2 and 58.9 (2026-11-13). Before #477 the edge glyphs went through no history, and with them on the history left 38.2 reversals a frame, every one of them an edge glyph.
+
+#### Edge glyphs in motion
+
+An edge cell decides several things from its edge pixels each frame: whether it draws a line at all (its edge length against `edge_threshold` and `edge_max`), which line (- | / \ by its direction, the bands meeting at 22.5 degrees from each axis), which of two neighbours a line near their border belongs to, and whether the line turns there into a corner or tee. A line near any of those borders tips across it and back as the camera slides a fraction of a pixel. On the slow orbit, 26 of main's 38 reversals a frame were a line glyph coming and going, and 12 a line swapping for another (- for \, | for /).
+
+So with the history on (the same frames as the tone's: consecutive, same grid and key), the edge passes read last frame's edge cells and glyphs, copied aside before this frame's passes write theirs (#477):
+
+- **Smoothing.** A cell keeps part of last frame's edge length, direction and place across the cell, the square root of `smoothing` (0.6 keeps 0.77): an edge length counts the pixels of one-pixel lines, which flicker with sub-pixel motion far more than a colour averaged over 16 samples. A length that changes by more than half of the larger of the two (a line came into the cell or left it) starts to let go, and one that went from nothing, or to nothing, takes the new one at once, so a whole line moving into an empty cell draws there on its first frame.
+- **Hysteresis**, from `hysteresis` (0.35): a cell that drew a line keeps it down to `edge_threshold` / 1.35 of edge and up to `edge_max` x 1.35, and one that didn't starts at `edge_threshold` x 1.35; its glyph stays while its direction is within 0.35 x 22.5 degrees of the glyph's band; a line near the border between two cells stays with the one that drew it until it is 0.35 of a cell past.
+- **Corners wait a frame.** A cell drawing the same line as last frame changes its corner or tee only when two frames running find the new one. A cell whose line comes, goes or turns takes this frame's at once.
+
+`flint render --frames 181 --orbit 6.8755 --flip-stats`, edges on:
+
+| | flips per frame | reversals per frame |
 |---|---|---|
-| `temporal = "off"` | 408.3 (2.84% of cells) | 100.6 (0.70%) |
-| `temporal = "on"` | 118.3 (0.82%) | 0.1 (0.00%) |
+| before #477 | 209.7 | 38.2 |
+| #477 | 101.9 | 0.9 |
+| `temporal = "off"` (unchanged) | 319.2 | 58.9 |
 
-Reversals, where a glyph changes and changes back two frames later, are the shimmer itself, and they are gone. The flips that remain are the scene really moving.
+The flips that remain are the scene moving. In a fast orbit (`--orbit 68.755`, 1.2 rad/s, 61 frames) reversals go from 126.5 to 41.0 a frame and the frame keeps 94% of main's edge cells: a marginal line waits until it clears the threshold band. `hysteresis = 0` turns the edge hysteresis off and `smoothing = 0` the edge smoothing; with history off (a single render, `temporal = "off"`) the edges are exactly the stateless ones. Edge history is kept in screen space under `temporal = "reproject"` too.
 
-`flint render --frames 181 --orbit 6.8755 --flip-stats` measures the same thing headlessly and exactly, from the style's own grid ([Frame sequences](../guides/headless-rendering.md#frame-sequences), #345). With `edges = 0` it gives 105.1 flips and 0.0 reversals a frame with the history on, against 321.1 and 57.8 with it off. The edge glyphs (#267), which came after this measurement, don't go through the history yet. With them on, the history leaves 30.3 reversals a frame (#477).
-
-The player's capture of the same orbit (`tools/ascii_flips.py`, edges on, at b3448e5) agrees: 3.53% flips and 0.82% reversals a frame with `off`, 1.90% and 0.25% (35.5 a frame) with `on` (#481, the same finding as #477).
+The player's capture of the same orbit ([the table above](#temporal-stability), #481) agrees: 0.84% flips and 0.01% reversals a frame with `on`, against 1.89% and 0.25% before #477. It counts a few more reversals than the headless grid (1.6 to 0.9 a frame). They aren't the same frames: the player's camera is the orbit script's, through the player's own frame loop, while `--orbit` places the camera directly.
 
 The state counts as history only when the last frame the renderer drew was the one before, and the grid, ramp and size are unchanged. A single `flint render` therefore draws exactly what the stateless style drew, and a `--frame-step` capture gives the style the same frames every run. Until #341 the player's captures still differed by one level in a few pixels, history on or off: the grass compute's blades came out in a different order each run. Five captures of the motion bench are now byte-identical. The player calls `SceneRenderer::reset_style_history()` when a new scene comes up, and on a [camera cut](#camera-cuts).
 
@@ -205,9 +244,10 @@ The state counts as history only when the last frame the renderer drew was the o
 After a cut (a cutscene's new shot, a teleport, a respawn) the history belongs to the old shot. Kept, it blends the old shot's colours into the new one's first frames, and cells whose tone barely changed keep the old glyph through the hysteresis band, for as long as the shot lasts. Two things reset it (#343):
 
 - **Scripts** call `reset_style_history()` on the frame of the cut ([Scripting → Style API](scripting.md#style-api)). The next frame is drawn as if it were the first.
-- **The player watches the camera** and resets by itself when a frame's step is both large and sudden: a move of more than 2 m or a turn of more than 30° in one frame, at more than four times the rate of the frame before. The second test keeps a fast chase camera, or a hitch that stretches one frame, from resetting every frame and losing its stability. A missed cut costs a shot's worth of stale glyphs, a false one costs one frame drawn without history. FOV and orthographic zoom changes aren't watched: a script that cuts by zoom calls `reset_style_history()`. `set_camera_cut_detection(false)` turns the watch off; the thresholds are the constants in `crates/flint-player/src/player_app/camera_cut.rs`.
+- **The player watches the camera** and resets by itself when a frame's step is both large and sudden: a move of more than 2 m, a turn of more than 30°, or a zoom of more than 1.25x either way (#474) in one frame, at more than four times the rate of the frame before, or any switch between perspective and orthographic. A zoom is measured on the view's size, `tan(fov / 2)` for a perspective camera and the half-height for an orthographic one, so 1.25x is a 50° to 40° punch-in or an ortho height from 10 to 8. The second test keeps a fast chase camera, a quick dolly zoom, or a hitch that stretches one frame, from resetting every frame and losing its stability. A missed cut costs a shot's worth of stale glyphs, a false one costs one frame drawn without history. `set_camera_cut_detection(false)` turns the watch off; the thresholds are the constants in `crates/flint-player/src/player_app/camera_cut.rs`.
+- **The scene viewer** (`flint edit`) resets at its own camera jumps, which it knows about, and runs no detector: Space back to the authored `[camera]` framing, a switch between perspective and orthographic (a view-gizmo snap, or orbiting out of one), and a hot reload. Its orbits, wheel zooms and eased view snaps are motion and keep their history (#474). On [`flint-examples/ascii_cuts.scene.toml`](https://github.com/chrischaps/flint-examples/blob/main/ascii_cuts.scene.toml), orbited away and back with Space, 204 to 233 of the 1,116 viewport cells kept the orbited view's glyphs before, still there three seconds later; now none do, from the first frame.
 
-`examples/ascii_cuts.scene.toml` cuts between two shots of the meadow clearing every second. Its script's `mode` is `"script"` (it resets at each cut), `"auto"` (the player's detection does) or `"none"` (neither). Captured at 1280x720 with `--frame-step 0.0166667` for 2.5 s, cells whose glyph differs from the `"script"` run (of 14,400):
+[`flint-examples/ascii_cuts.scene.toml`](https://github.com/chrischaps/flint-examples/blob/main/ascii_cuts.scene.toml) cuts between two shots of the meadow clearing every second. Its script's `mode` is `"script"` (it resets at each cut), `"auto"` (the player's detection does) or `"none"` (neither). Captured at 1280x720 with `--frame-step 0.0166667` for 2.5 s, cells whose glyph differs from the `"script"` run (of 14,400):
 
 | Mode | Before the first cut | First frame of the new shot | Its last frame, a second later | All frames after the cut |
 |------|---|---|---|---|
@@ -217,31 +257,45 @@ After a cut (a cutscene's new shot, a teleport, a respawn) the history belongs t
 
 The carry-over is mostly in mid tones: `-` where the new shot has `=`, `.` and `:` in the grass. Half of it is still there when the shot ends, because cells that clear the hysteresis band have no reason to change.
 
+Set the script's `zoom` above 1 and the camera never jumps: it keeps drifting over the clearing and every other second the FOV alone punches in, the view `zoom` times smaller. The cells that differ from the `"script"` run on the first zoomed frame (of 14,400), and the glyphs that flip from the last wide frame to it:
+
+| Zoom | `"none"`: carried over | `"auto"`: carried over | Flips at the cut, no reset | Flips at the cut, reset | Flips over the next 30 frames, no reset / reset |
+|------|---|---|---|---|---|
+| 1.1x | 1,288 | 1,288 (not a cut) | 1,317 | 2,419 | 3,111 / 2,716 |
+| 1.2x | 1,702 | 1,702 (not a cut) | 2,072 | 3,469 | 3,317 / 2,707 |
+| 1.3x | 2,072 | 0 | 2,761 | 4,447 | 3,666 / 2,959 |
+| 1.5x | 2,343 | 0 | 4,005 | 5,899 | 5,564 / 4,557 |
+| 2.0x | 2,974 | 0 | 6,153 | 8,489 | 6,336 / 4,944 |
+
+Every zoom carries some over, and the amount rises with the zoom with no knee to put a threshold at. A reset never lowers the number of flips: it moves them onto the cut frame, where the picture changes anyway, and leaves the frames after it calm (a steady drift flips about 82 cells a frame; after a missed cut the carried glyphs keep draining at two to three times that). So the line is drawn by intent. Under 1.25x a step is more likely an effect, a sprint's FOV kick or a hit's jolt, which keeps its history and its quieter frame (a reset would nearly double that frame's flips at 1.1x). Over it, a zoom is a new framing, and the detector resets exactly where the script would: 0 cells apart.
+
 #### Reprojected history
 
 The history is kept in screen space: a cell's past is whatever was in that cell last frame. When the camera moves, that is another piece of the world. `temporal = "reproject"` (#344) follows the surface instead. The cell pass unprojects each cell's centre through the scene depth, projects it with last frame's camera, and reads the past from the cell that point fell in. Each cell also stores its centre's view depth. A past whose depth is more than 10% off where the surface should have been is something the surface was behind (a disocclusion), and the cell starts fresh. Only the camera's motion is followed: Flint writes no motion vectors, so a moving object's cells read the past of whatever was there, and the depth test turns most of that away.
 
 It is correct: `reprojected_history_reads_the_past_of_the_surface_now_in_the_cell` (in `crates/flint-render/tests/stylize.rs`) trucks the camera one panel along a wall of red and green panels of equal luminance. With screen-space history, all 64 cells blend towards the other colour; reprojected, 16 do (the column that came on screen and the cells a panel edge crosses).
 
-On the meadow it doesn't help, so it is an option and `on` stays the default. Set `[entities.camera_rig.orbit]` in `examples/ascii_motion.scene.toml` to `speed = 1.2` and `pan = true`, and the camera turns in place, sliding the picture about two cells a frame. These are 3 s captures at 1280x720 (181 frames, 14,400 cells), counted with `tools/ascii_flips.py`. `--track 8` counts flips along the picture's motion: for each 8x8 block of cells it finds the shift that best matches last frame. Without it, a glyph that travels with its surface would count as a flip in two cells. *Travel* is that tracker's mean shift in cells per frame, which shows whether glyphs move with the world:
+On the meadow it doesn't help, so it is an option and `on` stays the default. Set `[entities.camera_rig.orbit]` in [`flint-examples/ascii_motion.scene.toml`](https://github.com/chrischaps/flint-examples/blob/main/ascii_motion.scene.toml) to `speed = 1.2` and `pan = true`, and the camera turns in place, sliding the picture about two cells a frame. These are 3 s captures at 1280x720 (181 frames, 14,400 cells), counted with `tools/ascii_flips.py`. `--track 8` counts flips along the picture's motion: for each 8x8 block of cells it finds the shift that best matches last frame. Without it, a glyph that travels with its surface would count as a flip in two cells. *Travel* is that tracker's mean shift in cells per frame, which shows whether glyphs move with the world:
 
 | fast pan (1.2 rad/s) | flips | reversals | tracked flips | tracked reversals | travel |
 |---|---|---|---|---|---|
-| `off` | 16.34% | 4.20% | 10.23% | 1.67% | 1.10 |
-| `on` | 7.19% | 1.09% | 6.28% | 0.91% | 0.30 |
-| `reproject` | 15.75% | 3.56% | 8.80% | 1.61% | 1.19 |
+| `off` | 16.77% | 4.22% | 10.72% | 1.89% | 1.18 |
+| `on` | 5.37% | 0.48% | 4.68% | 0.50% | 0.29 |
+| `reproject` | 13.74% | 3.52% | 7.89% | 1.56% | 1.06 |
 
 | slow orbit (0.12 rad/s) | flips | reversals |
 |---|---|---|
-| `off` | 3.53% | 0.82% |
-| `on` | 1.90% | 0.25% |
-| `reproject` | 2.12% | 0.29% |
+| `off` | 2.67% | 0.58% |
+| `on` | 0.84% | 0.01% |
+| `reproject` | 0.99% | 0.03% |
 
-Reprojected glyphs do travel with the world (1.19 cells a frame, the same as the stateless style's 1.10). But flips along the motion fall only from 10.2% to 8.8%. The grid can't move, so a surface that slides 2.3 cells lands at a new place inside its cells. Each cell then averages a different patch of it, and the grass and ground really do change from one patch to the next. Screen-space history wins on every count because it does something else: it holds glyphs to the screen (0.30 cells a frame of travel) while the colours slide underneath. That doesn't read as lag. Each frame's cell colours are closer to the stateless frame's with `on` (3.01 levels in 255) than with `reproject` (3.54).
+Both tables were re-measured with the edge glyphs' history (#477; 2026-11-13, #481). Before it, `on` gave 1.09% reversals on the fast pan and 0.25% on the slow orbit.
+
+Reprojected glyphs do travel with the world (1.06 cells a frame, close to the stateless style's 1.18). But flips along the motion fall only from 10.7% to 7.9%. The grid can't move, so a surface that slides 2.3 cells lands at a new place inside its cells. Each cell then averages a different patch of it, and the grass and ground really do change from one patch to the next. Screen-space history wins on every count because it does something else: it holds glyphs to the screen (0.29 cells a frame of travel) while the colours slide underneath. That doesn't read as lag. Each frame's cell colours are closer to the stateless frame's with `on` (3.01 levels in 255) than with `reproject` (3.54; measured in #344, before the edge history).
 
 Reach for `reproject` when a scene has large flat surfaces whose colours differ in hue but not brightness. Smoothing lets go only on a jump in luminance, so screen-space history smears one such surface's colour into the next under a pan, as in the test above. It costs about 0.05 ms more than `on` at 1080p (0.46 against 0.41 ms for the whole style, `--gpu-time 240`).
 
-It is a display-stage style: it reads the finished, tonemapped picture at output resolution, after the render-scale upscale, so glyphs stay sharp at `--render-scale 0.5`. The grid is centred on the frame, so the part cells at the borders match. At a whole-number scale (8 px glyphs in 8, 16 or 24 px cells) glyphs are drawn exactly; at a fractional one, such as 12 px cells on a 1.5x display, each glyph pixel keeps one width and only its borders blend. It costs about 0.04 ms at 1080p on an RTX 4070 (`--gpu-time 240`), down from about 0.15 ms before #277 split it in two: the cell pass averages each cell's colour once, where the old single pass did it for every pixel. That is with `edges = 0`. The [edge passes](#edges) add about 0.4 ms (measured on the tavern before #277, as 0.15 against 0.53--0.67 ms).
+It is a display-stage style: it reads the finished, tonemapped picture at output resolution, after the render-scale upscale, so glyphs stay sharp at `--render-scale 0.5`. The grid is centred on the frame, so the part cells at the borders match. At a whole-number scale (8 px glyphs in 8, 16 or 24 px cells) glyphs are drawn exactly; at a fractional one, such as 12 px cells on a 1.5x display, each glyph pixel keeps one width and only its borders blend. With `edges = 0` it costs about 0.06 ms at 1080p on an RTX 4070 (`--gpu-time 240`; 0.04 ms when it was measured for #277), down from about 0.15 ms before #277 split it in two: the cell pass averages each cell's colour once, where the old single pass did it for every pixel. The [edges](#edges) add about 0.17 ms: 0.08 ms for the [shared edge pass](#shared-edges), which `--gpu-time` names **Style edges**, and 0.09 ms of ASCII's own, its pass taking 0.15 ms against 0.06. To measure, run `flint render flint-examples/pbr_test.scene.toml --style ascii --width 1920 --height 1080 --gpu-time 240`, then the same with `--style ascii:edges=0` (p50 of five alternating runs, #1321). Before the shared pass (#743) the edges cost about 0.4 ms.
 
 | Key | Default | |
 |-----|---------|---|
@@ -252,18 +306,18 @@ It is a display-stage style: it reads the finished, tonemapped picture at output
 
 ### Colour modes
 
-The glyph's shape carries brightness; its colour sets the mood (#276). Every capture below is `examples/pbr_test.scene.toml` at 1280x720, cropped at 1:1 around the two boxes and the character. They were made before edges (#267) were on by default: add `--ascii-no-edges` to get them exactly, or leave it off and the boxes are outlined too.
+The glyph's shape carries brightness; its colour sets the mood (#276). Every capture below is [`flint-examples/pbr_test.scene.toml`](https://github.com/chrischaps/flint-examples/blob/main/pbr_test.scene.toml) at 1280x720, cropped at 1:1 around the two boxes and the character. They were made before edges (#267) were on by default: add `edges=0` to the style word to get them exactly, or leave it off and the boxes are outlined too.
 
 | | |
 |---|---|
-| ![source](../images/ascii-color-source-pbr-test.png) `--ascii` (source) | ![tint](../images/ascii-color-tint-pbr-test.png) `--ascii-color tint` |
-| ![raw](../images/ascii-color-raw-pbr-test.png) `--ascii-color raw` | ![mono](../images/ascii-color-mono-pbr-test.png) `--ascii-color mono` |
-| ![phosphor](../images/ascii-color-phosphor-pbr-test.png) `--ascii-palette phosphor --ascii-glow 0.6` | ![amber](../images/ascii-color-amber-pbr-test.png) `--ascii-palette amber --ascii-ramp blocks` |
-| ![cga](../images/ascii-palette-cga-pbr-test-oklab.png) `--ascii-palette cga` | ![cga16](../images/ascii-palette-cga16-pbr-test-oklab.png) `--ascii-palette cga16` |
-| ![inverse](../images/ascii-color-inverse-pbr-test.png) `--ascii-palette cga-warm --ascii-ground inverse` | ![black](../images/ascii-color-black-pbr-test.png) `--ascii-ground black` |
-| ![tidepool](../images/ascii-color-tidepool-pbr-test.png) `--ascii-palette tidepool` (`examples/palettes/tidepool.palette.toml`) | |
+| ![source](../images/ascii-color-source-pbr-test.png) `--style ascii` (source) | ![tint](../images/ascii-color-tint-pbr-test.png) `--style ascii:color=tint` |
+| ![raw](../images/ascii-color-raw-pbr-test.png) `--style ascii:color=raw` | ![mono](../images/ascii-color-mono-pbr-test.png) `--style ascii:color=mono` |
+| ![phosphor](../images/ascii-color-phosphor-pbr-test.png) `--style ascii:palette=phosphor,color=palette,glow=0.6` | ![amber](../images/ascii-color-amber-pbr-test.png) `--style ascii:palette=amber,color=palette,ramp=blocks` |
+| ![cga](../images/ascii-palette-cga-pbr-test-oklab.png) `--style ascii:palette=cga,color=palette` | ![cga16](../images/ascii-palette-cga16-pbr-test-oklab.png) `--style ascii:palette=cga16,color=palette` |
+| ![inverse](../images/ascii-color-inverse-pbr-test.png) `--style ascii:palette=cga-warm,color=palette,ground=inverse` | ![black](../images/ascii-color-black-pbr-test.png) `--style ascii:ground=black` |
+| ![tidepool](../images/ascii-color-tidepool-pbr-test.png) `--style ascii:palette=tidepool,color=palette` ([`flint-examples/palettes/tidepool.palette.toml`](https://github.com/chrischaps/flint-examples/blob/main/palettes/tidepool.palette.toml)) | |
 
-And on `examples/mesh_meadow.scene.toml` (640x360 crops):
+And on [`flint-examples/mesh_meadow.scene.toml`](https://github.com/chrischaps/flint-examples/blob/main/mesh_meadow.scene.toml) (640x360 crops):
 
 ![The meadow in phosphor green](../images/ascii-color-phosphor-mesh-meadow.png)
 ![The meadow in amber blocks](../images/ascii-color-amber-mesh-meadow.png)
@@ -278,7 +332,7 @@ background = "#0d1b2a"     # default black
 colors = ["#1b998b", "#3a86ff", "#ed217c", "#ff9b71", "#fffd82", "#e8f1f2"]
 ```
 
-`nearest` gives each cell the ink nearest its hue at full value, so a dark red still reads red and glyph density alone says it's dark. Distance is measured in OKLab (#320, below), and the style's `chroma` and `palette_dither` shape the match. `luminance` lists the inks darkest first and picks one by the cell's tone, as a one-colour phosphor tube does. Up to 32 inks. A file wins over a built-in of the same name; `PaletteCache` resolves names the way `GlyphSetCache` resolves fonts, through the vfs, and hot-reloads the same way (#323): change an ink with the viewer or player open and the frame recolours within a second (half a second, measured on `examples/ascii_tidepool.scene.toml`), and a file that appears beside the scene takes over a built-in of its name. Natively only; a web bundle never changes.
+`nearest` gives each cell the ink nearest its hue at full value, so a dark red still reads red and glyph density alone says it's dark. Distance is measured in OKLab (#320, below), and the style's `chroma` and `palette_dither` shape the match. `luminance` lists the inks darkest first and picks one by the cell's tone, as a one-colour phosphor tube does. Up to 32 inks. A file wins over a built-in of the same name; `PaletteCache` resolves names the way `GlyphSetCache` resolves fonts, through the vfs, and hot-reloads the same way (#323): change an ink with the viewer or player open and the frame recolours within a second (half a second, measured on [`flint-examples/ascii_tidepool.scene.toml`](https://github.com/chrischaps/flint-examples/blob/main/ascii_tidepool.scene.toml)), and a file that appears beside the scene takes over a built-in of its name. Natively only; a web bundle never changes.
 
 | Built-in | Match | Inks |
 |---|---|---|
@@ -295,7 +349,7 @@ colors = ["#1b998b", "#3a86ff", "#ed217c", "#ff9b71", "#fffd82", "#e8f1f2"]
 ![The meadow in ASCII paper with the dim ground: grass and sky both pale](../images/ascii-paper-dim-mesh-meadow.png)
 ![The meadow in ASCII paper with the inverse ground: dark grass under a light sky](../images/ascii-paper-inverse-mesh-meadow.png)
 
-*`--ascii --ascii-palette paper --ascii-ground dim|inverse` on `examples/mesh_meadow.scene.toml` at 1280x720, cropped at 1:1.*
+*`--style ascii:palette=paper,color=palette,ground=dim|inverse` on [`flint-examples/mesh_meadow.scene.toml`](https://github.com/chrischaps/flint-examples/blob/main/mesh_meadow.scene.toml) at 1280x720, cropped at 1:1.*
 
 #### Palettes match in OKLab
 
@@ -306,7 +360,7 @@ A `nearest` palette compares colours in [OKLab](https://bottosson.github.io/post
 
 Each pair below is the same 640x360 crop (from 1280x720), before #320 (RGB), after it with the defaults, and after it with `--style ascii:chroma=3,palette_dither=1`:
 
-| `--ascii-palette` | RGB (before) | OKLab | OKLab, `chroma = 3`, `palette_dither = 1` |
+| `palette` | RGB (before) | OKLab | OKLab, `chroma = 3`, `palette_dither = 1` |
 |---|---|---|---|
 | `cga`, pbr_test | ![](../images/ascii-palette-cga-pbr-test-rgb.png) | ![](../images/ascii-palette-cga-pbr-test-oklab.png) | ![](../images/ascii-palette-cga-pbr-test-dither.png) |
 | `cga16`, pbr_test | ![](../images/ascii-palette-cga16-pbr-test-rgb.png) | ![](../images/ascii-palette-cga16-pbr-test-oklab.png) | ![](../images/ascii-palette-cga16-pbr-test-dither.png) |
@@ -317,7 +371,7 @@ Under `cga16` the red box now takes `#ff5555` rather than `#aa0000`, the cube's 
 
 The CPU reference is `Palette::pick(colour, chroma, dither, cell)`, and the shader's is `pal_pick` in `crates/flint-render/src/palette.wgsl`, which the glyph pass includes. Inks are converted to OKLab once a frame on the CPU. A GPU test (`the_palette_matcher_agrees_with_its_cpu_reference`) holds the two to the same ink over a grid of 4096 colours with chroma and dither on. A `luminance` palette ignores both keys. Matching in OKLab costs about 0.03 ms at 1080p for `cga16`'s 15 inks (0.076 ms before, 0.103 ms after, `--gpu-time 240` on an RTX 4070 with edges off). Dither adds about 0.003 ms.
 
-Since #277 split the style into a cell pass and a glyph pass, most colour choices cost nothing extra. On an RTX 4070 at 1080p with edges off, the ASCII pass takes 0.047 ms in `source`, `tint`, `raw` and `mono`, with the `phosphor` ladder (0.048 ms), and with `ground = "black"` or `"inverse"`. All of these are the same as plain ASCII. Two settings cost more. Matching `cga16`'s 15 inks in OKLab takes 0.099 ms, and `glow = 0.6` takes 0.154 ms, because the glyph pass makes 24 more glyph reads a pixel. Before the split these were 0.143 ms (`source`), 0.152 ms (`cga16`), 0.144 ms (`inverse`) and 0.220 ms (`glow`). With the [edge passes](#edges) on, every mode measures 0.36--0.49 ms. The roughly 0.35 ms of edge work varies from run to run by more than the colour modes differ, so it hides them. To measure: `flint render examples/pbr_test.scene.toml --ascii --ascii-no-edges --width 1920 --height 1080 --gpu-time 240`, adding each mode's flag. The figures are the best of 5 alternating processes per mode, with SSAO steady at 0.150 ms across all of them as a control (#383).
+Since #277 split the style into a cell pass and a glyph pass, most colour choices cost nothing extra. On an RTX 4070 at 1080p with edges off, the ASCII pass takes 0.060 ms in `source`, `tint`, `raw` and `mono`, and with `ground = "black"` or `"inverse"`; with the `phosphor` ladder it takes 0.063 ms. All of these are the same as plain ASCII. Two settings cost more. Matching `cga16`'s 15 inks in OKLab takes 0.118 ms, and `glow = 0.6` (on phosphor) takes 0.199 ms, because the glyph pass makes 24 more glyph reads a pixel. When #383 measured them, with SSAO at 0.150 ms against today's 0.165, these were 0.047 ms (`source`), 0.099 ms (`cga16`) and 0.154 ms (`glow`). Before the split they were 0.143 ms (`source`), 0.152 ms (`cga16`), 0.144 ms (`inverse`) and 0.220 ms (`glow`). The [edges](#edges) add the same 0.17 ms to every mode: 0.08 ms for the [shared edge pass](#shared-edges) and 0.09 ms of ASCII's own. With them on, the ASCII pass takes 0.151 ms in `source`, 0.207 ms with `cga16` and 0.286 ms with `glow`, beside **Style edges** at 0.083 ms. Before the shared pass (#743) the edge work was about 0.35 ms, and it varied from run to run by more than the modes differ. To measure: `flint render flint-examples/pbr_test.scene.toml --style ascii:edges=0 --width 1920 --height 1080 --gpu-time 240`, adding each mode's flag; leave out `edges=0` to see the edges' cost. The figures are p50, the median of three to five alternating processes per mode, with SSAO steady at 0.165 ms across all of them as a control (#1321).
 
 ### Edges
 
@@ -325,15 +379,15 @@ Luminance alone loses a silhouette wherever an object is about as bright as what
 
 ![A sphere, a box and a pillar in ASCII, each outlined in unbroken line glyphs](../images/ascii-edges-on.png)
 
-![The same scene with --ascii-no-edges: the sphere's top half melts into the ground behind it](../images/ascii-edges-off.png)
+![The same scene with edges off: the sphere's top half melts into the ground behind it](../images/ascii-edges-off.png)
 
-*`examples/ascii_edges.scene.toml` at 1280x720, cropped at 1:1, with edges (top) and with `--ascii-no-edges`. The sphere and the box carry `style_mask { style = "ascii" }`; the pillar has none, so it is outlined by depth alone.*
+*[`flint-examples/ascii_edges.scene.toml`](https://github.com/chrischaps/flint-examples/blob/main/ascii_edges.scene.toml) at 1280x720, cropped at 1:1, with edges (top) and with `--style ascii:edges=0`. The sphere and the box carry `style_mask { style = "ascii" }`; the pillar has none, so it is outlined by depth alone.*
 
 Edges come from geometry, never from colour, so a wood texture makes none but a table's outline and its creases do (the ASCII spike's finding, #261). Three passes, before the glyph pass:
 
-1. **Edge pixels**, at the depth's resolution. A 3x3 Sobel over the relative view distance finds silhouettes; one over normals rebuilt from the depth finds creases, counted only where the 5x5 patch is one surface. Where an ASCII-styled entity (an `ascii_style`, or a `style_mask { style = "ascii" }`, [the entity style mask](#the-entity-style-mask)) meets anything else, including another styled entity with different settings, the pixel is an **outline**. Silhouettes and outlines keep their near side only, so each is drawn once.
+1. **Edge pixels**, at the depth's resolution. The silhouettes and creases are the [shared edges](#shared-edges)' (#743; ASCII found its own until then), scaled by the style's `edge_depth` and `edge_normal`: a 3x3 Sobel over the relative view distance finds silhouettes; one over normals rebuilt from the depth finds creases, counted only where the 5x5 patch is one surface. Each normal is rebuilt from one neighbour on each axis, on the side whose two neighbours lie on the pixel's own plane (a plane's depth is affine across the screen), never across a step or a fold beside it, so a crease marks the two pixels astride it rather than a band (#484: where the ground came close behind a pillar's foot, a 4-pixel band filled its cells past `edge_max` and the outline went; #952: choosing the neighbour nearer in view distance found a step's side but not a fold's, and a pillar's foot seen square on was 3 pixels tall). ASCII's own pass adds the outlines: where an ASCII-styled entity (an `ascii_style`, or a `style_mask { style = "ascii" }`, [the entity style mask](#the-entity-style-mask)) meets anything else, including another styled entity with different settings, the pixel is an **outline**. Silhouettes and outlines keep their near side only, so each is drawn once.
 2. **Cells**, one fragment a glyph cell. It reads every edge pixel in its cell, not a sparse lattice, so a one-pixel outline can't slip between samples, and sums their structure tensors: the dominant orientation picks the glyph. The cell draws a line when it holds at least `edge_threshold` cell widths of edge and at most `edge_max` (an outline needs only the threshold).
-3. **The glyph pass** draws the cell's line glyph in the one cell the line passes within half a cell of, measured across it: down the cell's centre column for a line nearer horizontal, along its centre row for one nearer vertical (#352). The cell pass finds where that is from the edge pixels' centroid, each pixel weighted by how much its gradient agrees with the cell's line, so a corner's other arm doesn't pull it. That is the cell a Bresenham line lights, so a line along a cell border, a coarse diagonal or a silhouette at render scale 0.5 draws one chain of cells, not two. A band of edge pixels wider than one (two-pixel stairs at scale 0.5) can straddle the border; the two halves count as one line when they run within 10° of each other and lie within three quarters of a cell, and the pair's centroid decides. Two real edges a cell apart, or converging at an angle like a box's silhouette and the crease below it, each keep their own.
+3. **The glyph pass** draws the cell's line glyph in the one cell the line passes within half a cell of, measured across it: down the cell's centre column for a line nearer horizontal, along its centre row for one nearer vertical (#352). The cell pass finds where that is from the edge pixels' centroid, each pixel weighted by how much its gradient agrees with the cell's line, so a corner's other arm doesn't pull it. That is the cell a Bresenham line lights, so a line along a cell border, a coarse diagonal or a silhouette at render scale 0.5 draws one chain of cells, not two. A band of edge pixels wider than one (two-pixel stairs at scale 0.5) can straddle the border; the two halves count as one line when they run within 10° of each other and lie within three quarters of a cell, and the pair's centroid decides. Two real edges a cell apart, or converging at an angle like a box's silhouette and the crease below it, each keep their own. Per entity, a silhouette along a cell border can fall to the cell just outside the entity, whose pixels pass the picture through, and its glyph would be drawn nowhere (#493). So a cell counts as drawn when the pixel at its centre is the whole frame's (while the whole frame is drawn) or belongs to a variant on the screen grid that is on. Of two cells that both hold the line, the drawn one takes it. A line whose pixels all lie in an outside cell moves into the drawn cell it leans toward, under a cell from where it was. Whole-frame ASCII draws every cell, so nothing moves there.
 
 #### Corners
 
@@ -356,9 +410,9 @@ edge_corner = 0                       edge_corner = 0.9 (the default)
 ╲****│++++++│::::::::::::::│******    ╲****│++++++│::::::::::::::│******           meet its vertical
 ```
 
-*`examples/ascii_edges.scene.toml` at 1280x720, columns 72 to 105 of `--ascii-text`. These five cells are all that changed in the frame. At the horizon's right the pillar's edge steps a column left below it, so the cell sees no `│` beneath and draws `└`.*
+*[`flint-examples/ascii_edges.scene.toml`](https://github.com/chrischaps/flint-examples/blob/main/ascii_edges.scene.toml) at 1280x720, columns 72 to 105 of `--ascii-text`. These five cells are all that changed in the frame. At the horizon's right the pillar's edge steps a column left below it, so the cell sees no `│` beneath and draws `└`.*
 
-The glyphs come from the set's `[edges] corners` ([glyph sets](glyph-atlas.md#a-glyph-set-file)); the built-in set has all nine. A set without them, like `examples/fonts/halftone.glyphs.toml`, draws the line glyphs it always did (the golden `ascii-edges-no-corner-glyphs` holds that to the pixel against `edge_corner = 0`), and a set with only the four corners keeps its lines at tees. A per-entity variant in a font of its own uses that font's corners. The edge view below draws a cell's corner in yellow, its arms from the cell's centre.
+The glyphs come from the set's `[edges] corners` ([glyph sets](glyph-atlas.md#a-glyph-set-file)); the built-in set has all nine. A set without them, like [`flint-examples/fonts/halftone.glyphs.toml`](https://github.com/chrischaps/flint-examples/blob/main/fonts/halftone.glyphs.toml), draws the line glyphs it always did (the golden `ascii-edges-no-corner-glyphs` holds that to the pixel against `edge_corner = 0`), and a set with only the four corners keeps its lines at tees. A per-entity variant in a font of its own uses that font's corners. The edge view below draws a cell's corner in yellow, its arms from the cell's centre.
 
 Two corners the coherence test can't see turn too (#637):
 
@@ -376,7 +430,7 @@ before #637                               after
 :::::::::::│*********************│****    :::::::::::│*********************│****
 ```
 
-*`examples/ascii_edges.scene.toml` at 1920x1080, columns 138 to 175 of `--ascii-text`. These three cells are all that changed in the frame.*
+*[`flint-examples/ascii_edges.scene.toml`](https://github.com/chrischaps/flint-examples/blob/main/ascii_edges.scene.toml) at 1920x1080, columns 138 to 175 of `--ascii-text`. These three cells are all that changed in the frame.*
 
 Under a render scale the edge pixels are the scene's, so a line is still one cell wide. The editor grid of `flint render` (on unless `--no-grid`) is an overlay drawn after the opaque geometry that writes no depth (#346), so the edges never trace it; its lines still lift the tone glyphs they cross, which is why renders of the look pass `--no-grid`.
 
@@ -401,17 +455,17 @@ edge_color = "#ffb347"    # ...outlined in amber
 
 From the command line, `--style ascii:color=tint,edge_ink=color,edge_color=#ffb347`.
 
-![examples/ascii_edges.scene.toml under a green tint: edges in the cell's ink (left) and in amber (right)](../images/ascii-edge-ink.png)
+![flint-examples/ascii_edges.scene.toml under a green tint: edges in the cell's ink (left) and in amber (right)](../images/ascii-edge-ink.png)
 
-*`examples/ascii_edges.scene.toml` at 960x540, cropped and doubled: `color = "tint"` with `edge_ink = "cell"` (left) and `edge_ink = "color", edge_color = "#ffb347"` (right).*
+*[`flint-examples/ascii_edges.scene.toml`](https://github.com/chrischaps/flint-examples/blob/main/ascii_edges.scene.toml) at 960x540, cropped and doubled: `color = "tint"` with `edge_ink = "cell"` (left) and `edge_ink = "color", edge_color = "#ffb347"` (right).*
 
 #### Seeing the decisions: `--debug-mode edges`
 
 A missing or doubled line glyph could come from any of the three passes, and the glyphs alone don't say which. The edge view (#349) draws what each pass decided, in place of the glyphs, over the scene in dim grey:
 
 ```bash
-flint render examples/ascii_edges.scene.toml --debug-mode edges --no-grid --output edges.png
-flint render examples/ascii_edges.scene.toml --debug-mode edges --no-grid --style ascii:cell=16 --output cells.png
+flint render flint-examples/ascii_edges.scene.toml --debug-mode edges --no-grid --output edges.png
+flint render flint-examples/ascii_edges.scene.toml --debug-mode edges --no-grid --style ascii:cell=16 --output cells.png
 ```
 
 - **Edge pixels**, by the source that marked them: cyan a depth step, amber a crease, magenta a styled entity's outline.
@@ -422,7 +476,7 @@ flint render examples/ascii_edges.scene.toml --debug-mode edges --no-grid --styl
 
 ![A close-up at 16-point cells: the pillar's foot and the box's top, each cell's length written in its corner](../images/ascii-edges-debug-cells.png)
 
-*`examples/ascii_edges.scene.toml` at 1280x720 (top) and at `ascii:cell=16`, cropped and doubled (bottom). The horizon is a depth step, the sky's far plane against the ground. Along the box's top the crease and the outline run a few pixels apart, so its cells hold 2.1 to 2.7 cell widths, inside `edge_max`; where the pillar meets the ground they hold 3.0, right at it.*
+*[`flint-examples/ascii_edges.scene.toml`](https://github.com/chrischaps/flint-examples/blob/main/ascii_edges.scene.toml) at 1280x720 (top) and at `ascii:cell=16`, cropped and doubled (bottom). The horizon is a depth step, the sky's far plane against the ground. Along the box's top the crease and the outline run a few pixels apart, so its cells hold 2.1 to 2.7 cell widths, inside `edge_max`; where the pillar meets the ground they hold 3.0, right at it.*
 
 Read it beside the four keys in the table above: `edge_depth` and `edge_normal` decide the coloured pixels, `edge_threshold` and `edge_max` the cells. `flint render` prints the thresholds it drew at and the legend, and draws the same legend in the image's lower left. Lower `edge_max` until a cell turns red to see how close a run of geometry is to being called texture. The view draws through post-processing, and switches ASCII on at its defaults in a scene that has none. In the player and viewer it is **Style Edges** in F4's debug shading list, with the legend under it.
 
@@ -443,21 +497,21 @@ exposure = 0.5      # optional: half a stop first
 
 ![The meadow barrel four ways: smooth; plain glyphs, mostly dots; brightness 0.35 and contrast 1.4, brighter but still narrow; normalize = 1, the full ramp from dots to @ with the hoops as rows of = and -](../images/ascii-normalize-barrel.png)
 
-*The barrel in `examples/ascii_entities.scene.toml` at 1280x720, cropped and doubled: smooth, plain, the `brightness = 0.35, contrast = 1.4` it needed before, and `normalize = 1` (its setting now). Its lower half averages 0.024 luminance in the smooth render, so it stays sparse even stretched: that is real darkness, not lost detail.*
+*The barrel in [`flint-examples/ascii_entities.scene.toml`](https://github.com/chrischaps/flint-examples/blob/main/ascii_entities.scene.toml) at 1280x720, cropped and doubled: smooth, plain, the `brightness = 0.35, contrast = 1.4` it needed before, and `normalize = 1` (its setting now). Its lower half averages 0.024 luminance in the smooth render, so it stays sparse even stretched: that is real darkness, not lost detail.*
 
 ![Three barrels: plain, exposure 1.5, normalize 1](../images/ascii-dark-props.png)
 
-*`examples/ascii_dark_props.scene.toml`: plain, `exposure = 1.5` and `normalize = 1`, side by side.*
+*[`flint-examples/ascii_dark_props.scene.toml`](https://github.com/chrischaps/flint-examples/blob/main/ascii_dark_props.scene.toml): plain, `exposure = 1.5` and `normalize = 1`, side by side.*
 
-The range is measured from the same frame, so `flint render` stays deterministic and nothing lags a frame behind: three small passes before the cell pass walk a fixed 320x180 lattice over the picture, sum each slot's samples (count, luminance, luminance squared) in runs of 20, add the runs into rows, and add the rows into each slot's range: its mean -/+ 2 standard deviations. The range maps linearly onto 0..1, then a gamma (0.35 to 2.5) puts the slot's mean at mid-grey, since a lit top and a shadowed side are often both in range and the linear stretch alone leaves the shadow blank. That is a percentile without a histogram: a highlight or a crack moves it far less than it would a min and max. A range narrower than 0.08 is widened around its middle, so a flat wall's noise doesn't fill the ramp. The passes run only when some slot asks for `normalize`; brightness and contrast then apply to the stretched tone as before. The statistics cost about 0.02 ms on an RTX 4070 at 1080p (`examples/ascii_entities.scene.toml` with `--ascii-edges 0 --gpu-time 240`: 0.094 ms with the barrel normalised, 0.074 ms without). About half of that is the three passes' fixed cost. Before #337 the lattice rows were summed by one fragment each, 180 threads walking 320 samples apiece, and the statistics cost about 0.075 ms.
+The range is measured from the same frame, so `flint render` stays deterministic and nothing lags a frame behind: three small passes before the cell pass walk a fixed 320x180 lattice over the picture, sum each slot's samples (count, luminance, luminance squared) in runs of 20, add the runs into rows, and add the rows into each slot's range: its mean -/+ 2 standard deviations. The range maps linearly onto 0..1, then a gamma (0.35 to 2.5) puts the slot's mean at mid-grey, since a lit top and a shadowed side are often both in range and the linear stretch alone leaves the shadow blank. That is a percentile without a histogram: a highlight or a crack moves it far less than it would a min and max. A range narrower than 0.08 is widened around its middle, so a flat wall's noise doesn't fill the ramp. The passes run only when some slot asks for `normalize`; brightness and contrast then apply to the stretched tone as before. A variant's runs and rows outside its own screen bounds are zeros, written without sampling, and the last pass adds only the rows inside them (#507). The statistics cost about 0.013 ms on an RTX 4070 at 1080p ([`flint-examples/ascii_entities.scene.toml`](https://github.com/chrischaps/flint-examples/blob/main/ascii_entities.scene.toml), whole frame, with `--style ascii:edges=0 --gpu-time 240`: 0.088 ms with the barrel normalised, 0.075 ms without), about half of it the three passes' fixed cost. Before #337 the lattice rows were summed by one fragment each, 180 threads walking 320 samples apiece, and the statistics cost about 0.075 ms; before #507 about 0.021 ms.
 
 ## Per-entity ASCII
 
 An entity with an `ascii_style` component is drawn in glyphs while the rest of the scene stays smooth (#266). No `[post_process.styles.ascii]` table is needed:
 
-![examples/ascii_entities.scene.toml: the meadow and the ground stay smooth while the bench (amber blocks), the skinned YBot (its own colour), the barrel (on its own grid) and the crate with its lantern (phosphor green) are glyphs; the lantern's glass box stays smooth](../images/ascii-entities.png)
+![flint-examples/ascii_entities.scene.toml: the meadow and the ground stay smooth while the bench (amber blocks), the skinned YBot (its own colour), the barrel (on its own grid) and the crate with its lantern (phosphor green) are glyphs; the lantern's glass box stays smooth](../images/ascii-entities.png)
 
-*`flint render examples/ascii_entities.scene.toml --no-grid --target 0.7,0.7,4.2 --distance 5.2 --yaw 29 --pitch 10`, 1280x720.*
+*`flint render flint-examples/ascii_entities.scene.toml --no-grid --target 0.7,0.7,4.2 --distance 5.2 --yaw 29 --pitch 10`, 1280x720.*
 
 ```toml
 [post_process.styles.ascii]   # optional: the preset every styled entity starts from
@@ -478,24 +532,24 @@ enabled = false               # stays smooth, even under a whole-frame ASCII
 
 - **Fields.** Every key of the table above except `scope`, all optional. A field the entity leaves out comes from the scene's table, then the style's default. The schema gives no field a default on purpose, since the loader would fill it in and hide the scene's setting. An archetype's `[archetype.<name>.defaults.ascii_style]` is a preset too, and an entity's own fields merge over it field by field.
 - **Descendants** inherit their ancestor's style until one carries an `ascii_style` or `style_mask` of its own; the nearest wins. A plain `style_mask { style = "ascii" }` is the same as an empty `ascii_style`.
-- **Ids.** Entities with the same settings share one style mask id. Each distinct set of settings is a variant, and the pass looks up each pixel's settings by its id. The variant table is two storage buffers, every variant's row and each mask id's slot, sized to the frame: they start at 64 entries and double when a frame needs more, so 500 props on `grid = "object"` each get a row (#336). A pixel of the whole frame never reads them, so full-screen ASCII costs what it did. Past 4095 variants (the tone statistics' texture holds a column each) the rest are drawn like the whole frame, with a warning.
-- **Colour.** A cell's colour averages only the samples of the pixel's own variant, so a styled prop's glyphs carry its colour, not the meadow's behind it. Its silhouette is the mask's, to the pixel. With a `footprint` of 2 or more those 16 samples are summed once a cell, in a pre-pass (#313, `ascii_variant_cells.wgsl`), rather than in each of the cell's pixels. Variants on one grid (the same cell, origin and footprint) share a band of rows, and each cell keeps the first two of the band's variants met in it. A pixel of a third variant still sums for itself, and so does a variant past 8 grids. At footprint 1 every pixel sums for itself: its 16 loads hit the 16 texels its cell shares, so they come from the texture cache, and there a pre-pass over every cell cost more than it saved. The pixels are the same either way, to the bit. Timings are in [Profiling](../guides/profiling.md#gpu-timing).
-- **The whole frame.** With the scene's table on and `scope = "screen"` (or `--ascii`), everything is glyphs and entities still change their own settings; `enabled = false` keeps one smooth.
+- **Ids.** Entities with the same settings share one style mask id. Each distinct set of settings is a variant, and the pass looks up each pixel's settings by its id. The variant table is two storage buffers, every variant's row and each mask id's slot, sized to the frame: they start at 64 entries and double when a frame needs more, so 500 props on `grid = "object"` each get a row (#336). Every per-entity style uses the same table since #740 (pencil, watercolor and user styles held 63, 15 and 15 variants before). A pixel of the whole frame never reads them, so full-screen ASCII costs what it did. Past 4095 variants (the tone statistics' texture holds a column each) the rest are drawn like the whole frame, with a warning that names the first entity left out. Whenever a cap like this leaves an entity out (this one, ASCII's 8 dissolve bands and 8 snap grids, pencil's and watercolor's paper images), the player and the scene viewer show it on screen too: a card in the bottom-left corner names the style, the cap and the first entity past it, until another scene loads (#1246).
+- **Colour.** A cell's colour averages only the samples of the pixel's own variant, so a styled prop's glyphs carry its colour, not the meadow's behind it. Its silhouette is the mask's, to the pixel. With a `footprint` of 2 or more those 16 samples are summed once a cell, in a pre-pass (#313, `ascii_variant_cells.wgsl`), rather than in each of the cell's pixels. Variants on one grid (the same cell, origin and footprint) share a band of rows, and each cell keeps the first two of the band's variants met in it. A pixel of a third variant still sums for itself, and so do a variant past 8 grids and one past the 255th row of the variant table, which a cell's texel can't name (#507). At footprint 1 the pre-pass runs only when the variants' draws have screen bounds, and then only over the cells near them (#507): over every cell on screen it cost more than it saved, since a pixel's 16 loads hit the 16 texels its cell shares and come from the texture cache. Without bounds (a draw that crosses the camera plane, or `FLINT_STYLE_SCISSOR=0`) every pixel at footprint 1 sums for itself. The pixels are the same either way, to the bit. Timings are in [Profiling](../guides/profiling.md#gpu-timing).
+- **The whole frame.** With the scene's table on and `scope = "screen"` (or `--style ascii`), everything is glyphs and entities still change their own settings; `enabled = false` keeps one smooth.
 - **Grids.** By default every styled entity shares the screen's grid, which keeps glyphs aligned where props meet (the spike's finding, #261). `grid = "object"` pins an entity's cells to its projected origin: its glyphs hold still while it slides across the screen, but still swim when it turns or comes closer (#277). Each such entity gets a variant of its own.
 - **Colour modes** (`color`, `palette`, `ground`, `glow`) are per entity too: a frame packs up to 32 palette inks in all, and a palette that doesn't fit beside the others uses the scene's, with a warning.
 - **Edges between entities** come from [edges](#edges) (#267). Without them a styled prop's edge is only where its glyph field stops, so two styled props that overlap would run together. The edge passes draw line glyphs along depth steps and creases, and an outline wherever the style mask changes from one of the style's ids to any other: the plain `ascii` id or any variant's, so a change between two variants is an outline too. Ids are per variant, not per entity, so two props with the same settings that touch on one surface are told apart by the depth and crease edges, not the mask. Variants on `grid = "object"` don't draw edges yet, because the edge cells are on the screen grid.
 - **Temporal stability** (#277's `smoothing`, `hysteresis` and `dither`) applies to the whole frame's cells. A per-entity variant is drawn per pixel on its own grid and keeps no history yet, so a styled prop can still shimmer in motion.
-- **From scripts** (#269): `set_entity_style(id, "ascii")`, `set_style_param(id, "cell", 12.0)` and `clear_entity_style(id)` edit the component at runtime, and changing a param every frame makes no GPU allocation. `tween_style_param(id, "cell", 7.0, 1.5)` lets the engine ease one (#370), and `get_entity_style(id)` / `get_style_param(id, "cell")` read back what an entity is drawn in, inherited or whole-frame (#372). See [Scripting → Style API](scripting.md#style-api) and `examples/ascii_story.scene.toml`. Whole-frame styles have their own calls, `set_post_style` and `set_post_style_param` (#369; [Scripting → Whole-frame styles](scripting.md#whole-frame-styles)).
-- **Fonts** (#335). An entity's `font` names its own glyph set, so props can draw in different fonts in one frame. Every set in use is stacked into one atlas texture (`GpuGlyphStack`, uploaded again only when the frame's sets change), and each variant's row carries its font's glyph cell and where its ramp and its four edge glyphs sit, so the cell's height follows that font's aspect and the edges are drawn in its own line glyphs. A frame holds up to 8 fonts and an atlas stack up to 8192 pixels tall. A font that doesn't fit, or whose ramp and edges don't fit in the frame's 128 ramp steps, draws in the scene's font, with a warning. `examples/ascii_fonts.scene.toml` draws a YBot and a barrel in a hand-drawn halftone set (`examples/fonts/halftone.glyphs.toml`, 8x12 cells) beside props in the built-in letters.
+- **From scripts** (#269): `set_entity_style(id, "ascii")`, `set_style_param(id, "cell", 12.0)` and `clear_entity_style(id)` edit the component at runtime, and changing a param every frame makes no GPU allocation. `tween_style_param(id, "cell", 7.0, 1.5)` lets the engine ease one (#370), and `get_entity_style(id)` / `get_style_param(id, "cell")` read back what an entity is drawn in, inherited or whole-frame (#372). See [Scripting → Style API](scripting.md#style-api) and [`flint-examples/ascii_story.scene.toml`](https://github.com/chrischaps/flint-examples/blob/main/ascii_story.scene.toml). Whole-frame styles have their own calls, `set_post_style` and `set_post_style_param` (#369; [Scripting → Whole-frame styles](scripting.md#whole-frame-styles)).
+- **Fonts** (#335). An entity's `font` names its own glyph set, so props can draw in different fonts in one frame. Every set in use is stacked into one atlas texture (`GpuGlyphStack`, uploaded again only when the frame's sets change), and each variant's row carries its font's glyph cell and where its ramp and its four edge glyphs sit, so the cell's height follows that font's aspect and the edges are drawn in its own line glyphs. A frame holds up to 8 fonts and an atlas stack up to 8192 pixels tall. A font that doesn't fit, or whose ramp and edges don't fit in the frame's 128 ramp steps, draws in the scene's font, with a warning. [`flint-examples/ascii_fonts.scene.toml`](https://github.com/chrischaps/flint-examples/blob/main/ascii_fonts.scene.toml) draws a YBot and a barrel in a hand-drawn halftone set ([`flint-examples/fonts/halftone.glyphs.toml`](https://github.com/chrischaps/flint-examples/blob/main/fonts/halftone.glyphs.toml), 8x12 cells) beside props in the built-in letters.
 - **Not yet:** ramps beyond 128 steps in all across the frame's variants (a ramp that doesn't fit uses the scene's, with a warning).
 
 ```bash
-flint render examples/ascii_entities.scene.toml --output ascii.png              # as authored
-flint render examples/ascii_entities.scene.toml --ascii-scope screen            # the whole frame
-flint render examples/pbr_test.scene.toml --ascii --ascii-grid object           # flags set the preset
+flint render flint-examples/ascii_entities.scene.toml --output ascii.png              # as authored
+flint render flint-examples/ascii_entities.scene.toml --style ascii:scope=screen      # the whole frame
+flint render flint-examples/pbr_test.scene.toml --style ascii:grid=object             # a style word sets the preset
 ```
 
-At 1080p on an RTX 4070 the demo's ASCII pass costs about 0.045 ms and its mask 0.013--0.023 ms (DX12, Vulkan); with `--ascii-scope screen` the pass costs about 0.06 ms, and with no styled entities 0.04 ms. In Chrome it is about twice that, and a render scale leaves it unchanged, since the cells are output pixels. A phone is another matter: on a Pixel 8 Pro (Mali-G715) any ASCII, per entity or full screen, with or without edges, takes the web player from about 64 fps to 25--30, while `invert` and `palette` cost nothing visible (#378; the pass is being found in #568). The numbers by backend, scale, browser and phone are in `docs/design/web.md` ("Stylize passes", #270, #378). It works under `--msaa 4` and `--render-scale`, where the silhouette follows the scaled mask. F4 → Styles → ASCII offers `scope` and `grid` beside the other settings, and `flint edit --watch` hot-reloads `ascii_style` edits.
+At 1080p on an RTX 4070 the demo's ASCII pass costs about 0.045 ms and its mask 0.013--0.023 ms (DX12, Vulkan); with `--style ascii:scope=screen` the pass costs about 0.06 ms, and with no styled entities 0.04 ms. In Chrome it is about twice that, and a render scale leaves it unchanged, since the cells are output pixels. A phone is another matter: on a Pixel 8 Pro (Mali-G715) ASCII took the web player from about 64 fps to 25--30, while `invert` and `palette` cost nothing visible (#378). Three quarters of that is the shared edge pass, which `edges` (default 1) turns on: about 3 ms of GPU a frame at render scale 1 and 1.5 ms at the web's 0.67 cap, against 0.09 ms at 1080p on an RTX 4070. With `edges = 0` the rest of ASCII costs about 1 ms there (#568). The numbers by backend, scale, browser and phone are in `docs/design/web.md` ("Stylize passes", #270, #378). It works under `--msaa 4` and `--render-scale`, where the silhouette follows the scaled mask. F4 → Styles → ASCII offers `scope` and `grid` beside the other settings, and `flint edit --watch` hot-reloads `ascii_style` edits.
 
 ### Silhouettes
 
@@ -504,13 +558,13 @@ A styled entity's silhouette is cut to the pixel, but it is filled with cells 8 
 - **`outline`** (points, default 1) inks the entity's own pixels that lie within that distance of a pixel of another mask slot. The silhouette is drawn as a line inside the entity, in its own ink (the hue at full value, a tint, or a palette ink, as its glyphs are), and a feature two outlines wide comes out solid.
 - **`min_coverage`** (default 0.5) is the least ink of every pixel in a cell the entity only grazes: under a quarter of the cell's colour samples, easing out by five eighths.
 
-![examples/ascii_silhouette.scene.toml, the bench at 14 m: before #288 its legs are black lumps; with the outline and minimum coverage the bench reads in its own wood-coloured ink](../images/ascii-silhouette-bench.png)
+![flint-examples/ascii_silhouette.scene.toml, the bench at 14 m: before #288 its legs are black lumps; with the outline and minimum coverage the bench reads in its own wood-coloured ink](../images/ascii-silhouette-bench.png)
 
 They apply to per-entity variants only: the whole frame's cells have no silhouette, and `ground = "inverse"` already fills its cells with ink. `outline = 0, min_coverage = 0` draws what came before. The outline reads up to 4 rings of 8 mask texels for each styled pixel. On the demo at 1080p on an RTX 4070 (`--gpu-time 240`, edges on) the ASCII pass measured 0.38--1.0 ms with the floors on and 0.53--1.0 ms with them off: run-to-run noise hides the difference.
 
 ```bash
-flint render examples/ascii_silhouette.scene.toml --no-grid -o bench.png
-flint render examples/ascii_silhouette.scene.toml --no-grid --style ascii:outline=0,min_coverage=0 -o before.png
+flint render flint-examples/ascii_silhouette.scene.toml --no-grid -o bench.png
+flint render flint-examples/ascii_silhouette.scene.toml --no-grid --style ascii:outline=0,min_coverage=0 -o before.png
 ```
 
 ### Whole-cell silhouettes
@@ -520,16 +574,31 @@ The outline reads a prop as a shape cut out of the scene: the glyphs end at the 
 - A cell where the entity covers at least `cell_share` (default 0.5) of the cell's 16 colour samples is the entity's. Every pixel in it draws the entity's glyph, the scene's pixels in the cell included.
 - A cell it covers less of is dropped. The entity's own pixels in it show the scene around the entity, each the picture at the nearest of the cell's samples that isn't the entity's, rather than the prop's smooth shading. With the whole frame in ASCII they draw the whole frame's glyph instead.
 
-![examples/ascii_entities.scene.toml, the barrel and crate at 3x: with pixel silhouettes the glyphs end at an outline along the mask's edge; with cell silhouettes every edge cell is a whole glyph or the meadow](../images/ascii-silhouette-cell.png)
+![flint-examples/ascii_entities.scene.toml, the barrel and crate at 3x: with pixel silhouettes the glyphs end at an outline along the mask's edge; with cell silhouettes every edge cell is a whole glyph or the meadow](../images/ascii-silhouette-cell.png)
 
 The edge becomes a staircase of cells, like a character on a text screen. The pixel `outline` is off on a snapped variant, since the edge is the cells'. `min_coverage` still applies, and lowering `cell_share` (0.25 keeps more of a bench's legs) is the way to hold thin features. Edge glyphs (#267) still draw in the cells the entity keeps. Object grids (`grid = "object"`) snap on their own grid. A variant that keeps `silhouette = "pixel"` keeps its own pixels even inside a snapped neighbour's cell.
 
 ```bash
-flint render examples/ascii_entities.scene.toml --no-grid --style ascii:silhouette=cell -o cells.png
-flint render examples/ascii_entities.scene.toml --no-grid --style ascii:silhouette=cell,cell_share=0.25 -o thin.png
+flint render flint-examples/ascii_entities.scene.toml --no-grid --style ascii:silhouette=cell -o cells.png
+flint render flint-examples/ascii_entities.scene.toml --no-grid --style ascii:silhouette=cell,cell_share=0.25 -o thin.png
 ```
 
-The glyph pass works out each pixel's cell, so every pixel of a cell gets the same answer. It reads the cell's 16 mask samples once for the pixel's own grid, then once for each other grid a snapping variant uses (up to 8; a variant on a ninth still drops its own minority cells but fills none). Each pass keeps counts in registers for the first two snapping variants met in the cell, so a third variant of the same grid meeting them in one cell is left out. On `examples/ascii_entities` at 1080p on an RTX 4070 (`--gpu-time 240`, three alternating runs, two snapping grids) the ASCII pass took 0.34–0.38 ms with cells against 0.17–0.24 ms with pixels (edges off), and 0.64–0.68 ms against 0.49–0.54 ms with edges on: about 0.15 ms more. A first version that kept the samples in private arrays cost 0.4 ms more. A pixel the mask itself misses (a grazing silhouette pixel its depth tolerance drops) still passes through, as it does with `pixel`.
+Which variant holds a cell is decided once for the cell (#929): a small pass before the glyphs reads each cell's 16 mask samples, for every grid a snapping variant uses but only over the cells near those variants, and keeps the answer in a texel. The glyph pass then reads one texel for the pixel's own grid and one for each other snapping grid (up to 8; a variant on a ninth still drops its own minority cells but fills none), so every pixel of a cell gets the same answer. The count keeps the first two snapping variants met in the cell, so a third variant of the same grid meeting them in one cell is left out. Asking it from every pixel made DX12's FXC compiler take about 6 s over the glyph shader; it now takes under 2 s. A frame whose snapping grids would need more than 8192 rows of that state leaves the grids past them cut to the pixel, and says so once. On `flint-examples/ascii_entities.scene.toml` at 1080p on an RTX 4070 (`--gpu-time 240`, three alternating runs, two snapping grids) the ASCII pass took 0.34–0.38 ms with cells against 0.17–0.24 ms with pixels (edges off), and 0.64–0.68 ms against 0.49–0.54 ms with edges on: about 0.15 ms more. A first version that kept the samples in private arrays cost 0.4 ms more. A pixel the mask itself misses (a grazing silhouette pixel its depth tolerance drops) still passes through, as it does with `pixel`.
+
+#### At the edge of another style's entity
+
+With ASCII on for the whole frame and `silhouette = "cell"` in its table, the same rule meets the entities of other styles (#534). A pencil cask in an ASCII frame is [another style's](#each-pixel-is-one-styles), and the cut between them falls on ASCII's cells instead of the cask's outline:
+
+- A cell where at least `cell_share` of the 16 samples are not the cask's stays a glyph, whole. The cask's pixels in it are the glyph's, so pencil leaves them.
+- Any other cell is the cask's, whole. Its pencil pixels are sketched, and its other pixels show the scene as it came into the display stage: pencil draws only its own pixels, so what lies around the cask in that cell is the plain picture.
+
+![tests/fixtures/scenes/stylize_props.scene.toml at 3x under whole-frame ASCII with silhouette = "cell", the pencil crate: before #534 the cut followed the crate's outline through the glyph cells; after it, each cell along the crate is a whole glyph or wholly the crate's, sketch and plain scene](../images/ascii-cell-ownership.png)
+
+```bash
+flint render flint-examples/stylize_props.scene.toml --no-grid --style ascii:silhouette=cell -o props.png
+```
+
+The framework does the cut, so any style the frame runs beside ASCII gets it: ASCII hands over its grid (`StylePass::ownership_cells`) before the display stage draws, and every style's [ownership pass](#each-pixel-is-one-styles) of that stage cuts along the same cells, in either chain order. A whole-frame style that runs beside ASCII (a palette) keeps the glyph cells as ASCII does. On `tests/fixtures/scenes/stylize_props.scene.toml` at 640x360 the cells along the pencil props that held both glyph and pencil pixels went from 66 to none, in either order; the golden is `ascii-cell-yields-to-pencil`. At 1080p on an RTX 4070 (`--gpu-time 240`, alternating runs) the ASCII and pencil passes, ownership included, measured the same with either cut, within the runs' spread (ASCII 0.39–0.40 ms, pencil 0.078–0.084 ms at the minimum). The HDR stage keeps the pixel cut: its styles draw at the scene's resolution, and the display stage decides every cell again after them.
 
 ## Pencil
 
@@ -561,8 +630,8 @@ boil = 0.0             # redraws a second, for boiling lines (0 = still)
 ```
 
 ```bash
-flint render examples/stylize_props.scene.toml --no-grid --style pencil -o page.png
-flint render examples/pencil_sketch.scene.toml --no-grid -o props.png        # per-entity variants
+flint render flint-examples/stylize_props.scene.toml --no-grid --style pencil -o page.png
+flint render flint-examples/pencil_sketch.scene.toml --no-grid -o props.png        # per-entity variants
 flint render scene.toml --style pencil --sweep pencil.direction=surface,screen,tensor -o dirs.png
 ```
 
@@ -572,9 +641,9 @@ How it draws:
 
 - **Hatching builds tone the way a hand does.** Each layer switches on as the tone darkens past its threshold, and its strokes thicken from nothing rather than popping in. A layer crosses the one before it off the square (at 0°, +65°, −40° and +25°), so layers never make a grid. Each stroke is a dash of its own length that tapers at both ends, is jittered off its row and is bent by a slow wobble. A few dashes are left out.
 - **Stroke direction.** `surface` runs strokes along the surface's iso-depth lines, taken from the gradient of 1/z. That gradient is constant over a plane, so a box face hatches straight, and it turns smoothly round a barrel and across a floor. `screen` hatches everything at `angle`. `tensor` follows the picture's luminance edges, a structure tensor blurred over about three stroke spacings in two separable passes at half resolution (#392). In that blur each pixel's direction is weighted by its contour strength, so silhouettes and creases steer the flow and a flat, noisy patch (soft shadow, ambient occlusion) barely counts. The strokes sweep round a shadow's edge instead of fraying into short crossing patches. Where a surface or tensor direction is unsure (a face turned square to the camera, a flat colour), `angle` shows through. Directions are quantized to 15° bins with neighbouring bins blended, so strokes stay straight within a patch, as hand hatching does.
-- **Contours** come from depth steps (drawn on the near side), creases (the normal rebuilt from depth turns), the edge of a styled entity's mask, and luminance edges by `detail`. They are read back through a noise offset (`wobble`), twice when `sketchy` is set. A floor seen edge-on steps in depth from row to row as much as a silhouette does, so near the horizon it inks a thick band; `grazing = 1` keeps a depth step only where the second difference of 1/z (zero across any plane) says the neighbours lie on another surface, and the floor draws one horizon line (#404). No crease is drawn within two pixels of the frame's edge, where the neighbours are clamped (before #404 every pencil look outlined the frame).
+- **Contours** come from depth steps (drawn on the near side), creases, the edge of a styled entity's mask, and luminance edges by `detail`. The steps and creases are the [shared edges](#shared-edges)' since #743, read back as a step (a share of the distance, scaled by `depth`) and a turn (1 - cos of the fold, scaled by `crease`). They are read back through a noise offset (`wobble`), twice when `sketchy` is set. A floor seen edge-on steps in depth from row to row as much as a silhouette does, and before #743 it inked a thick band near the horizon; the shared pass draws no step where the depth is a plane, so every pencil look now draws one horizon line. `grazing = 1` (#404) adds pencil's own, stricter test of the same kind, the second difference of 1/z by `depth`. No crease is drawn within two pixels of the frame's edge, where the neighbours are clamped (before #404 every pencil look outlined the frame).
 - **A field of small silhouettes** (#883). Every blade of a `grass_ground` meadow is a depth step against the ground behind it, so at density 40 the contour pass inks them all and, at any line width, they merge into one black band from the near edge to the horizon. `clutter = 1` fades a line where the lines round it already cover most of a disc two outline widths across *and* most of one three times as wide: one outline through the near disc covers about a fifth of it, a field of blades two thirds and more (on the meadow fixture under `rotoscope`, the props' lines measured 0.17 at the median and 0.39 at the 95th percentile, the meadow 0.65). Both discs, because a small figure's limbs fill the near one too, but only a field fills the wide one. The meadow then draws as a sheet with its near edge and its horizon line, and the props in front of it keep theirs. It reads only the lines pass 1 drew, nothing from the grass, so any field of small silhouettes is measured the same way (only the meadow has been tried). It costs about 0.006 ms at 1080p, since only pixels that already carry a line measure it. Per entity too (`pencil_style { clutter = 1 }`); the `rotoscope` look sets it.
-- **Tone from the light** (#869). The picture's luminance is albedo times light, so by default (`tone = "picture"`) a dark material is hatched as if it were in shadow, and a white prop in deep shadow stays bare. `tone = "light"` divides the picture by the [style albedo](#the-style-albedo) (each opaque mesh's own colour, drawn only while a row asks for it), both in display values, so the hatching follows where the light falls off whatever the paint. On the plain bench at `brightness = 0`, picture tone hatches the whole brown floor; light tone leaves it blank and hatches the barrels' undersides, the crate's shaded face and the shadows they cast. On the darker `examples/ascii_dark_props` ground, where the `rotoscope` look's own `brightness = 0.5` still hatches everything, light tone at 0 hatches only the barrels' shadow. So one `brightness` holds across scenes. Where no mesh was drawn (terrain, grass, water, particles) or the paint is nearly black, the picture's own luminance stands. The sky is paper (#890): a pixel at the far plane has nothing for the light to fall on, so under `tone = "light"` it is left blank whatever its colour, `brightness` and `contrast`, as a traced drawing leaves it; on `examples/skeletal_test`'s dark sky the `rotoscope` look hatched it all over before. A look that wants a hatched sky uses `tone = "picture"`. Per entity too (`pencil_style { tone = "light" }`).
+- **Tone from the light** (#869). The picture's luminance is albedo times light, so by default (`tone = "picture"`) a dark material is hatched as if it were in shadow, and a white prop in deep shadow stays bare. `tone = "light"` divides the picture by the [style albedo](#the-style-albedo) (each opaque mesh's own colour, drawn only while a row asks for it), both in display values, so the hatching follows where the light falls off whatever the paint. On the plain bench at `brightness = 0`, picture tone hatches the whole brown floor; light tone leaves it blank and hatches the barrels' undersides, the crate's shaded face and the shadows they cast. On the darker `flint-examples/ascii_dark_props.scene.toml` ground, where the `rotoscope` look's own `brightness = 0.5` still hatches everything, light tone at 0 hatches only the barrels' shadow. So one `brightness` holds across scenes. Where no mesh was drawn (terrain, grass, water, particles) or the paint is nearly black, the picture's own luminance stands. The sky is paper (#890): a pixel at the far plane has nothing for the light to fall on, so under `tone = "light"` it is left blank whatever its colour, `brightness` and `contrast`, as a traced drawing leaves it; on `flint-examples/skeletal_test.scene.toml`'s dark sky the `rotoscope` look hatched it all over before. A look that wants a hatched sky uses `tone = "picture"`. Per entity too (`pencil_style { tone = "light" }`).
 
 ```bash
 flint render scene.toml --no-grid --look rotoscope --style pencil:tone=light,brightness=0 -o shadows.png
@@ -602,7 +671,7 @@ stroke_rows = 4              # strokes stacked in the strip, top to bottom
 ```
 
 ```bash
-flint render examples/stylize_props.scene.toml --no-grid \
+flint render flint-examples/stylize_props.scene.toml --no-grid \
   --style pencil:paper_image=cold_press,stroke_image=graphite,stroke_rows=4 -o page.png
 ```
 
@@ -611,24 +680,45 @@ flint render examples/stylize_props.scene.toml --no-grid \
 - **Found like glyph sets**, by [the one asset search](assets.md#where-the-engine-looks-for-a-file) (kinds `papers` and `strokes`): `papers/<name>.png` (then `.jpg`, `.jpeg`) or `strokes/<name>.png` beside the scene, in each directory above it up to the project root, then in the mounted engine; a name with a folder or an extension (`scans/linen.jpg`) is a path tried from each of those directories. The working directory is not searched. Files are read through the vfs, so `flint bundle` carries them to the web. F4 lists the images in every `papers/` and `strokes/` the scene can see. A name that can't be found or decoded warns once, with every path tried, and draws procedurally. Natively an edited file reloads while the viewer is open, as palettes do.
 - **The paper.** Its luma, measured against the image's own mean and spread, is the paper's height. The height shades the paper and is the tooth that breaks the strokes, as strongly as `grain` says. So any scan, dark or light, faint or deep, comes out at the same strength. The scan's overall colour cast is taken out when it loads, so the `paper` colour still decides the paper's colour. The image adds relief and local flecks of hue, not a second tint. It tiles from the screen's corner in points, so the paper holds still as the camera moves.
 - **The strokes.** The strip is `stroke_rows` strokes stacked top to bottom, each drawn left to right. A dash takes one of them by its hash and stretches it along its length. The row spans twice `thickness`, and the stroke grows from thin as the tone passes the layer's threshold. Ink is the strip's dark or opaque texels (`alpha x (1 - luma)`) over the strip's own 99th percentile, so dark on white and dark on transparent both work, and a light scan still draws a full line. The strip's own ends replace the drawn taper. It works on every `grid`: under `grid = "world"` the row is twice the stroke width in metres, as the world strokes are measured.
-- **One paper and one strip a frame.** These come from the scene's table, or else from the first `pencil_style` entity that names one. An entity that names a different file draws procedurally and gets one warning.
-- **No sampler.** Images are `Rgba8Unorm` with a mip chain made on the CPU, and the shader reads them with `textureLoad` at the level it picks. Wrapping the paper is integer arithmetic, and the DX12 sampler heap rule holds. `crates/flint-render/src/stylize/images.rs` holds the loader and `style_image.wgsl` the reader, for any style that wants an image.
-- `examples/papers/cold_press.png` and `examples/strokes/graphite.png` are synthesized by `tools/style-images/make_images.py` (`python tools/style-images/make_images.py examples`; numpy and Pillow), not scanned. A real scan drops in the same way. With no image named, pencil draws exactly what it drew before: its goldens pass unblessed.
+- **A paper and a strip each.** Every `pencil_style` entity may name its own paper and strip, and the scene's table names the frame's: charcoal on one prop and HB on another, a barrel on cold press beside a crate on kraft (#547). A frame holds up to four papers and four strips; an entity that names a fifth draws procedurally and gets one warning naming it. Entities naming the same file share it.
+- **No sampler.** Images are `Rgba8Unorm` with a mip chain made on the CPU, stacked as the layers of one texture array (each at its own size, so a layer reads exactly as the image alone would), and the shader reads them with `textureLoad` at the level it picks. Wrapping the paper is integer arithmetic, and the DX12 sampler heap rule holds. `crates/flint-render/src/stylize/images.rs` holds the loader and `style_image.wgsl` the reader, for any style that wants an image.
+- [`flint-examples/papers/cold_press.png`](https://github.com/chrischaps/flint-examples/blob/main/papers/cold_press.png) and [`flint-examples/strokes/graphite.png`](https://github.com/chrischaps/flint-examples/blob/main/strokes/graphite.png) are synthesized by `tools/style-images/make_images.py` (`python tools/style-images/make_images.py examples`; numpy and Pillow), not scanned. A real scan drops in the same way. With no image named, pencil draws exactly what it drew before: its goldens pass unblessed.
 
-It runs at the display stage, at output resolution, with sizes in points (times the pixels-per-point scale), in two passes. The first pass writes each pixel's tone, contour strength and stroke direction into a scratch target. The second blurs the direction into a flow and draws the strokes. Only when a variant hatches by `tensor`, two half-resolution passes between them blur its flow first (`pencil_flow.wgsl`), and the drawing pass reads the result. At 1080p on an RTX 4070 the whole frame costs about 0.49 ms; `tensor` adds about 0.08 ms (0.56 to 0.64 ms on `examples/pencil_sketch.scene.toml`, the mean of six alternating `--gpu-time 240` runs). With only two props asking for it the cost is 0.19 ms, because both full-screen passes still run and only return early on unstyled pixels.
+Per entity, each prop names its own ([`flint-examples/pencil_sketch.scene.toml`](https://github.com/chrischaps/flint-examples/blob/main/pencil_sketch.scene.toml)):
+
+```toml
+[entities.barrel.pencil_style]
+paper_image = "cold_press"
+
+[entities.crate.pencil_style]
+paper_image = "styles/papers/kraft.png"
+paper = [0.80, 0.66, 0.47]
+```
+
+It runs at the display stage, at output resolution, with sizes in points (times the pixels-per-point scale), in two passes. The first pass writes each pixel's tone, contour strength and stroke direction into a scratch target. The second blurs the direction into a flow and draws the strokes. Only when a variant hatches by `tensor`, two half-resolution passes between them blur its flow first (`pencil_flow.wgsl`), and the drawing pass reads the result. At 1080p on an RTX 4070 the whole frame costs about 0.49 ms; `tensor` adds about 0.08 ms (0.56 to 0.64 ms on [`flint-examples/pencil_sketch.scene.toml`](https://github.com/chrischaps/flint-examples/blob/main/pencil_sketch.scene.toml), the mean of six alternating `--gpu-time 240` runs). With only two props asking for it the cost is 0.19 ms, because both full-screen passes still run and only return early on unstyled pixels.
 
 **Strokes that hold to the surfaces.** Hatching is laid in screen space by default, so when the camera moves the strokes stay where they are and the surfaces slide under them (the shower-door effect). `grid = "world"` (#389) lays the strokes on the surfaces instead. Each pixel's world position is rebuilt from the depth and hatched on the three axis planes (triplanar, weighted by the normal the first pass rebuilds), with stripes measured in metres, so the strokes travel with the props as the camera orbits. A fixed spacing in metres would crowd into grey with distance, so spacing comes in octaves: level *k* puts its rows 2^*k* metres apart. Each pixel picks the octave whose spacing on screen is nearest `spacing` and cross-fades it with the next one, as a mip chain does. The on-screen spacing is measured per plane and per stroke direction, from the quad's derivatives, so a floor seen edge-on climbs to wider rows across its depth. Strokes keep their size on screen at any distance, and each one stays where it lies. Every even row of one octave is a row of the next, and a row is hashed by its odd part and the octave that gives it, so a stroke keeps its dashes as it climbs. `angle` turns the strokes within each plane. `direction` isn't used, and the sky keeps screen hatching. The paper and the contours' wobble stay on the page, as a real sheet would.
 
 ```bash
-flint render examples/pencil_sketch.scene.toml --no-grid --style pencil:grid=world,scope=screen \
+flint render flint-examples/pencil_sketch.scene.toml --no-grid --style pencil:grid=world,scope=screen \
   --frames 72 --frame-dt 0.0333 --orbit 25 -o orbit.png
 ```
 
 ![The barrel at three points of an orbit: screen hatching (top) stays fixed while the barrel turns under it; world hatching (bottom) turns with the barrel](../images/pencil-world-orbit.png)
 
-Measured on that orbit (block matching each textured patch of a plain render between consecutive frames, then asking whether the pencil frame matches the next one better standing still or moved with the surface; 2,244 patches): screen hatching correlates 0.78 standing still and 0.59 moved with the surface, while world hatching correlates 0.59 still and 0.78 moved. Patches that include a silhouette move with it in both modes. At 1080p on an RTX 4070 the whole-frame pencil pass costs 0.52 ms with a world grid, against 0.46 ms on the screen. A prop that moves in the world (not the camera) still slides under world strokes, since they are in world, not object, space.
+Measured on that orbit (block matching each textured patch of a plain render between consecutive frames, then asking whether the pencil frame matches the next one better standing still or moved with the surface; 2,244 patches): screen hatching correlates 0.78 standing still and 0.59 moved with the surface, while world hatching correlates 0.59 still and 0.78 moved. Patches that include a silhouette move with it in both modes. At 1080p on an RTX 4070 the whole-frame pencil pass costs 0.52 ms with a world grid, against 0.46 ms on the screen. A prop that moves in the world (not the camera) still slides under world strokes, since they are in world, not object, space. For that, use `grid = "local"`, next.
 
-**Per entity.** Pencil works per entity in the same way as ASCII. A `pencil_style` component, or a plain `style_mask { style = "pencil" }`, draws that entity in pencil while the rest of the frame stays as it is, and each distinct set of settings becomes a variant with its own mask id. Every field of the table above except `scope` can be set on the component, and a field it leaves out comes from the scene's table, then the default. `grid = "object"` pins an entity's hatching to its projected origin, so its strokes travel with it (under translation; `grid = "world"` holds under any camera move). With `scope = "entities"` the scene's table is only a preset. A pixel that another style owns (an ASCII prop in a pencil frame) is left to that style.
+**Strokes that ride on a moving prop.** `grid = "local"` (#544) lays the same world strokes in the entity's own space. Its variant carries the styled root's world matrix, and the drawing pass takes each pixel's world position, its derivatives and the normal back into the root's space before hatching, so the stripes are measured in the prop's own units on its own axis planes. A cask rolling across the clearing keeps its strokes as it rolls, and a crate turning in place turns them with it, while the camera moving still leaves them where they lie. Children that move with their root ride with it. Under a [motion hold](post-processing.md) the strokes take the matrix the prop is drawn with, so a prop held on twos keeps its strokes between its drawings. The frame is a rigid one: a skinned mesh's surfaces move inside it, so its strokes still swim (they would need a rest-pose position from the scene pass). The whole frame's table has no root of its own, so `local` there draws as `world`, and only a `pencil_style` entity (or a preset its entities inherit) rides.
+
+```bash
+flint render flint-examples/pencil_rolling.scene.toml --no-grid --scripts --time 0.5..2.5 --fps 24 -o roll/f-%05d.png
+```
+
+In that scene the back cask is on `grid = "world"` and the front cask and the crate on `local`: play the frames and the back cask rolls under its strokes while the others carry theirs. The golden `pencil-local` pins a still of it, mid-roll.
+
+Measured on that scene with the same method (48 frames, 960x540): the cask on `grid = "world"` correlates 0.64 standing still and 0.20 moved with its surface (3,818 patches), the cask on `grid = "local"` 0.19 still and 0.71 moved (6,955 patches; moved wins in 98% of them), and the turning crate 0.59 still and 0.89 moved (85%). With every prop on `world` the same cask and crate score 0.48 / 0.24 and 0.92 / 0.71. A local row is three vec4s longer than a world one (208 bytes a row, in the variant table's storage buffer); the drawing pass does three dot products for the position, six for its derivatives and three cross products for the normal, on rows that ask for it.
+
+**Per entity.** Pencil works per entity in the same way as ASCII. A `pencil_style` component, or a plain `style_mask { style = "pencil" }`, draws that entity in pencil while the rest of the frame stays as it is, and each distinct set of settings becomes a variant with its own mask id. Every field of the table above except `scope` can be set on the component, and a field it leaves out comes from the scene's table, then the default. `grid = "object"` pins an entity's hatching to its projected origin, so its strokes travel with it (under translation; `grid = "world"` holds under any camera move, and `grid = "local"` under the prop's own moves and turns too). With `scope = "entities"` the scene's table is only a preset. A pixel that another style owns (an ASCII prop in a pencil frame) is left to that style.
 
 ```toml
 [post_process.styles.pencil]
@@ -647,7 +737,7 @@ sketchy = 1.0
 enabled = false        # stays painted
 ```
 
-![examples/pencil_sketch.scene.toml: six props, each its own hand; the world around them stays painted](../images/pencil-sketch-entities.png)
+![flint-examples/pencil_sketch.scene.toml: six props, each its own hand; the world around them stays painted](../images/pencil-sketch-entities.png)
 
 ### Motion on twos
 
@@ -661,23 +751,23 @@ rate = 12.0              # drawings a second: on twos at 24 fps
 boil = 12.0              # the lines redraw on the same ticks
 ```
 
-![Eight frames of examples/motion_hold.scene.toml captured by flint-player at --frame-step 1/48: the pendulum, the YBot and the pencil lines change on frames 0 and 4 and hold on the three frames after each](../images/motion-hold-strip.png)
+![Eight frames of flint-examples/motion_hold.scene.toml captured by flint-player at --frame-step 1/48: the pendulum, the YBot and the pencil lines change on frames 0 and 4 and hold on the three frames after each](../images/motion-hold-strip.png)
 
 - **What is held.** The component holds the entity and everything below it: the world matrix it is drawn with and a skinned model's bone palette, kept from the first frame of each tick until the next tick. The nearest `motion_hold` up the hierarchy wins, so `rate = 0` on a child lets that branch move smoothly.
 - **What it carries is held too** (#873). A point or spot light on a held entity, or below one, shines from where that entity was drawn when the tick began, so the pool of light on the floor steps with the drawing. A directional light has no position to hold: its `direction` is written in world space and doesn't turn with the entity. An emitter (`particle_emitter` or `particle_effect`) on a held entity emits from the held drawing. Its particles are born there, not along the jump to the next drawing, so a trail comes out as beads, one cluster a drawing. Emission over distance still counts the whole way travelled. Once born, a particle moves smoothly: it is an effect, not a drawing. The emitter's velocity, which `inherit_velocity` adds, is the world's smooth one, not a jump each tick.
 - **What stays smooth.** Live particles, the ocean, the sky, grass and the camera.
 
-![examples/motion_hold.scene.toml in flint-player at 1.0 s: the held pendulum's lantern leaves a bead of soot for each drawing, the smooth one a continuous streak; both pools of light clear the hatching on the floor below](../images/motion-hold-lanterns.png)
+![flint-examples/motion_hold.scene.toml in flint-player at 1.0 s: the held pendulum's lantern leaves a bead of soot for each drawing, the smooth one a continuous streak; both pools of light clear the hatching on the floor below](../images/motion-hold-lanterns.png)
 
-- **Only the drawing is held.** Physics (fixed at 1/60 s), IK and scripts read the world, which goes on moving smoothly, so a held crate still falls and collides at 60 Hz and a held hand still reaches its IK target. In `examples/motion_hold.scene.toml` two pendulums swing as mirrors of each other, one held and one smooth. Captured in `flint-player` at `--frame-step 1/48`, every frame on a tick is byte-identical to the same scene with no hold.
+- **Only the drawing is held.** Physics (fixed at 1/60 s), IK and scripts read the world, which goes on moving smoothly, so a held crate still falls and collides at 60 Hz and a held hand still reaches its IK target. In [`flint-examples/motion_hold.scene.toml`](https://github.com/chrischaps/flint-examples/blob/main/motion_hold.scene.toml) two pendulums swing as mirrors of each other, one held and one smooth. Captured in `flint-player` at `--frame-step 1/48`, every frame on a tick is byte-identical to the same scene with no hold.
 - **Same tick as the lines.** A tick is `floor(time x rate)` of the post time, the clock `boil` reads. Pencil's boil steps its seed through the same function, so at `boil = 12` and `rate = 12` the pose and the lines change in exactly the same frames. A tick lands a thousandth of a tick early, so a clock that sums 1/60 steps to a hair under 1/12 still turns on frame 5.
-- **The whole frame.** `[post_process] motion_hold = 12` (or `--motion-hold 12` on `flint render`, `flint play` and `flint-player`) holds every entity that names no rate of its own, with the lights and emitters they carry. The `rotoscope` look sets it beside `boil = 12` (#887), so `--look rotoscope` alone puts a scene on twos; `--motion-hold 0` lets the motion run smooth under it. It also holds the post time that styles, film grain and the tear read to the start of each tick, so a whole-frame pencil boiling at 24 still redraws once a tick.
+- **The whole frame.** `[post_process] motion_hold = 12` (or `--set post.motion_hold=12` on `flint render`, `--motion-hold 12` on `flint play` and `flint-player`) holds every entity that names no rate of its own, with the lights and emitters they carry. The `rotoscope` look sets it beside `boil = 12` (#887), so `--look rotoscope` alone puts a scene on twos; `motion_hold = 0` lets the motion run smooth under it. It also holds the post time that styles, film grain and the tear read to the start of each tick, so a whole-frame pencil boiling at 24 still redraws once a tick.
 - **Scripts.** `set_motion_hold(id, rate)`, `clear_motion_hold(id)` and `get_motion_hold(id)` write and read the component directly, so a hold set in `on_update` draws from that frame.
 - **Deterministic.** The host stamps the renderer with the frame's game time (`SceneRenderer::set_motion_time`) before it uploads bones: the player's clock, a capture's moment. It stamps the particles with the same seconds (`ParticleSync::set_motion_time`) before they step, so an emitter steps on its carrier's frames. A `--frame-step` capture is byte-identical run to run. `flint render --time 0..2 --fps 24` draws it. A renderer that is never stamped holds nothing.
 - **In the editors** (#871). The model previewer (`flint edit model.glb`) holds on the clip's own time, the one its timeline shows: playing, the pose changes `rate` times a second of clip time (fewer a second of wall time when the clip is slowed, as slowing film does), and a paused scrub steps through the same drawings, the panel naming which one. Its **Hold** switch and rate, or `--motion-hold 12`, put it on. A layer dial, a posed bone or a clip switch shows at once and is held from there. The scene viewer (`flint edit scene.toml`) holds on its own wall clock, from the scene's `motion_hold` components, its `[post_process] motion_hold` or `--motion-hold`. The viewer plays no animation and runs no physics, so a held YBot stands in its bind pose and the pendulums hang still; what steps there is what you move: drag a held entity with the gizmo and its drawing follows on the ticks, then lands where you drop it.
 
 ```bash
-flint render examples/motion_hold.scene.toml --no-grid --anim-time 0 --time 0..2 --fps 24 -o twos.gif
+flint render flint-examples/motion_hold.scene.toml --no-grid --anim-time 0 --time 0..2 --fps 24 -o twos.gif
 ```
 
 ### Blending in and out
@@ -706,13 +796,13 @@ A tween is the engine easing the blend for you ([Scripting → Tweens](scripting
 
 ![The bench cross-fading into amber blocks at blend 0, 0.25, 0.5, 0.75 and 1: every pixel a mix of its wood and its glyph](../images/ascii-blend-fade.png)
 
-*Frames from `flint-player examples/ascii_reveal.scene.toml --frame-step 0.05 --screenshot-every 0.05`, cropped and doubled.*
+*Frames from `flint-player flint-examples/ascii_reveal.scene.toml --frame-step 0.05 --screenshot-every 0.05`, cropped and doubled.*
 
 - **`fade`** mixes every pixel of the entity with its glyph pixel by `blend`, in display space.
 - **Every other mask-reading style fades too.** Pencil, watercolor and user styles get `blend` from the framework's [cross-fade](#blend-for-free) (#396): `pencil_style { blend = 0.5 }` is half sketch, half the prop's own shading, in linear light. ASCII has a `transition` of its own, and so does pencil (next).
-- **Pencil draws on (#879).** `transition = "draw"` (on `pencil_style`, the `[post_process.styles.pencil]` table or `--style pencil:transition=draw`; default `fade`) makes a blend between 0 and 1 a front, not a mix. The outlines are drawn up to it, growing along their length; the hatching follows them a stroke at a time, each dash drawn from its start; the paper's wash floods in last. Where the front hasn't reached a line, the line is absent, not faint. The blend's run is split in three overlapping phases: outlines over 0–0.9, hatching over 0.25–0.95, paper over 0.4–1. Every mark asks one order field when its turn comes: smooth noise about 14 hatch rows across, flattened through its measured quantiles so a front at *t* has drawn about *t* of each line. Along a line the field rises and falls slowly, so the drawn parts grow out from its low points. A dash takes its turn from the order at its middle. The field is keyed by the row's `seed` without the `boil` steps, so a boiling drawing grows in one order while its lines redraw. It reads every way pencil is blended: an entity's `blend` (and `tween_style_param`), `blend_source = "tear"`, and the whole frame's table `blend`. For those the stage's mix and the cross-fade step aside (`StyleDescriptor::draws_blend`). At blend 1 the drawing is the faded one's, pixel for pixel (golden `pencil-draw-whole`). It needs no pass of its own: the order is computed in the drawing pass. While some front is below 1 that pass is a second compiled variant (`pencil_draw_on.wgsl` prepended; `pencil_fade.wgsl` folds the code out of the one every other frame uses, so those frames compile and draw exactly as before). Measured with `--gpu-time 240` on `tests/fixtures/scenes/stylize_props_plain.scene.toml` at 1080p on an RTX 4070, the whole-frame pencil pass took 0.73 ms drawing on at blend 0.25 or 0.5, against 0.52 ms fading at 0.5 and 0.50 ms whole. The spike's other candidate, a distance along each contour by jump flooding, wasn't built: the noise order already grows lines in long segments, not dots. Demo: `examples/pencil_draw_on.scene.toml`; goldens `pencil-draw-*`.
+- **Pencil draws on (#879).** `transition = "draw"` (on `pencil_style`, the `[post_process.styles.pencil]` table or `--style pencil:transition=draw`; default `fade`) makes a blend between 0 and 1 a front, not a mix. The outlines are drawn up to it, growing along their length; the hatching follows them a stroke at a time, each dash drawn from its start; the paper's wash floods in last. Where the front hasn't reached a line, the line is absent, not faint. The blend's run is split in three overlapping phases: outlines over 0–0.9, hatching over 0.25–0.95, paper over 0.4–1. Every mark asks one order field when its turn comes: smooth noise about 14 hatch rows across, flattened through its measured quantiles so a front at *t* has drawn about *t* of each line. Along a line the field rises and falls slowly, so the drawn parts grow out from its low points. A dash takes its turn from the order at its middle. The field is keyed by the row's `seed` without the `boil` steps, so a boiling drawing grows in one order while its lines redraw. It reads every way pencil is blended: an entity's `blend` (and `tween_style_param`), `blend_source = "tear"`, and the whole frame's table `blend`. For those the stage's mix and the cross-fade step aside (`StyleDescriptor::draws_blend`). At blend 1 the drawing is the faded one's, pixel for pixel (golden `pencil-draw-whole`). It needs no pass of its own: the order is computed in the drawing pass. While some front is below 1 that pass is a second compiled variant (`pencil_draw_on.wgsl` prepended; `pencil_fade.wgsl` folds the code out of the one every other frame uses, so those frames compile and draw exactly as before). Measured with `--gpu-time 240` on `tests/fixtures/scenes/stylize_props_plain.scene.toml` at 1080p on an RTX 4070, the whole-frame pencil pass took 0.73 ms drawing on at blend 0.25 or 0.5, against 0.52 ms fading at 0.5 and 0.50 ms whole. The spike's other candidate, a distance along each contour by jump flooding, wasn't built: the noise order already grows lines in long segments, not dots. Demo: [`flint-examples/pencil_draw_on.scene.toml`](https://github.com/chrischaps/flint-examples/blob/main/pencil_draw_on.scene.toml); goldens `pencil-draw-*`.
 - **`dissolve`** turns whole cells: a cell is a glyph once `blend` passes its place in a dissolve order, half patch noise a few cells across and half per-cell hash, so glyphs arrive in ragged patches that spread. The order is fixed per cell, so a ramp never shimmers, and on `grid = "object"` it travels with the prop.
-- **A prop turns `blend` of its own cells (#398).** A small prop holds only a few of the noise's patches, so on the order alone a 6x5-cell prop at blend 0.5 turned 30--73% of its cells, depending on where it sat. So each cell is compared by its *rank* in the order among the same variant's cells within 8 cells of it: two short passes before the glyph pass (`ascii_dissolve_order.wgsl` marks each cell the variant holds a lattice sample of and writes its order; `ascii_dissolve_rank.wgsl` counts the lower ones in a 17x17 window). A prop up to 9 cells across and down turns exactly round(`blend` x its cells) wherever it sits; a larger one is ranked window by window, which keeps its patches and flattens the noise's slow swells. The patches are the same ones as before. As a prop moves on the screen grid and its cells come and go, about one cell near the threshold may change with each. Up to 8 dissolving variants are ranked (`MAX_DISSOLVE`); past them a variant falls back to the order itself. Measured from `flint render` on `tests/fixtures/scenes/stylize_blend.scene.toml`'s barrel at 17 placings, about 40 cells: at blend 0.5 it turned 49--74% of its cells before, and 44--57% after. The rest of the spread is cells the 16 lattice samples miss, such as outline slivers. On an RTX-class GPU the two passes stayed under `--gpu-time`'s noise with the barrel filling half of a 1080p frame.
+- **A prop turns `blend` of its own cells (#398).** A small prop holds only a few of the noise's patches, so on the order alone a 6x5-cell prop at blend 0.5 turned 30--73% of its cells, depending on where it sat. So each cell is compared by its *rank* in the order among the same variant's cells within 8 cells of it: two short passes before the glyph pass (`ascii_dissolve_order.wgsl` marks each cell the variant holds a pixel of and writes its order; `ascii_dissolve_rank.wgsl` counts the lower ones in a 17x17 window). A prop up to 9 cells across and down turns exactly round(`blend` x its cells) wherever it sits (at an odd count and blend 0.5 the middle cell's rank is 0.5 itself, and it turns); a larger one is ranked window by window, which keeps its patches and flattens the noise's slow swells. The patches are the same ones as before. As a prop moves on the screen grid and its cells come and go, about one cell near the threshold may change with each. Up to 8 dissolving variants are ranked (`MAX_DISSOLVE`); past them a variant falls back to the order itself. Measured from `flint render` on `tests/fixtures/scenes/stylize_blend.scene.toml`'s barrel at 17 placings, about 40 cells: at blend 0.5 it turned 49--74% of its cells on the order alone, and 44--57% once ranked. What was left was cells the 16 lattice samples miss, such as an outline sliver a pixel wide: they took the order itself, unbalanced against the ranked cells. So the order pass finds a cell's membership from the samples first and, where all 16 miss, from every pixel of the cell inside the variant's bounds (#554; a variant whose silhouette snaps keeps `cell_share` of the samples, since its cells are drawn whole or not). On a rerun of 17 placings (36--43 cells, up to 8 of them slivers) it turned 47--56% before that change and exactly half at every placing after. On an RTX-class GPU the two passes stayed under `--gpu-time`'s noise with the barrel filling half of a 1080p frame.
 - **It rides in the mask, not the variant.** The [style mask](#the-entity-style-mask) carries each pixel's blend in its `.g` channel beside the id in `.r`. Two props fading at different rates still share one id, and a ramp makes no new variant, row or GPU object (a GPU test in `tests/stylize.rs` ramps it and counts). Like the id, the blend is the styled root's, inherited by its subtree.
 - **`style_mask { blend = ... }`** works too, for a style with no component of its own. A style component's `blend` wins over the `style_mask`'s on the same entity.
 - **Under a whole-frame style**, a prop at blend 0 is a smooth hole in the glyph field: the blend says how much of the entity's *own* variant shows, and below 1 the rest is the picture as it came.
@@ -720,7 +810,7 @@ A tween is the engine easing the blend for you ([Scripting → Tweens](scripting
 - **Cost.** The blend costs one more channel in the mask (`Rg16Uint`, 4 bytes a pixel) and no extra texture read. Pixels a blend leaves plain skip the glyph work: at 1080p `tests/fixtures/scenes/stylize_blend.scene.toml`'s ASCII pass took 0.31 ms, against 0.39 ms for the same props fully styled.
 - **At blend 0 a style costs nothing** (#400). When every entity drawn in a per-entity style is at blend 0 (a blend that rounds to 0 in the mask's encoding counts), the style counts as off: neither its pass nor the mask is drawn, and the frame is the unstyled one, byte for byte and at the unstyled scene's GPU time. A scene table with `scope = "entities"` doesn't keep it on, because it is only the entities' preset. The ids don't change, so a ramp out of 0 finds its id and variant where it left them. What starts again is anything a style keeps from frame to frame, as after a camera cut, since its pass skipped frames; nothing it held was visible. A whole-frame (screen) table keeps the style on at any blend, because there the props at 0 are holes in a styled frame.
 
-`examples/ascii_reveal.scene.toml` is a 10-second loop: the barrel dissolves into phosphor glyphs, the bench fades into amber blocks, and both go back. The `ascii-blend` golden pins a half-way dissolve and a 40% fade.
+[`flint-examples/ascii_reveal.scene.toml`](https://github.com/chrischaps/flint-examples/blob/main/ascii_reveal.scene.toml) is a 10-second loop: the barrel dissolves into phosphor glyphs, the bench fades into amber blocks, and both go back. The `ascii-blend` golden pins a half-way dissolve and a 40% fade.
 
 ### Blending a whole-frame style
 
@@ -733,22 +823,22 @@ blend = 0.5               # half paint, half the scene as it was
 ```
 
 ```bash
-flint render examples/dream_story.scene.toml --style kuwahara:radius=7,blend=0.5
+flint render flint-examples/dream_story.scene.toml --style kuwahara:radius=7,blend=0.5
 ```
 
-A script ramps it to cross-fade the whole world into a look at a story beat: `set_post_style("kuwahara", true)`, then `set_post_style_param("kuwahara", "blend", k)` every frame ([Scripting → Whole-frame styles](scripting.md#whole-frame-styles)). `examples/dream_story.scene.toml` falls asleep into Kuwahara and wakes again.
+A script ramps it to cross-fade the whole world into a look at a story beat: `set_post_style("kuwahara", true)`, then `set_post_style_param("kuwahara", "blend", k)` every frame ([Scripting → Whole-frame styles](scripting.md#whole-frame-styles)). [`flint-examples/dream_story.scene.toml`](https://github.com/chrischaps/flint-examples/blob/main/dream_story.scene.toml) falls asleep into Kuwahara and wakes again. To find the mix by eye, drag the style's **Blend** slider in **F4 → Styles** and Copy TOML or Commit to scene writes it back (#521).
 
 ![The clearing falling asleep into Kuwahara at blend 0, about 0.25, 0.5, 0.75 and 1, the brush growing from radius 3 to 7 as it goes: the bench's legs and the barrel's hoops soften into strokes](../images/kuwahara-dream-fade.png)
 
-*Frames from `flint-player examples/dream_story.scene.toml --frame-step 0.05 --screenshot-every 0.05` at 2, 3, 3.5, 4 and 5 s, cropped.*
+*Frames from `flint-player flint-examples/dream_story.scene.toml --frame-step 0.05 --screenshot-every 0.05` at 2, 3, 3.5, 4 and 5 s, cropped.*
 
 - **How.** After a style whose blend is under 1 has drawn, the stage draws the style's input back over its output with the blend constant `1 - blend`. That is one full-screen draw, in the style's own GPU timing scope, and only while the blend is under 1. The mix is in the target's linear values (HDR at the HDR stage, linear light on an sRGB display target).
 - **Cost.** No allocation per frame: one pipeline per target format, made the first time a blend is drawn, and the input's bind group is kept with the chain. A GPU test in `tests/stylize.rs` ramps Kuwahara's and invert's blends for 24 frames and counts the kept bind groups and GPU objects.
 - **At 0 it's gone** (#399). A style whose table blend is 0 leaves its stage's chain: the frame is the one without it, byte for byte, and costs nothing. The style stays built and counts as on, so a fade can end at 0 and start up again later with no rebuild and no pop. Its mask and its claim on its entities' pixels stay too, so a whole-frame pencil still leaves those entities alone. The `ascii-whole-blend-zero` and `kuwahara-blend-zero` goldens compare with a render made without the style, and `ascii-whole-blend-half` pins the half-way fade:
 
   ```bash
-  flint render examples/pbr_test.scene.toml --no-grid --ascii --style ascii:blend=0.5
-  flint render examples/pbr_test.scene.toml --no-grid --ascii --sweep ascii.blend=0,0.25,0.5,0.75,1
+  flint render flint-examples/pbr_test.scene.toml --no-grid --style ascii:blend=0.5
+  flint render flint-examples/pbr_test.scene.toml --no-grid --style ascii --sweep ascii.blend=0,0.25,0.5,0.75,1
   ```
 - **Per-entity styles** keep their own `blend` on the component, which rides in the [style mask](#the-entity-style-mask) and mixes per pixel ([Blending in and out](#blending-in-and-out)). The table's `blend` fades the whole stage's result of that style, entities included.
 
@@ -763,8 +853,8 @@ reveal_shape = "tear"     # tear, wipe, iris or panel
 ```
 
 ```bash
-flint render examples/reveal_tear.scene.toml --style pencil:reveal=0.5
-flint render examples/reveal_tear.scene.toml --sweep pencil.reveal=0.15,0.4,0.65 --sweep pencil.reveal_shape=tear,wipe,iris,panel
+flint render flint-examples/reveal_tear.scene.toml --style pencil:reveal=0.5
+flint render flint-examples/reveal_tear.scene.toml --sweep pencil.reveal=0.15,0.4,0.65 --sweep pencil.reveal_shape=tear,wipe,iris,panel
 ```
 
 ![The props clearing under pencil at reveal 0.15, 0.4 and 0.65 (across) for each shape (down): a tear ripping out from the middle with an inked, torn rim; a ragged wipe from the left; an iris; a comic panel the screen's shape](../images/reveal-shapes.png)
@@ -775,6 +865,7 @@ flint render examples/reveal_tear.scene.toml --sweep pencil.reveal=0.15,0.4,0.65
 |---|---|---|
 | `reveal` | none | How far the region has grown, 0 to 1. With no `reveal` there is no region, whatever the other keys say. |
 | `reveal_shape` | `tear` | `tear`: a ragged hole that rips open from a point. `wipe`: a ragged line that crosses the frame. `iris`: a circle from a point, its rim wobbling a little. `panel`: a straight rectangle the screen's shape, from a point out to every edge (the comic-panel cut). |
+| `reveal_invert` | `false` | Keep the style outside the region instead of inside it (#1180): the frame the style read shows through the region as it grows. Inverted, `reveal = 0` is the style everywhere and 1 the live frame. |
 | `reveal_x`, `reveal_y` | 0.5, 0.5 | Where a tear, iris or panel starts, as a share of the frame (y down). |
 | `reveal_angle` | 0 | A wipe's direction of travel in degrees: 0 from the left edge to the right, 90 from the top down. |
 | `reveal_ragged` | by shape | How far the edge strays from the shape, as a share of the frame: tear 0.3, wipe 0.12, iris 0.05, panel 0. |
@@ -789,13 +880,13 @@ flint render examples/reveal_tear.scene.toml --sweep pencil.reveal=0.15,0.4,0.65
 
 - **Tuned by eye in F4** (#875). Every style's section in **F4 → Styles** (and the player's F3 Styles panel) has a **Reveal** group under its own settings. Its checkbox switches the reveal on at `reveal = 1`, and switching it off takes every reveal key out of the style while keeping them, so the next time it goes on the tuned tear comes back. Under it are the amount, a shape combo, the ink's colour picker and a slider for each number above, with the table's ranges and help. A row the shape doesn't read is greyed out: Angle unless it's a wipe, Start x and y for a wipe. Dragging the amount tears the frame open live; **Copy TOML** and **Commit to scene** write the keys back, and a reveal switched off leaves the file when it is committed.
 
-  ![F4 in the player over examples/reveal_tear.scene.toml: the amount dragged to 0.36 has torn the live clearing open into pencil through an inked, ragged edge. The Reveal group lists Amount, Shape, Ink and the eight numbers; Angle is greyed out for a tear, and the dot beside Amount marks it as differing from the scene](../images/f4-reveal.png)
+  ![F4 in the player over flint-examples/reveal_tear.scene.toml: the amount dragged to 0.36 has torn the live clearing open into pencil through an inked, ragged edge. The Reveal group lists Amount, Shape, Ink and the eight numbers; Angle is greyed out for a tear, and the dot beside Amount marks it as differing from the scene](../images/f4-reveal.png)
 
   *`flint-player` with `--input-script` driving F4 on a copy of the scene without its director script, so no tween fights the slider.*
 - **Torn paper** (#876). `reveal_rim` and `reveal_shadow` make the tear read as a physical sheet: the drawn side shows its white core along the rip, and the live picture underneath darkens where the torn edge lifts off it. Both default to 0, which draws the reveal exactly as it was, byte for byte. In F4 they are the Rim and Shadow sliders of the Reveal group, with a Rim colour picker after them (greyed out while Rim is 0).
 
   ```bash
-  flint render examples/reveal_tear.scene.toml --style pencil:reveal=0.5,reveal_rim=3,reveal_shadow=0.4
+  flint render flint-examples/reveal_tear.scene.toml --style pencil:reveal=0.5,reveal_rim=3,reveal_shadow=0.4
   ```
 
   ![A ragged wipe from pencil into the live clearing, 1:1 at 1080p, four ways: no rim and no shadow; a 4-point paper rim; a shadow of 0.5; both. With both the barrel's torn edge has a white core on the drawn side and a soft shadow down and to the right on the live side](../images/reveal-torn-paper.png)
@@ -803,25 +894,31 @@ flint render examples/reveal_tear.scene.toml --sweep pencil.reveal=0.15,0.4,0.65
   *`flint render tests/fixtures/scenes/stylize_props_plain.scene.toml --no-grid --style pencil:reveal=0.5,reveal_shape=wipe,reveal_angle=20 --style-time 0.6 --sweep pencil.reveal_rim=0,4 --sweep pencil.reveal_shadow=0,0.5 --sweep-crop 760,380,440,440`.*
 
   Each is found by asking the region itself rather than trusting a distance worked out from the field's slope, which holds only right at the edge: a pixel is rim when some point on a ring round it, as wide as the rim, is outside, and the live side is shadowed by how much of the region lies back toward the light within the shadow's reach. So a pinhole casts a pinhole's shadow, and the sheet is not flecked with paper where the noise dips toward the cut without crossing it. They cost more than the line: with `--gpu-time 200` at 1080p on an RTX 4070, pencil at `reveal = 0.5` went from 0.585 ms p50 to 0.776 ms with `reveal_rim = 3`, 0.698 ms with `reveal_shadow = 0.4`, and 0.848 ms with both.
-- **One call animates it.** `tween_post_style_param("pencil", "reveal", 1.0, 4.0)` eases the reveal from where it is (0 for a style that has none) to 1 ([Scripting → Whole-frame styles](scripting.md#whole-frame-styles)). `examples/reveal_tear.scene.toml` starts live, tears open into pencil over 4 s, and pulls the live frame back in with a wipe.
-- **Deterministic.** The edge is the render-mode tears' noise (`tear_mask.wgsl`'s `fbm` and `value_noise`, with ridged teeth so it reads as torn paper, not a cut), on screen position and `reveal_boil` steps of post time. The same `--style-time` draws the same edge, byte for byte; the next step redraws its teeth.
+- **Inverted, the picture opens from a point** (#1180). A reveal always grows its region from the start point, and without `reveal_invert` the style is what grows. With `reveal_invert = true` the style holds the rest of the frame and the plain picture shows inside the region: the whole frame in glyphs, then the sun coming up and the rendered world spreading out from it through an inked iris. The edge, its ink, the rim (on the style's side, so round the hole) and the shadow (cast into the hole) are drawn as before; the shader only turns which side of the cut is the style's.
+
+  ```bash
+  flint render tests/fixtures/scenes/stylize_props_plain.scene.toml --no-grid --style ascii:reveal=0.3,reveal_shape=iris,reveal_invert=true
+  ```
+
+  The ends are exact the other way round: inverted, `reveal = 1` leaves the chain (the live frame) and `reveal = 0` draws no reveal (the style's own frame). Ease it from 0 to 1 to open the picture: `tween_post_style_param("ascii", "reveal", 1.0, 6.0)` with the table's `reveal_invert = true` and `reveal = 0`. In F4 it is the Reveal group's **Inverted** checkbox, and switching the group on writes the amount that covers the frame with the style (0 inverted).
+- **One call animates it.** `tween_post_style_param("pencil", "reveal", 1.0, 4.0)` eases the reveal from where it is (0 for a style that has none) to 1 ([Scripting → Whole-frame styles](scripting.md#whole-frame-styles)). [`flint-examples/reveal_tear.scene.toml`](https://github.com/chrischaps/flint-examples/blob/main/reveal_tear.scene.toml) starts live, tears open into pencil over 4 s, and pulls the live frame back in with a wipe.
+- **Deterministic.** The edge is the frame tear's noise (`tear_mask.wgsl`'s `fbm` and `value_noise`, with ridged teeth so it reads as torn paper, not a cut), on screen position and `reveal_boil` steps of post time. The same `--style-time` draws the same edge, byte for byte; the next step redraws its teeth.
 - **The ends are exact.** At `reveal = 0` the style leaves its stage's chain, as at `blend = 0`, so the frame is the live one byte for byte and costs nothing. At 1 the reveal draws nothing, so the frame is the style's own. In between the amount grows the region about with the share of the frame it covers; a tear's last scraps of live picture linger in the corners until the end.
 - **With `blend`.** Inside the region the style shows by its `blend`; outside, not at all. The ink is drawn at the blend too.
 - **How and what it costs.** The stage draws it in place of the [blend](#blending-a-whole-frame-style): after the style, one full-screen draw puts what the style read back outside the region and lays the ink, premultiplied, in the style's own GPU timing scope. Each revealing style takes a 256-byte slot of one uniform buffer (16 a frame), so nothing is allocated per frame. Measured with `--gpu-time 200` at 1080p on an RTX 4070: pencil's pass went from 0.477 to 0.568 ms p50 with `reveal = 0.5`, about 0.09 ms for the reveal, against 0.024 ms for a plain `blend = 0.5`.
-- **Goldens.** `pencil-reveal-tear-half` pins the half-torn frame at post time 0.6, `pencil-reveal-torn-paper` the same tear with `reveal_rim = 3` and `reveal_shadow = 0.4`, `pencil-reveal-panel` a panel, and `pencil-reveal-zero` compares reveal 0 with the frame without the style.
+- **Goldens.** `pencil-reveal-tear-half` pins the half-torn frame at post time 0.6, `pencil-reveal-torn-paper` the same tear with `reveal_rim = 3` and `reveal_shadow = 0.4`, `pencil-reveal-panel` a panel, and `pencil-reveal-zero` compares reveal 0 with the frame without the style. `ascii-reveal-iris-invert` pins an inverted iris at 0.3, and `ascii-reveal-invert-zero` / `-one` hold inverted 0 and 1 to whole-frame ASCII and the frame without it.
 
-### Style blends and render-mode tears
+### Style blends and the frame's tear
 
-`--render-mode` 1--4 (matrix, blood, drunk, tron) and a style blend can both look like reality tearing into text, but they work at different levels (and a blend can [follow the tear](#a-blend-that-follows-the-tear)):
+The [tear](post-processing.md#the-tear) (`[post_process] tear`) and a style blend can both look like reality tearing into text, but they work at different levels (and a blend can [follow the tear](#a-blend-that-follows-the-tear)):
 
-| | Render-mode tears | Style blend |
+| | The frame's tear | Style blend |
 |---|---|---|
-| Where | Composite pass, before display styles | Display-stage style, after the composite |
 | What it covers | The whole screen, through `tear_mask`: drifting fbm patches or an iris from the centre, in screen space | One entity and its subtree, through the style mask, on the entity's own cells |
-| Driven by | `mode_mix` and `mode_params` (a scene-wide value) | `blend` on each entity's component |
-| The look | Fixed per mode (mode 1's glyphs are an 8x12 dot-matrix built into `composite_shader.wgsl`) | Any style's settings: fonts, ramps, palettes, edges, grids |
+| Driven by | `tear`, `tear_scale`, `tear_iris` (one value a frame) | `blend` on each entity's component |
+| The look | None of its own: whatever follows it (`blend_source = "tear"`), a whole-frame style such as `matrix` or a prop's | Any style's settings: fonts, ramps, palettes, edges, grids |
 
-Neither duplicates the other's job. Tears change how the *world* is seen, and a blend changes how one *thing* is drawn. They compose: an ASCII prop inside a matrix tear is glyphized from the tear's picture, since display styles read the composite's output. Mode 1's glyphs and the ASCII style do overlap as looks, and the `matrix` look (`--look matrix`) is the ASCII style's take on it.
+Neither duplicates the other's job. A whole-frame style through the tear changes how the *world* is seen, and a blend changes how one *thing* is drawn. They compose: an ASCII prop inside a matrix tear is glyphized from the code rain, since the [reality styles](post-processing.md#the-reality-styles) run first of the display chain and draw over every pixel. The `matrix` style's glyphs and the ASCII style do overlap as looks, and the `matrix` look (`--look matrix`) is the ASCII style's take on it.
 
 ### A blend that follows the tear
 
@@ -833,34 +930,95 @@ blend_source = "tear"     # "own", the default, is the blend alone
 transition = "dissolve"   # cells turn whole at the tear's frayed rim
 ```
 
-Render mode 6 is a tear with no look of its own: the composite draws nothing for it, so the props that follow it are the only thing it shows. Modes 1--4 tear too, and then the props turn inside the mode's own holes (an ASCII prop in a matrix tear is glyphized from the code rain, as above). A script drives it as any mode, every frame it shows, and a scene can't set a render mode:
+The tear alone has no look of its own, so the props that follow it are the only thing it shows. With a whole-frame style following it too (`matrix` with `blend_source = "tear"`), the props turn inside the same holes the style shows in (an ASCII prop in a matrix tear is glyphized from the code rain, as above). A scene sets it in `[post_process]`, and a script with `set_post("tear", ...)`, which holds until set again:
 
 ```rust
 fn on_init() {
-    set_render_mode_params(2.4, 0.0, 6.0, 0.0);   // patch scale 2.4, fbm patches
+    set_post("tear_scale", 2.4);  // patch scale 2.4
+    set_post("tear_iris", false); // patches, not the iris
 }
 
 fn on_update() {
-    set_render_mode(6, 0.5);                      // half the clearing torn
+    set_post("tear", 0.5);        // half the clearing torn
 }
 ```
 
 ```bash
-flint render examples/ascii_tear.scene.toml --render-mode 6 --mode-mix 0.5 --mode-params 2.4,0,6,0
+flint render flint-examples/ascii_tear.scene.toml --set post.tear=0.5 --set post.tear_scale=2.4
 ```
 
-![The clearing at tear mix 0, 0.3 and 0.55 under render mode 6, and at 0.3 under mode 1: the props turn to green glyphs only inside the tear's patches, which mode 1 shows as code rain, while the grass and ground stay as they were](../images/ascii-tear.png)
+![The clearing at tears of 0, 0.3 and 0.55 alone, and at 0.3 with the matrix style following it: the props turn to green glyphs only inside the tear's patches, which matrix shows as code rain, while the grass and ground stay as they were](../images/ascii-tear.png)
 
-*`flint render examples/ascii_tear.scene.toml --render-mode <m> --mode-mix <x> --mode-params 2.4,0,6,0 --no-grid`, cropped.*
+*`flint render flint-examples/ascii_tear.scene.toml --set post.tear=<x> --set post.tear_scale=2.4 [--style matrix:blend_source=tear] --no-grid`, cropped (rendered as render modes 6 and 1 before #746).*
 
-- **One mask, two readers.** The tear is `tear_mask_at` in `crates/flint-render/src/tear_mask.wgsl`, which Rust prepends to both the composite and the style mask's shader. The mask pass multiplies it into the blend it writes into the mask's `.g`, so every reader of the blend gets it: ASCII's fade and dissolve, and pencil, watercolor and user styles through the framework's [cross-fade](#blend-for-free). Its uv is the mask pixel's centre over the mask's size, the composite's own at any render scale, so a prop turns exactly where the composite tears.
-- **No tear, no cost.** While the frame draws no tear (`render_mode` not 1--4 or 6, `mode_mix` at most 0.001, or post-processing off), a torn entity counts as blend 0: its id is faded, so with nothing else styled neither the style's pass nor the mask is drawn and the frame is the unstyled one, byte for byte ([At blend 0](#blending-in-and-out)). The renderer checks the config each frame, since a script sets the mode after the world is read. The golden `ascii-tear-calm` holds it.
-- **Settings.** `mode_params` are the tear's ([Render modes](post-processing.md#render-modes)): `x` the patch scale (0 = 3), `y` fbm patches (0) or an iris from the centre (1). The uniform each masked draw has grew from 16 to 48 bytes to carry them, in its existing 256-byte slot.
+- **One mask, two readers.** The tear is `tear_mask_at` in `crates/flint-render/src/tear_mask.wgsl`, which Rust prepends to both the style mask's shader and the blend draw a whole-frame style that follows the tear gets (`stylize/blend_tear.wgsl`). The mask pass multiplies it into the blend it writes into the mask's `.g`, so every reader of the blend gets it: ASCII's fade and dissolve, and pencil, watercolor and user styles through the framework's [cross-fade](#blend-for-free). Its uv is the mask pixel's centre over the mask's size, the display's own at any render scale, so a prop turns exactly where a whole-frame style tears.
+- **No tear, no cost.** While the frame draws no tear (`tear` at most 0.001, or post-processing off), a torn entity counts as blend 0: its id is faded, so with nothing else styled neither the style's pass nor the mask is drawn and the frame is the unstyled one, byte for byte ([At blend 0](#blending-in-and-out)); a whole-frame style that follows the tear leaves the chain. The renderer checks the config each frame, since a script sets the tear after the world is read. The golden `ascii-tear-calm` holds it.
+- **Settings.** The tear's are `[post_process]` keys ([The tear](post-processing.md#the-tear)): `tear_scale` the patches across the frame's height (default 3; 0 or less draws as 3), `tear_iris` an iris from the centre instead. The uniform each masked draw has carries them in 48 bytes, in its existing 256-byte slot.
 - Scripts set it with `set_style_param(id, "blend_source", "tear")` and read it back with `get_style_param`; it is a choice, so it doesn't ease.
 
-`examples/ascii_tear.scene.toml` is a 12-second loop: the tear opens over the clearing, nearly swallows it, and closes. The goldens `ascii-tear` and `ascii-tear-matrix` pin it under modes 6 and 1 on `tests/fixtures/scenes/stylize_props_tear.scene.toml`.
+[`flint-examples/ascii_tear.scene.toml`](https://github.com/chrischaps/flint-examples/blob/main/ascii_tear.scene.toml) is a 12-second loop: the tear opens over the clearing, nearly swallows it, and closes. The goldens `ascii-tear` and `ascii-tear-matrix` pin it under modes 6 and 1 on `tests/fixtures/scenes/stylize_props_tear.scene.toml`.
 
-A screen field a game fills itself (a shockwave ring, a flashlight cone, the wooze field) as a blend source is not built yet (#859).
+### A blend that follows a screen field
+
+`blend_source = "field"` (#859) is the same idea with a field the game draws itself: at each pixel the entity's blend is its `blend` times the **style field** there, a screen field scripts fill each frame out of soft shapes. A shockwave ring spreading from an impact turns the props its front crosses to text and lets them go once it has passed; a flashlight cone shows what each prop really is wherever it points.
+
+```toml
+[entities.barrel.ascii_style]
+blend_source = "field"    # the blend times the style field at each pixel
+transition = "dissolve"
+```
+
+The field is immediate mode, like the [draw calls](scripting.md): what a frame draws is that frame's field, from `on_update` or `on_draw_ui`, and a frame that draws none has none. Places and lengths are logical points, the draw space (`screen_width()`, `screen_height()`); each shape is full inside, falls to 0 `soft` points past its edge, and takes an optional `strength` (0..1) last. The field at a pixel is its strongest shape's there.
+
+<!-- script-api:begin module:style_field -->
+<!-- Generated by `flint script api --book` from the engine's declarations (crates/flint-script/src/api/, or the ScriptModule of a feature that owns its module): edit the doc there, not here. CI's headless job runs --check-book. -->
+
+| Function | Returns | Description |
+|---|---|---|
+| `field_disc(x: num, y: num, radius: num, soft: num)` | — | Fill a disc of the style field this frame: a style following the field shows inside it. |
+| `field_disc(x: num, y: num, radius: num, soft: num, strength: num)` | — | Fill a disc of the style field this frame: a style following the field shows inside it. |
+| `field_ring(x: num, y: num, radius: num, width: num, soft: num)` | — | Fill a ring of the style field this frame, width points across: a shockwave's front that turns what it crosses. |
+| `field_ring(x: num, y: num, radius: num, width: num, soft: num, strength: num)` | — | Fill a ring of the style field this frame, width points across: a shockwave's front that turns what it crosses. |
+| `field_cone(x: num, y: num, direction: num, spread: num, length: num, soft: num)` | — | Fill a cone of the style field this frame from (x, y), pointing direction degrees clockwise from up and spread degrees either side: a flashlight's beam. |
+| `field_cone(x: num, y: num, direction: num, spread: num, length: num, soft: num, strength: num)` | — | Fill a cone of the style field this frame from (x, y), pointing direction degrees clockwise from up and spread degrees either side: a flashlight's beam. |
+
+<!-- script-api:end -->
+
+```rust
+let waves = [];
+
+fn on_draw_ui() {
+    if is_mouse_just_pressed(0) {
+        waves.push(#{ x: mouse_x(), y: mouse_y(), born: total_time() });
+    }
+    let kept = [];
+    for wave in waves {
+        let s = (total_time() - wave.born) / 3.0;    // three seconds a wave
+        if s < 1.0 {
+            let radius = screen_width() * 1.2 * s;
+            field_ring(wave.x, wave.y, radius, 120.0, 40.0, 1.0 - s);
+            kept.push(wave);
+        }
+    }
+    waves = kept;
+}
+```
+
+```bash
+flint render flint-examples/ascii_shockwave.scene.toml --scripts --time 1.4
+flint render flint-examples/ascii_shockwave.scene.toml --scripts --time 0..12 -o waves.gif
+```
+
+![Four moments of the shockwave clearing: calm before the first impact; the first ring's front over the bot and the bench, which are green glyphs there; later rings over each barrel; and the bot's head and arms turning as a ring passes behind it, its own shading again where the front has gone by](../images/ascii-shockwave.png)
+
+*`flint render flint-examples/ascii_shockwave.scene.toml --scripts --time 0.4,1.2,5.4,9.5 --strip --width 640 --height 360`, quantized to 128 colours.*
+
+- **Shapes, not a texture.** A field is up to 16 shapes (`flint_core::style_field`: `Disc`, `Ring`, `Cone`), in screen uv with every length a fraction of the screen's height, so a disc is round at any aspect and the field means the same at any resolution or render scale. The mask pass works each one out at its own pixels (`field_at` in `style_mask.wgsl`, beside the tear's `tear_mask_at`), from one 528-byte uniform written only on a frame a draw follows a field that moved: no texture, no pass. `FieldShape::value_at` is the same function on the CPU, and a GPU test holds the mask to it pixel for pixel. Past 16 shapes the rest are left out, said once.
+- **No field, no cost.** A frame with no shape is a frame with no field: an entity following it counts as blend 0, its id faded, so with nothing else styled neither the style's pass nor the mask is drawn, as with no tear.
+- **Hosts.** The field reaches the renderer as `FrameInputs::style_field`: the player takes it after `on_draw_ui` (`ScriptSystem::drain_style_field`), and `flint render --scripts` from the capture's last step. A frame capture keeps it in `inputs.json`, so `flint frame replay` draws it again. The viewer runs no scripts and fills none.
+- **Not yet.** Only an entity's blend follows the field: a whole-frame style's table takes `"own"` or `"tear"`. A field a shader fills (a user style's target) and the wooze field as a source are later work.
+
+[`flint-examples/ascii_shockwave.scene.toml`](https://github.com/chrischaps/flint-examples/blob/main/ascii_shockwave.scene.toml) drops something into the clearing every four seconds and sends a ring from where it lands (`world_to_screen`); a click sends one from the cursor, and the right button holds a flashlight from the bottom of the screen.
 
 ## Palette
 
@@ -874,7 +1032,7 @@ pixel = 4              # block size in points: 1 = per pixel, more = a chunky lo
 ```
 
 ```bash
-flint render examples/mesh_meadow.scene.toml --output meadow.png \
+flint render flint-examples/mesh_meadow.scene.toml --output meadow.png \
   --style palette:palette=phosphor,dither=1,pixel=4
 ```
 
@@ -889,7 +1047,7 @@ flint render examples/mesh_meadow.scene.toml --output meadow.png \
 
 **One matcher.** A `nearest` palette picks with `pal_pick` in `crates/flint-render/src/palette.wgsl` (`palette::PALETTE_WGSL`, OKLab distance since #320) in both styles. Each shader concatenates the same file and defines `palette_ink(i)` and `palette_ink_lab(i)` over its own uniform, so a palette can't mean one thing in ASCII and another here. `Palette::pick` (and `palette::pick_in` over any list) is the same function on the CPU, and `the_palette_matcher_agrees_with_its_cpu_reference` holds them to each other. A `luminance` ladder is climbed by each style itself, since ASCII climbs it by the cell's tone; `the_palette_style_quantizes_the_frame_to_its_table` holds the palette style's ladder and nearest picks to `Palette::quantize`, flat and dithered. A new style that reads a palette should include the file rather than copy it.
 
-`examples/pbr_test.scene.toml` and `examples/mesh_meadow.scene.toml` at 1280x720, cropped at 1:1; the right column is `dither=1,pixel=4`:
+[`flint-examples/pbr_test.scene.toml`](https://github.com/chrischaps/flint-examples/blob/main/pbr_test.scene.toml) and [`flint-examples/mesh_meadow.scene.toml`](https://github.com/chrischaps/flint-examples/blob/main/mesh_meadow.scene.toml) at 1280x720, cropped at 1:1; the right column is `dither=1,pixel=4`:
 
 | | flat (`pixel=1`) | dithered, 4-point blocks |
 |---|---|---|
@@ -931,13 +1089,13 @@ paper_image = "none"  # or a papers/<name>.png beside the scene (#390)
 scope = "screen"    # or "entities": a preset for watercolor_style entities
 ```
 
-![examples/mesh_meadow.scene.toml under --style watercolor: the grass laid in glazes with pooled dark rims, the path a granular wash, the sky bare cold-press paper](../images/watercolor-meadow.png)
+![flint-examples/mesh_meadow.scene.toml under --style watercolor: the grass laid in glazes with pooled dark rims, the path a granular wash, the sky bare cold-press paper](../images/watercolor-meadow.png)
 
-*`flint render examples/mesh_meadow.scene.toml --style watercolor`, 1280x720.*
+*`flint render flint-examples/mesh_meadow.scene.toml --style watercolor`, 1280x720.*
 
-![examples/watercolor.scene.toml: only the YBot, the two barrels and the crate are painted; the meadow and the ground stay as rendered, and the tag on the crate stays unpainted](../images/watercolor-entities.png)
+![flint-examples/watercolor.scene.toml: only the YBot, the two barrels and the crate are painted; the meadow and the ground stay as rendered, and the tag on the crate stays unpainted](../images/watercolor-entities.png)
 
-*`flint render examples/watercolor.scene.toml --no-grid`, 1280x720: per entity, as authored.*
+*`flint render flint-examples/watercolor.scene.toml --no-grid`, 1280x720: per entity, as authored.*
 
 ![stylize_props with Kuwahara at radius 4 under watercolor at three glazes; the props' style_mask "ascii" glyphs and "pencil" hatching draw over the paint](../images/watercolor-kuwahara.png)
 
@@ -949,22 +1107,22 @@ It runs at the **display stage**, after tonemapping, because it paints *on* pape
 
 - **Density.** The colour is treated as the pigment layer's transmittance over white paper, and a layer `d` times as thick transmits `C^d` (Beer–Lambert). White stays the paper and black stays black; a mid-tone moves most. Edges, glaze borders, depth rims, turbulence and granulation all add to `d`.
 - **Paper** lives in screen space, in points, so its grain holds still as the camera moves and is the same size to the eye at any `--pixels-per-point`. The noise is integer-hashed, so a frame is the same on every run.
-- **A paper image** (#390): `paper_image = "cold_press"` paints on `papers/cold_press.png` (found as for [pencil](#paper-and-strokes-from-files)), one texel every `grain_scale` points. Its height, measured against the image's own mean and spread, replaces the noise, so `grain` (the relief) and `granulation` (pigment settling in the valleys) read the scan. Its local hue variations tint `paper`. One paper serves a frame: the scene's, else the first entity's.
+- **A paper image** (#390): `paper_image = "cold_press"` paints on `papers/cold_press.png` (found as for [pencil](#paper-and-strokes-from-files)), one texel every `grain_scale` points. Its height, measured against the image's own mean and spread, replaces the noise, so `grain` (the relief) and `granulation` (pigment settling in the valleys) read the scan. Its local hue variations tint `paper`. Each `watercolor_style` entity may paint on its own, up to four papers a frame (#547); one past that paints on the procedural paper, with one warning.
 
 ![mesh_meadow under watercolor at 1:1, procedural paper and cold_press: the path's wash settles into the scan's nodules](../images/watercolor-paper-image.png)
-- **Per entity.** A `watercolor_style` component (its fields are the keys above, `paper = [r, g, b]` for the paper's colour) or a `style_mask { style = "watercolor" }` paints an entity with no table, the rest of the frame passing through, exactly as [per-entity ASCII](#per-entity-ascii) works: the scene's table (with `scope = "entities"`) is the preset, entities with equal settings share an id, `enabled = false` opts out, descendants inherit. The mask is read at the wobbled position, so a painted prop's silhouette wanders a little over its surroundings, as a real wash's would. One frame holds 15 variants. `examples/watercolor.scene.toml` paints a static mesh, a skinned one, two props with settings of their own and an inherited one, and leaves one out.
+- **Per entity.** A `watercolor_style` component (its fields are the keys above, `paper = [r, g, b]` for the paper's colour) or a `style_mask { style = "watercolor" }` paints an entity with no table, the rest of the frame passing through, exactly as [per-entity ASCII](#per-entity-ascii) works: the scene's table (with `scope = "entities"`) is the preset, entities with equal settings share an id, `enabled = false` opts out, descendants inherit. The mask is read at the wobbled position, so a painted prop's silhouette wanders a little over its surroundings, as a real wash's would. Every variant gets a row of the [variant table](#what-a-cap-leaves-out). [`flint-examples/watercolor.scene.toml`](https://github.com/chrischaps/flint-examples/blob/main/watercolor.scene.toml) paints a static mesh, a skinned one, two props with settings of their own and an inherited one, and leaves one out.
 - **One wash radius a frame.** `wash` is the largest any variant (or the scene) asks for; every other key is per entity.
 - **With Kuwahara** they chain: Kuwahara (HDR stage) flattens the scene into brush pools, and watercolor then paints those pools on paper (`--style kuwahara:radius=4 --style watercolor:layers=3`). They share nothing, and neither needs the other.
 - **With ASCII and pencil**, watercolor runs first by default (registration order), so glyphs and hatching draw over the paint. Give it a higher `order` to paint over them instead ([Order within a stage](#order-within-a-stage)).
 - The `watercolor` look (`--look watercolor`) is the style with softened light (no bloom, lighter SSAO), `pigment = 0.85` and four glazes. `ink_wash` is still the Kuwahara-built monochrome look.
 
 ```bash
-flint render examples/mesh_meadow.scene.toml --style watercolor -o meadow.png
-flint render examples/watercolor.scene.toml -o props.png                       # per entity, as authored
-flint render examples/stylize_props.scene.toml --look watercolor --sweep watercolor.layers=0,3,5,8 -o glazes.png
+flint render flint-examples/mesh_meadow.scene.toml --style watercolor -o meadow.png
+flint render flint-examples/watercolor.scene.toml -o props.png                       # per entity, as authored
+flint render flint-examples/stylize_props.scene.toml --look watercolor --sweep watercolor.layers=0,3,5,8 -o glazes.png
 ```
 
-At 1080p on an RTX 4070 the whole-frame pass costs about 0.43 ms (`mesh_meadow`, `--gpu-time 240`). The per-entity demo costs 0.32 ms plus 0.03 ms for the mask: the wash is still blurred over the whole frame, and only the paint pass skips unpainted pixels. `--style watercolor:off` turns the style off everywhere, the entities that carry a `watercolor_style` of their own included (#376), so the props render as the scene does underneath, with bloom, SSAO and the rest kept. In a scene, a table's `enabled = false` is only the table's: an entity's own component still switches the style on for its pixels, so set `enabled = false` on the entities, as with ASCII.
+At 1080p on an RTX 4070 the whole-frame pass costs about 0.43 ms (`mesh_meadow`, `--gpu-time 240`). The per-entity demo costs 0.11 ms plus 0.03 ms for the mask: since #538 the wash, its blur and the paint run only near the painted props ([Drawn only where the entities are](#drawn-only-where-the-entities-are)); over the whole frame they cost 0.24 ms. `--style watercolor:off` turns the style off everywhere, the entities that carry a `watercolor_style` of their own included (#376), so the props render as the scene does underneath, with bloom, SSAO and the rest kept. In a scene, a table's `enabled = false` is only the table's: an entity's own component still switches the style on for its pixels, so set `enabled = false` on the entities, as with ASCII.
 
 ## Display bloom
 
@@ -981,7 +1139,7 @@ saturation = 1.0   # 1 keeps the glyph's hue, 0 glows white
 
 ![pbr_test in phosphor ASCII at 3x, glow 0.6 alone on the left and with display bloom on the right: the bright box's glyphs share one halo that spills across their cells and over the grid lines beside it](../images/display-bloom-phosphor-crop.png)
 
-*A crop of `flint render examples/pbr_test.scene.toml --ascii --ascii-palette phosphor --ascii-glow 0.6` at 1280x720, shown at 3x, without and with `--style display_bloom`.*
+*A crop of `flint render flint-examples/pbr_test.scene.toml --style ascii:palette=phosphor,color=palette,glow=0.6` at 1280x720, shown at 3x, without and with `--style display_bloom`.*
 
 - **Where it runs.** It's registered after ASCII and pencil, so by default it blooms what they drew. Give it an `order` to place it elsewhere in the display chain ([Order within a stage](#order-within-a-stage)).
 - **The threshold is on what you see.** A pixel passes by its brightest channel in display values (0--1), with a soft knee. The halo itself adds in linear light. At the defaults the dim grass glyphs stay clean and only the lit box and the ridge glow; a lower `threshold` or a wider `knee` lifts the whole field.
@@ -989,11 +1147,11 @@ saturation = 1.0   # 1 keeps the glyph's hue, 0 glows white
 - **`levels` is in points.** On a 2x display the chain takes one more level, so the halo keeps its size next to cells that also grew. The intensity is divided by the levels drawn, so changing the reach doesn't change the brightness.
 - It's a whole-frame style with no per-entity component.
 
-At 1080p on an RTX 4070 it costs **0.066 ms** (5 levels; `flint render examples/pbr_test.scene.toml --ascii --ascii-palette phosphor --style display_bloom --width 1920 --height 1080 --gpu-time 240`). Its mips add about 5.5 MB at 1080p (a half-size `Rgba16Float` texture and the quarter, eighth... ones under it). The `display-bloom` golden pins it over phosphor ASCII.
+At 1080p on an RTX 4070 it costs **0.066 ms** (5 levels; `flint render flint-examples/pbr_test.scene.toml --style ascii:palette=phosphor,color=palette --style display_bloom --width 1920 --height 1080 --gpu-time 240`). Its mips add about 5.5 MB at 1080p (a half-size `Rgba16Float` texture and the quarter, eighth... ones under it). The `display-bloom` golden pins it over phosphor ASCII.
 
 ```bash
-flint render examples/pbr_test.scene.toml --ascii --ascii-palette phosphor --style display_bloom -o glow.png
-flint render examples/pbr_test.scene.toml --ascii --ascii-palette phosphor --style display_bloom --sweep display_bloom.knee=0,0.25,0.5 -o knee.png
+flint render flint-examples/pbr_test.scene.toml --style ascii:palette=phosphor,color=palette --style display_bloom -o glow.png
+flint render flint-examples/pbr_test.scene.toml --style ascii:palette=phosphor,color=palette --style display_bloom --sweep display_bloom.knee=0,0.25,0.5 -o knee.png
 ```
 
 ## Looks and sweeps
@@ -1052,22 +1210,79 @@ vignette_enabled = true
 spacing = 9             # the rest of graphite's pencil table stays
 ```
 
-`--look` goes the other way, over the scene's keys, so a look can be tried on any scene as it stands. A scene whose block is only `look = "graphite"` draws exactly what `--look graphite` draws on the same scene without a block: the two renders of `examples/looks.scene.toml` are byte-identical. `flint render` prints `Scene look: graphite`, and `flint validate` warns about a look it can't find or one whose keys don't fit. In the player a missing look is a warning and the scene draws without it.
+`--look` goes the other way, over the scene's keys, so a look can be tried on any scene as it stands. A scene whose block is only `look = "graphite"` draws exactly what `--look graphite` draws on the same scene without a block: the two renders of [`flint-examples/looks.scene.toml`](https://github.com/chrischaps/flint-examples/blob/main/looks.scene.toml) are byte-identical. `flint render` prints `Scene look: graphite`, and `flint validate` warns about a look it can't find or one whose keys don't fit. In the player a missing look is a warning and the scene draws without it.
 
-The player and the viewer (`flint edit scene.toml`) read the look when the scene loads. **F4 → Look** lists every look the scene can reach (each `styles/` from its folder up to the project root, the mounted engine's, then the built-ins no file shadows) and switches to the one you pick. The pick replaces the whole post config, so edits made in F4's other sections before the pick are gone. The viewer keeps the pick across hot reloads, so you can edit a look file in the scene's `styles/` and watch it change. Scripts switch looks with `set_look("matrix")` and take them off with `clear_look()` ([Scripting → Style API](scripting.md#style-api)). Every switch starts again from the scene's own keys, so nothing from the previous look carries over.
+The player and the viewer (`flint edit scene.toml`) read the look when the scene loads. **F4 → Look** lists every look the scene can reach (each `styles/` from its folder up to the project root, the mounted engine's, then the built-ins no file shadows) and switches to the one you pick. The pick replaces the whole post config, so edits made in F4's other sections before the pick are gone. The viewer keeps the pick across hot reloads, so you can edit a look file in the scene's `styles/` and watch it change. Scripts switch looks with `set_look("matrix")` and take them off with `clear_look()` ([Scripting → Style API](scripting.md#style-api)), or fade to one with `set_look("matrix", 2.0)` (next section). `get_look()` says which look is on, whoever chose it (the scene, F4, a script or a transition), and `list_looks()` names every look F4 would list (#497). Every switch starts again from the scene's own keys, so nothing from the previous look carries over.
 
-![F4's Look picker in the player: examples/looks.scene.toml's graphite swapped for watercolor by hand; the post chain below mirrors the new exposure and vignette](../images/f4-look-picker.png)
+![F4's Look picker in the player: flint-examples/looks.scene.toml's graphite swapped for watercolor by hand; the post chain below mirrors the new exposure and vignette](../images/f4-look-picker.png)
 
-![examples/looks.scene.toml in flint-player: scripts/looks_tour.rhai calls set_look every three seconds of game time (graphite, ascii_noir, matrix, ink_wash, watercolor) and then clear_look](../images/looks-tour-player.png)
+![flint-examples/looks.scene.toml in flint-player: scripts/looks_tour.rhai calls set_look every three seconds of game time (graphite, ascii_noir, matrix, ink_wash, watercolor) and then clear_look](../images/looks-tour-player.png)
 
-*Captured with `flint-player examples/looks.scene.toml --frame-step 0.1 --screenshot tour.png --screenshot-at 1.5 --screenshot-every 3`.*
+*Captured with `flint-player flint-examples/looks.scene.toml --frame-step 0.1 --screenshot tour.png --screenshot-at 1.5 --screenshot-every 3`.*
+
+#### Fading from one look to the next
+
+A cut suits a menu or a debug pick; a story beat wants the old look to give way to the new one. `set_look("watercolor", 2.0)` (and `clear_look(2.0)`) eases from what the frame draws now to what the look resolves to, over that many seconds of game time, slow out and slow in (#496). F4's Look picker in the player has a **Fade** time beside it that does the same for a pick.
+
+What crosses, and how:
+
+- **Numbers and colours** lerp: exposure, SSAO intensity, a fog colour, every number or colour key a [built-in effect](post-processing.md) has, and each parameter of a style both looks run (a parameter one look leaves unset reads as the style's default).
+- **An effect one look turns on** (vignette, bloom, SSAO, fog, height fog, volumetric light, dither) stays on through the fade and its strength runs from 0, or down to 0 as it turns off, so it never appears halfway.
+- **Whole numbers and switches** (sample counts, FXAA, `boil_on`) change at the midpoint.
+- **A style only one look has** fades by its whole-frame `blend`: graphite's pencil from 1 to 0 while watercolor's washes come up from 0 to 1. At 0 a style leaves its chain, so both ends are the frame without it, byte for byte. In between the two styles chain in their usual order, the later one reading the earlier's half-faded frame: the outgoing look fades out under the incoming one, rather than the two being drawn apart and mixed.
+- **A style's options** (a ramp, a palette, a font), its place in the chain and its reveal switch at the midpoint: there is one of each style, so it can't be drawn both ways at once.
+
+The fade writes only what the two looks set differently. Whatever else moves the config meanwhile keeps moving: a script's `set_post_process` overrides are stamped over the fade each frame, and a style a script tweens that neither look touches is left to the tween. At the end the config is exactly what the cut would have drawn, and `look_faded` fires. A scene transition drops a fade in progress.
+
+A fade is timed from the game time the script asked it at: the frame drawn at that moment is where it starts, and the frame at the asked time plus its seconds is where it ends. `flint render --scripts --time T` captures a fade at T with the values the player draws at T, every look the scripts asked before T laid in the order asked (#1157), so a fade asked after a cut starts from the cut's look, not from the look the scene file authors. [`flint-examples/look_fade.scene.toml`](https://github.com/chrischaps/flint-examples/blob/main/look_fade.scene.toml) holds each look for 1.5 s and fades for 2, so `--time 2.5` is halfway from graphite to watercolor.
+
+![flint-examples/look_fade.scene.toml in flint-player: graphite fading into watercolor over two seconds, at 1.0, 2.0, 2.5, 3.0 and 3.7 s of game time; the HUD bar is time, the picture eases](../images/look-fade-player.jpg)
+
+*Captured with `flint-player flint-examples/look_fade.scene.toml --frame-step 0.0333333 --screenshot fade.png --screenshot-every 0.0333333 --exit-after 4`.*
+
+#### Building a look before it is shown
+
+A style's pipelines are built the first time a frame draws it, and some styles have many: ASCII builds 15. So the first `set_look` to a look nobody has drawn yet stops the game while they are built, on that frame. Measured on the looks tour ([`flint-examples/looks.scene.toml`](https://github.com/chrischaps/flint-examples/blob/main/looks.scene.toml)), whose `ascii_noir` beat comes at 3 s, in a release build on an RTX 5070 Laptop: that frame took about a second: 976 to 1083 ms on Vulkan with the driver's shader cache emptied before each run (eight runs), 825 to 1491 ms on DX12, whose shaders Flint compiles itself every run (three runs). Ink wash's and watercolor's first beats cost 67 to 132 ms more. Later switches to the same look cost nothing: the built pipelines are kept. A cross-fade (`set_look(name, 2.0)`) pays the same on its first frame, which is the story beat you wanted smooth.
+
+`prepare_look(name)` builds a look's styles ahead, on worker threads, while the game goes on drawing:
+
+```rhai
+fn on_init() {
+    for name in ["ascii_noir", "ink_wash", "watercolor"] {
+        prepare_look(name);    // nothing changes on screen
+    }
+}
+
+fn on_event(name, data) {
+    if name == "storm_breaks" {
+        set_look("ink_wash", 2.0);   // built already: the fade starts smoothly
+    }
+}
+```
+
+Nothing is shown and `get_look()` still answers the look drawn. Each style is built once whoever asks: a look that is built or building already costs nothing, and the frame that sets a look whose styles are still building waits for that build rather than starting another, so it never pays more than it would have. A switch made right after `prepare_look` therefore still stops; give it the time a build takes (about a second for ASCII on a fast machine). In the tour above, preparing its five looks at `on_init` left no frame over 50 ms at the `ascii_noir` beat in seven runs on the two backends, and none at the others but one of 50.3 ms, spent in `set_look` itself, not in a build.
+
+On the web there are no threads, so `prepare_look` builds at the call: make it where a stop is hidden, behind a loading screen or a fade to black. A Rust host calls `SceneRenderer::prepare_styles(device, &config)` with the config it will show, or `PlayerApp::prepare_look(name)`.
+
+A scene can say the same in its file, and the player prepares them when the scene loads, before its first frame:
+
+```toml
+[post_process]
+preload_looks = ["graphite", "ink_wash", "watercolor"]   # looks a script will set_look
+preload_styles = ["matrix", "tron"]                      # styles a script will set_post_style
+```
+
+A style is more than its own pipelines. The stage draws a style's `blend`, its [reveal](#revealing-a-whole-frame-style) and its tear (`blend_source = "tear"`) with pipelines of its own, built the first time a frame needs each: the first frame a sheet waiting at `reveal = 0` starts to tear open used to stop for that build (92 ms in one film). Preparing builds those too: the ones a style's table asks for, and for a preloaded look or style every one of them, whatever its table says at load, since a fade blends a look in and a script may tween a reveal or tear a style in later. A scene's own styles get theirs at its entry with no key at all. `preload_styles` is for styles nothing switches on until a script does: the reality styles (`matrix`, `tron`) a render mode tears in, a `set_post_style` at a story beat. A name the search can't find is warned about at load and skipped. A preloaded look's file is read once, at load, so the cut reads nothing from the disk; edit one while the scene plays and the edit shows at its next load. Rust hosts pass the names to `SceneRenderer::prepare_styles_with(device, &config, &names)`.
+
+Measured on a bench that cuts through Kindling's four looks every 1.5 s (`graphite`, `ink_wash`, `watercolor`, `coloured_pencil`) in a debug build, Vulkan, RTX 4070, a fresh shader cache each run: without `preload_looks` the first cut took 750 to 1150 ms (pencil's pipelines) and watercolor's 102 to 228 ms over six runs; with it every one of the 24 cuts took 16.2 to 18.4 ms, a refresh, and no run had a hitch. Plaintext's beats (a pencil sheet tearing in, then `matrix` and `tron` switched on and torn in) hitched 61 to 92 ms at `matrix` in five runs out of five without `preload_styles`, and in none with it.
 
 **`--sweep KEY=V1,V2,...`** renders the same frame once per value and lays the frames out as one labelled contact sheet, four across, in the ASCII style's built-in glyphs. KEY can be:
 
 - any `--style` key, written `<style>.<key>`: `ascii.cell=6,8,12`, `ascii.ramp=classic,blocks`, `kuwahara.radius=2,4,6,8`. Values are checked against the style's range;
 - any `[post_process]` field, written `post.<field>`: `post.exposure=0.8,1.2`. Use `|` between values to sweep a vector: `post.fog_color=0,0,0|0.7,0.75,0.82`;
 - `look=ascii_noir,matrix,ink_wash,graphite`, to compare whole looks;
-- a Living Props wooze knob, written `wooze.<knob>`: `wooze.glide=0,0.25,0.5,1`, `wooze.preset=boil,morph` (knobs `amplitude`, `step`, `glide`, `jitter`, `preset`). Each such column is a run of its own from time 0 (see [Sweeping a Knob](../guides/headless-rendering.md#sweeping-a-knob)).
+- a Living Props wooze knob, written `wooze.<knob>`: `wooze.glide=0,0.25,0.5,1`, `wooze.preset=boil,morph` (knobs `amplitude`, `step`, `glide`, `jitter`, `preset`). Each such column is a run of its own from time 0 (see [Sweeping a Knob](../guides/headless-rendering.md#sweeping-a-knob));
+- a field of the scene's `[living] echoes`, written `living.echoes.<knob>`: `living.echoes.spread=0,0.9,1.8` (knobs `count`, `spread`, `alpha`). Each column draws what a scene with that table draws.
 
 Each family is one key prefix on the one flag, parsed by one type (`commands/sweep.rs`, #353), and every family lands on the same sheet. Each cell is 640x360 unless you pass `--width` and `--height`. The scene loads once and every column re-renders the same frame, so four columns of `stylize_props` take about 13 s in a debug build. A sweep goes over `--look` and every other flag. When two neighbouring columns come out pixel-identical, `flint render` warns that the sweep showed nothing between them: the style was off, nothing on screen read the key, or both values clamped to one.
 
@@ -1082,7 +1297,7 @@ The ASCII looks set no `edges` key, so they draw the [edge glyphs](#edges) by de
 Some keys only make sense together. Brightness and contrast both move the ground, so a contrast that looks right at one brightness can black the scene out at another. **Give `--sweep` twice** and the sheet becomes a grid (#358): the first key's values run across the columns, the second key's run down the rows, and every cell takes one value from each. A grid never wraps, so a column holds one value all the way down and you can read along either key. A grid takes up to 48 cells. You can't sweep the same key twice, or two `look=` lists; one axis can be a look and the other a post field or style key.
 
 ```bash
-flint render examples/stylize_props.scene.toml --look ascii_noir \
+flint render flint-examples/stylize_props.scene.toml --look ascii_noir \
     --sweep ascii.brightness=0,0.15,0.3,0.45 --sweep ascii.contrast=1,1.6,2.2 -o noir-grid.png
 ```
 
@@ -1097,14 +1312,16 @@ A style sized in points, such as ASCII's `cell` or pencil's `spacing`, draws as 
 - **`--sweep-crop X,Y,W,H`** draws every cell at `--width`x`--height` (1920x1080 unless you set them) and keeps that region pixel for pixel. The glyphs come out exactly the size the final render draws them, but you only see part of the frame. Choose a region that holds what the key affects, such as a prop's edge for glow or a gradient for a ramp.
 - **`--sweep-scale full`** draws every cell at the full size and shrinks it to 640 wide. The composition matches the final render (where glyphs land, how much of the frame the tone fills), but the glyphs blur.
 
-Both flags work with a grid. The sheet's subtitle states the scale, for example `1:1 640x360 at 760,520 of 1920x1080` or `1920x1080 shown at 33%`, so a reader knows what they are looking at. A crop that goes past the frame is refused before anything is drawn. `--sweep-scale cell` is the default.
+Both flags work with a grid. The sheet's subtitle states the scale, for example `1:1 640x360 at 760,520 of 1920x1080` or `1920x1080 shown at 33%`, so a reader knows what they are looking at. A crop sheet also carries a **locator** in its header, top right: the first cell's whole frame, shrunk, with the kept region outlined and the rest dimmed, so you can see which part of the scene every cell comes from (#501). A pixel crop that goes past the frame is refused before anything is drawn. `--sweep-scale cell` is the default.
+
+A crop can be given **in fractions** of the frame instead of pixels: when any value has a decimal point, all four are shares of the width and height, from 0 to 1. `--sweep-crop 0.4,0.48,0.33,0.33` keeps the same part of the frame at 1920x1080 or at 1280x720, so a crop you've found works at any `--width`/`--height`. Its edges are rounded to pixels, and the subtitle gives the region it came to.
 
 ```bash
-flint render examples/stylize_props.scene.toml --look ascii_noir \
+flint render flint-examples/stylize_props.scene.toml --look ascii_noir \
     --sweep ascii.glow=0,0.6,1.2 --sweep-crop 760,520,640,360 -o glow.png
 ```
 
-![ascii_noir's glow swept as 1:1 crops of a 1080p frame: the radio and the barrel at their final glyph size](../images/sweep-crop-noir-glow.png)
+![ascii_noir's glow swept as 1:1 crops of a 1080p frame: the chair and the crate at their final glyph size, and top right the locator, the whole frame with the crop boxed in amber](../images/sweep-crop-noir-glow.png)
 
 Rendering at full size costs more: each cell is a whole 1080p frame. The pixel-identical check compares the full frames before they're cropped, so a crop can't hide a difference elsewhere in the frame.
 
@@ -1113,7 +1330,7 @@ Rendering at full size costs more: each cell is a whole 1080p frame. The pixel-i
 A sheet is judged by eye. **`--report FILE.json`** (#357) also measures each column, from the same pixels the sheet is made of: mean luminance, the share of near-black (luma ≤ 24) and near-white (≥ 232) pixels, edge density (the share of pixels whose right + down luma step passes 24), and, when the ASCII style drew, the grid's size, its share of blank cells and the share of cells on each step of the ramp, darkest first. Edge glyphs are counted in `off_ramp`. The same sweep prints a line per column:
 
 ```text
-$ flint render examples/stylize_props.scene.toml --look ascii_noir \
+$ flint render flint-examples/stylize_props.scene.toml --look ascii_noir \
     --sweep ascii.brightness=0,0.15,0.3,0.45 --report brightness.json -o brightness.png
   [0] luma 0.10  black 82%  white 1%  edges 24%  blank cells 29%
   [0.15] luma 0.18  black 69%  white 2%  edges 42%  blank cells 5%
@@ -1122,17 +1339,36 @@ $ flint render examples/stylize_props.scene.toml --look ascii_noir \
 
 **`--reference ref.png`** adds each column's distance to a target image, using the metric `flint gen --ai-refine` uses (#183): mean colour, a 16-bin luminance histogram and a 16x16 luminance layout, as a score out of 100 where 0 is the reference itself. It's a ruler, not a judge. It can say whether one column is closer than another, but it doesn't measure taste. On a sheet each label gets `d <score>`, the nearest column is starred, and `nearest` in the report names it. Under `--sweep-crop` or `--sweep-scale full` the image measures and distance are taken from the cell as the sheet shows it, while the ASCII section still counts the whole drawn frame's grid. A two-key grid reports every cell, each `value` naming both keys, but its labels carry no distances.
 
+**`--reference-text ref.txt`** (#495) reads an ASCII frame as letters, not pixels. Pixels are the wrong ruler for glyphs: a glyph is texture to a luminance histogram, so a `glow` that smears ink into the ground moves the histogram more than a change of letters does. Give the reference's own grid, as `--ascii-text` writes it, and every frame the ASCII style drew is scored by three terms. **Mean colour** is the pixels' term, as before. **Glyph coverage** reads each cell as the ink of its glyph in the atlas (0 for blank, 1 for the densest printable letter) and takes the earth mover's distance between the two grids' ink mixes, so `+` for `*` is a short move and `.` for `@` a long one. **Glyph layout** is the mean ink difference over 16x16 regions of the frame. The grids don't have to share a cell size: a cell of 9 compares with a cell of 8. Each score is printed with its terms, and in the report `distance` has `metric` (`pixels` or `glyphs`), `terms` (each term's distance and the points it adds; they sum to `score`), the pixel terms, and `glyph`. A frame that draws no glyphs scores as a blank grid. Without `--reference-text`, a render whose ASCII style is on says it is scoring by pixels. On `stylize_props`, with ascii_noir toward the matrix look, a glow sweep moves the two metrics very differently:
+
+```text
+$ flint render flint-examples/stylize_props.scene.toml --look matrix -o ref.png --ascii-text ref.txt
+$ flint render flint-examples/stylize_props.scene.toml --look ascii_noir --sweep ascii.glow=0,1.5 \
+    --reference ref.png -o glow.png
+  [ascii.glow = 0] ...  distance 22.27 by pixels (mean colour 2.07 + histogram 17.65 + layout 2.55)
+  [ascii.glow = 1.5] ...  distance 14.25 by pixels (mean colour 1.50 + histogram 11.31 + layout 1.44)
+$ ... --reference ref.png --reference-text ref.txt
+  [ascii.glow = 0] ...  distance 12.60 by glyphs (mean colour 2.07 + glyph coverage 5.30 + glyph layout 5.22)
+  [ascii.glow = 1.5] ...  distance 12.03 by glyphs (mean colour 1.50 + glyph coverage 5.30 + glyph layout 5.22)
+```
+
+Under glyphs, the ramp and the tone keys are what move the score (`ascii.ramp=detailed` 11.52, `ascii.brightness=0.45` 6.16).
+
 **`--ai-refine`** closes the loop: `flint render scene --look <x> --reference ref.png --ai-refine`. Each round an agent sees the reference, the current render, the look's block, every key it may change (with ranges) and every edit tried so far with its score. It proposes up to `--refine-candidates` (4) candidates in `--sweep` key syntax. Each candidate is checked like a sweep value, then rendered and measured. The best is kept if it lowers the distance by more than 0.05. The loop stops after `--refine-rounds` (4), or after two rounds in a row with no gain, or when the agent has nothing left to propose. It writes:
 
 - `<look>_refined.look.toml` beside `-o` (or `--refine-out`): the kept block, plus a note of what was kept and what it cost;
 - the same path with `.json`: the log of every candidate, its score and image measures, and whether it was kept;
 - `-o`: a sheet showing the reference, the start, and each kept round.
 
-`--ai-provider anthropic` (the default) asks Claude (`ANTHROPIC_API_KEY`, `--ai-model`). Every call goes through the procgen `CostMeter`: it's priced, appended to `.flint/procgen_costs.json`, and refused before sending when it could pass `--max-cost`. `--ai-provider mock` is free and offline. It walks the look's own `tune` sweeps one untried value at a time, which turns the loop into a measured coordinate search. Toward a hidden target (ascii_noir at cell 12, brightness 0.3, contrast 1.2), the mock went 7.68 → 0.00 in five rounds. Contrast 1.2 scored *worse* than the start on its own, and only helped once the other two had moved.
+`--ai-provider anthropic` (the default) asks Claude (`ANTHROPIC_API_KEY`, `--ai-model`). Every call goes through the procgen `CostMeter`: it's priced, appended to `.flint/ai_costs.jsonl`, and refused before sending when it could pass `--max-cost`. `--ai-provider mock` is free and offline. It walks the look's own `tune` sweeps one untried value at a time, which turns the loop into a measured coordinate search. Toward a hidden target (ascii_noir at cell 12, brightness 0.3, contrast 1.2), the mock went 7.68 → 0.00 in five rounds. Contrast 1.2 scored *worse* than the start on its own, and only helped once the other two had moved.
 
 Toward the `matrix` look's render, with Claude (four calls, $0.115), ascii_noir went 25.66 → 15.09. Claude turned the colour to `tint` and the ramp to `detailed`, then found that `glow` was the strongest lever. It also learned from the log that whitening the tint and turning off the vignette both scored worse:
 
 ![Refining ascii_noir toward the matrix look: reference, start 25.7, then rounds at 25.0, 19.2, 15.2, 15.1](../images/look-refine-noir-to-matrix.png)
+
+That was the pixel metric, and `glow` won because it smeared the sky into a pale band with no letters in it. Rerun on main in November 2026 (start 22.27), the pixel refine kept glow in two of its four rounds. Given `--reference-text`, the same refine scores by glyphs (12.77 → 4.02, four calls, $0.149) and keeps no glow at all. It kept the `detailed` ramp with brightness 0.3 and `tint`, then cell 8 (the reference's own 80 columns), then ink 1.3 with a whiter tint. After round 3 Claude noted that coverage and layout hadn't moved since round 2, "so only a ramp, brightness or contrast change will shift them". The weak term is now mean colour. Over a mostly dark frame it is only about 2 of the 12 points, so the whiter tint it kept reads greyer than the reference's green:
+
+![Refining ascii_noir toward the matrix look by glyphs: reference, start 12.8, then rounds at 5.2, 4.9, 4.0](../images/look-refine-noir-to-matrix-glyphs.png)
 
 ### Choosing cell size and ramp
 
@@ -1150,7 +1386,7 @@ scene (HDR, render scale)
   -> style mask (Rg16Uint: id + blend, only while a style reads it)
   -> HDR styles (Kuwahara)          linear Rgba16Float, scene resolution
   -> SSAO, volumetric (depth), bloom (the original HDR, or the HDR styles' result: feeds_bloom)
-  -> composite: fog, DoF, tonemap, grade, vignette, grain, render modes
+  -> composite: fog, DoF, tonemap, grade, vignette, grain
   -> Display styles (watercolor, ASCII, pencil, palette, display bloom, invert) surface format, output resolution
   -> FXAA -> surface -> HUD
 ```
@@ -1160,7 +1396,7 @@ scene (HDR, render scale)
 
 Styles of one stage run one after another, each reading the one before it. The framework ping-pongs between two targets it owns, so any number of styles chain without a style knowing its neighbours.
 
-The display stage keeps its memory to two full-size textures (#302). At 1440p each one is about 15 MB, which matters on phones and the web. The composite draws into the stage's input, and once the first style has read that input it is free to be a ping. With FXAA on, FXAA's intermediate is the second texture: the composite draws into whichever of the two leaves the last style writing the intermediate. So one style needs one texture of its own (two with FXAA's), and longer chains need two (still two with FXAA's). The output is byte-identical to the old chain. A style's own intermediates come on top of these; watercolor's two washes are full size, for example. The player's F3 stats show every target as `Style targets: N (MB, K full-size)`, where the full-size count includes FXAA's intermediate. The count is everything asked for since the last resize, so switching a style off doesn't lower it.
+The display stage keeps its memory to two full-size textures (#302). At 1440p each one is about 15 MB, which matters on phones and the web. The composite draws into the stage's input, and once the first style has read that input it is free to be a ping. With FXAA on, FXAA's intermediate is the second texture: the composite draws into whichever of the two leaves the last style writing the intermediate. So one style needs one texture of its own (two with FXAA's), and longer chains need two (still two with FXAA's). The output is byte-identical to the old chain. A style's own intermediates come on top of these; watercolor's two washes are full size, for example. The player's F2 overlay shows the total as `Style targets: N (MB, K full-size)`, where the full-size count includes FXAA's intermediate, and under it each target with its size and MB. The count is everything asked for since the last resize, so switching a style off doesn't lower it.
 
 ### Order within a stage
 
@@ -1188,15 +1424,15 @@ order = 9
 An entity that asks for a style owns its pixels for that style (#384). With ASCII on for the whole frame, a cask carrying `style_mask { style = "pencil" }` stays a pencil sketch: ASCII leaves it, and pencil draws it from the scene as rendered, not from ASCII's glyphs. The rule runs both ways, and in either chain order: an ASCII barrel in a pencil frame stays glyphs.
 
 ```sh
-flint render examples/stylize_props.scene.toml --style ascii --no-grid --output props.png
+flint render flint-examples/stylize_props.scene.toml --style ascii --no-grid --output props.png
 ```
 
 ![Whole-frame ASCII over stylize_props, before and after: the pencil cask and crate were glyphs sketched over, now they are sketched](../images/stylize-ownership.png)
 
-The framework does it, so a new style (a user style included) gets it without code of its own. After each style draws, an ownership pass puts the style's input back on every pixel whose mask id another running style owns. The owner of an id is the style its variant names, when that style is registered and on this frame. An opt-out (`enabled = false`) is nobody's, so the whole-frame style draws it: the tag on the crate is glyphs. The pass reads the mask's blend, so a foreign entity fading out of its style (`blend` toward 0) fades into the whole frame's style. Styles read the same list as `StyleFrame::foreign_ids()`: pencil keeps its contours and hatching off those pixels, and ASCII's text grid (`--ascii-text`) writes their cells as ground.
+The framework does it, so a new style (a user style included) gets it without code of its own. After each style draws, an ownership pass puts the style's input back on every pixel whose mask id another running style owns. The owner of an id is the style its variant names, when that style is registered and on this frame. The owner table has a slot for every id the frame has (it stopped at 255 before #740, and a crowd's props past it were drawn over without a word). An opt-out (`enabled = false`) is nobody's, so the whole-frame style draws it: the tag on the crate is glyphs. The pass reads the mask's blend, so a foreign entity fading out of its style (`blend` toward 0) fades into the whole frame's style. Styles read the same list as `StyleFrame::foreign_ids()`: pencil keeps its contours and hatching off those pixels, and ASCII's text grid (`--ascii-text`) writes their cells as ground.
 
 - **Who doesn't yield.** `mask_view`, `edges_view` and `display_bloom` draw over everything (`StyleDescriptor::draws_over_entities()`): the debug views show the whole picture, and the glow crosses styles as light does. The `style` and `edges` debug modes don't run the pass.
-- **The cut is the mask's.** The cut follows the mask pixel by pixel, so a glyph cell that straddles the cask's outline is cut along it. Whole-cell silhouettes ([#338](#whole-cell-silhouettes)) are a per-entity ASCII setting and don't apply to the edge of another style's entity.
+- **The cut is the mask's, or ASCII's cells.** The cut follows the mask pixel by pixel, so a glyph cell that straddles the cask's outline is cut along it. With `silhouette = "cell"` in ASCII's table the cut snaps to ASCII's cells instead, each cell along the cask all glyph or all cask ([At the edge of another style's entity](#at-the-edge-of-another-styles-entity), #534).
 - **The mask is drawn for it.** A style that yields asks for the mask while another running style owns an entity, even if it reads nothing else from the mask.
 - **Cost.** The pass is one full-screen triangle per yielding style, drawn only on frames where another style owns an entity. It discards every pixel that isn't foreign.
 
@@ -1218,13 +1454,13 @@ Kuwahara's default is unchanged: off.
 
 | ![neon isolines, bloom reading the original scene: the lines are flat, the lamp's halo glows where the style dimmed it](../images/bloom-follows-style-neon-off.png) | ![neon isolines feeding bloom: each line glows](../images/bloom-follows-style-neon-on.png) |
 |---|---|
-| `examples/neon_bloom.scene.toml --style neon:feeds_bloom=0`: bloom reads the scene under the style. The lines are flat, and the lamp, which the style dimmed to a fifth, still haloes at full strength | The scene as written (`neon` says `feeds_bloom = true`): bloom reads the styled picture, so each line glows and the lamp's halo shrinks with it |
+| `flint-examples/neon_bloom.scene.toml --style neon:feeds_bloom=0`: bloom reads the scene under the style. The lines are flat, and the lamp, which the style dimmed to a fifth, still haloes at full strength | The scene as written (`neon` says `feeds_bloom = true`): bloom reads the styled picture, so each line glows and the lamp's halo shrinks with it |
 | ![Kuwahara, bloom from the original scene](../images/bloom-follows-style-kuwahara-off.png) | ![Kuwahara feeding bloom](../images/bloom-follows-style-kuwahara-on.png) |
-| Kuwahara at its default (`neon_bloom` with `--style neon:off --style kuwahara:radius=8 --exposure 2.2`, a crop at 2x): the lamp's halo keeps the original, unpainted rim | The same with `kuwahara:feeds_bloom=1`: the halo follows the painted strokes, so the rim breaks where the filter broke it. Subtle at Kuwahara's sizes, which is why it stays off by default |
+| Kuwahara at its default (`neon_bloom` with `--style neon:off --style kuwahara:radius=8 --set post.exposure=2.2`, a crop at 2x): the lamp's halo keeps the original, unpainted rim | The same with `kuwahara:feeds_bloom=1`: the halo follows the painted strokes, so the rim breaks where the filter broke it. Subtle at Kuwahara's sizes, which is why it stays off by default |
 
 ## Writing a style
 
-A style is one module in `crates/flint-render/src/stylize/` plus its name in the `register_styles!` list at the bottom of `stylize/mod.rs`. A game writes one the same way in its own crate and registers it at run time instead (#419): `flint_render::stylize::register(&STYLE)` before the first scene is read, or `PlayerExtension::styles` for a game that embeds the player ([Player Extensions](../guides/player-extensions.md#styles)). Everything below is public, so a game's style is built from the same parts; `--list-styles --json` gives it `"source": "game"`. The module exports a `StyleDescriptor` called `STYLE`, built with `const` constructors (#366) so that a field added to the descriptor, a parameter or an option later gets its default in the constructor and no style has to change (the types are `#[non_exhaustive]`, so a game crate can't write a literal either):
+A style is one module in `crates/flint-render/src/stylize/` plus its name in the `register_styles!` list at the bottom of `stylize/mod.rs`. A game writes one the same way in its own crate and registers it at run time instead (#419): `styles.register(&STYLE)` on the `StyleRegistry` it draws with ([ADR 0129](https://github.com/chrischaps/Flint/blob/main/docs/adr/0129-the-style-registry-is-a-value.md): a registry is a value a renderer or host owns, not the process's) before the first scene is read against it, or `PlayerExtension::styles` for a game that embeds the player ([Player Extensions](../guides/player-extensions.md#styles)). Everything below is public, so a game's style is built from the same parts; `--list-styles --json` gives it `"source": "game"`. The module exports a `StyleDescriptor` called `STYLE`, built with `const` constructors (#366) so that a field added to the descriptor, a parameter or an option later gets its default in the constructor and no style has to change (the types are `#[non_exhaustive]`, so a game crate can't write a literal either):
 
 ```rust
 pub(super) static STYLE: StyleDescriptor = StyleDescriptor::new(
@@ -1233,11 +1469,13 @@ pub(super) static STYLE: StyleDescriptor = StyleDescriptor::new(
     StyleStage::Display,
     create,                        // fn(&StyleDevice) -> Box<dyn StylePass>: pipelines in d.format
 )
-.params(&[StyleParam::new("strength", 1.0, 0.0..=1.0)])
-.hints(&[StyleHint::new("strength", "Strength", "0 = none, 1 = the full negative")]);
+.params(&[StyleParam::new("strength", 1.0, 0.0..=1.0)
+    .label("Strength")
+    .help("0 = none, 1 = the full negative")]);
 // Everything else has a default, and a setter for a style that differs:
 //   .options(&[StyleOption::new(name, default, choices)])   named strings;
-//       .discovered(fn) finds choices beside the scene (#322)
+//       .discovered(fn) finds choices beside the scene (#322);
+//       .label(..) and .help(..) as a parameter's
 //   .uses_mask(MaskUse::Always)    the renderer draws the entity style mask for it;
 //       MaskUse::When(fn(&config, &ids) -> bool): only while it says so (#350)
 //   .needs(&[StyleNeed::Edges])    the shared geometry edges (#301)
@@ -1249,14 +1487,23 @@ pub(super) static STYLE: StyleDescriptor = StyleDescriptor::new(
 
 An option's `choices` are a closed list unless it is `discovered`: its `fn(&ChoiceScope) -> Vec<String>` then gives the list wherever a scene is known (`StyleOption::choices_in`, which the F4 menu and `--list-styles` read), from `scope.files(AssetKind::Palettes)` (every file of the kind the scene can see, by `Project::list` from the scope's `AssetScope`, through the vfs; a scope with no scene offers what is built in alone) and the other options' values (`(scope.option)("font")`). A discovered option is open: `--style ascii:palette=tidepool` passes, and the style resolves the name and warns if it can't.
 
-`hints` are optional, and F4 draws a style without them: a setting with no hint shows its own name (`edge_max` becomes "Edge max") on a plain slider. A hint gives a setting (or a colour, by its key) a label, a hover line, and `.integer()` for a value that only makes sense whole (ASCII's cell size). `.when(option, &[values])` says the setting is read only while that option has one of those values, and `.unless(option, &[values])` that it is idle while it does; F4 greys the row out while a condition fails (a hint holds up to two). ASCII's are
+How a setting is shown rides on the setting itself (#510), and all of it is optional: F4 draws a setting with none under its own name (`edge_max` becomes "Edge max") on a plain slider. `.label(..)` and `.help(..)` give it a label and a hover line, and `.integer()` (parameters only) marks a value that only makes sense whole (ASCII's cell size: the slider steps by 1 and Copy TOML writes `cell = 8`). `.when(option, &[values])` says the setting is read only while that option has one of those values, and `.unless(option, &[values])` that it is idle while it does; F4 greys the row out while a condition fails (a setting holds up to two). A colour's go on its red channel, where its picker stands. ASCII's are
 
 ```rust
-StyleHint::new("tint", "Tint", "The ink for colour mode tint").when("color", &["tint"]),
-StyleHint::new("background", "Background", "How much of the scene shows behind the glyphs (dim ground)")
+StyleParam::new("tint_r", 0.35, 0.0..=1.0)
+    .label("Tint")
+    .help("The ink for colour mode tint")
+    .when("color", &["tint"]),
+StyleParam::new("tint_g", 1.0, 0.0..=1.0),
+StyleParam::new("tint_b", 0.45, 0.0..=1.0),
+StyleParam::new("background", 0.15, 0.0..=1.0)
+    .label("Background")
+    .help("How much of the scene shows behind the glyphs (dim ground)")
     .when("ground", &["dim", "inverse"])
     .unless("color", &["palette"]),
 ```
+
+`StyleDescriptor::label_for`, `help_for` and `is_integer` read them back by any setting's name, a colour's key included (`StyleDescriptor::ui(name)` gives the whole `StyleUi`).
 
 A greyed row's reset button stays live, and the value is kept: it only stops mattering. `StyleDescriptor::unused_reason(config, name)` gives the hover line, or `None` while the setting is read.
 
@@ -1293,7 +1540,7 @@ impl StylePass for Invert {
 A style's WGSL goes into `kit::shader` as `kit::wgsl!("common.wgsl", "mine.wgsl")`: the files' `include_str!`s concatenated, plus their names. The names are what let a shader be tuned without a rebuild (#418). With `FLINT_STYLE_SHADER_DIR=crates/flint-render/src/stylize` set, natively, every built-in style reads its files from that folder rather than from the binary, shared files such as `ascii_common.wgsl` and `../palette.wgsl` included. The viewer and the player build again each style whose file was saved, a quarter-second poll on the frame thread, and `flint render` reads the folder on every run:
 
 ```bash
-FLINT_STYLE_SHADER_DIR=crates/flint-render/src/stylize flint edit examples/watercolor.scene.toml
+FLINT_STYLE_SHADER_DIR=crates/flint-render/src/stylize flint edit flint-examples/watercolor.scene.toml
 ```
 
 Saved in `watercolor.wgsl`, a tweak showed in the open viewer 470--672 ms later (nine edits). A debug rebuild after the same tweak took 35 s, and the release rebuild #272 measured took 3--7 minutes, each followed by a restart. naga checks what is read first. A file that doesn't parse or validate goes to the style error card as `file:line:col` with the line quoted, as a user style's does, and the shader last built from disk keeps drawing (else the compiled-in one). A shader naga takes and wgpu refuses, such as a renamed entry point, panics while the style is built. The style is then built from the last good shaders, and the card says so. Saving a good file clears the card. The variable is read once at start-up, which also logs a warning that it's on. It does nothing on the web, and a shipping build never reads the files.
@@ -1313,6 +1560,7 @@ What a style gets from `StyleFrame`:
 | `edges`, `edges_bind(...)` | the [shared geometry edges](#shared-edges), while a style that `needs` them is on |
 | `target(name, format)` | a texture of the style's own at the stage's size, kept until the next resize |
 | `sampled(...)`, `sampled_input(...)`, `uniform(...)`, `bind(...)`, `depth_bind(...)` | bind groups kept with the post chain |
+| `bind_over(...)`, `depth_bind_over(...)`, `edges_or(...)`, `albedo_or(...)` | the same, kept over textures that can be made again while the chain lives (the edges, the albedo, an image): made again in the old group's place when one is another texture (#960) |
 | `first_write(name)` | true once per chain, for uniforms that only change on resize |
 | `time` | game seconds, for animated styles |
 
@@ -1322,7 +1570,7 @@ What the framework does so a style doesn't have to:
 - **Resize.** Every target and cached bind group lives in the post chain's resources, which `resize_postprocess()` rebuilds. There is no per-style resize hook to forget.
 - **Formats.** HDR-stage styles draw in `Rgba16Float`; display-stage styles in the surface format. On an sRGB surface a display style samples linear values and its writes are encoded, so a style that works in display values decodes and encodes itself (`frame.srgb()`; `invert.wgsl` shows how).
 - **Samplers.** Styles bind the chain's one linear sampler, so their bind groups add nothing to DX12's 2048-slot sampler heap.
-- **The mask.** A `uses_mask` style gets the entity style mask drawn for it each frame, and no style pays for it otherwise. `MaskUse::When` asks per frame from the config and the ids (#350): ASCII reads it only while `edges > 0` and something is styled, or another style's entity passes through it, so `--ascii-no-edges` in a scene with no `style_mask` makes no mask target and `--gpu-time` shows no "Style mask" line.
+- **The mask.** A `uses_mask` style gets the entity style mask drawn for it each frame, and no style pays for it otherwise. `MaskUse::When` asks per frame from the config and the ids (#350): ASCII reads it only while `edges > 0` and something is styled, or another style's entity passes through it, so `--style ascii:edges=0` in a scene with no `style_mask` makes no mask target and `--gpu-time` shows no "Style mask" line.
 - **Shared inputs.** A style that lists `StyleNeed::Edges` in `needs` gets the [geometry edge texture](#shared-edges), drawn once a frame however many styles read it.
 - <a id="blend-for-free"></a>**Blend.** A style that reads the mask (`uses_mask`, or a per-entity `component`) fades with its entities' [`blend`](#blending-in-and-out) and the [veil](#whats-in-front-the-veil) in front of them without a line of blend code (#396). Right after its pass the framework draws a cross-fade into its output: one full-screen triangle, alpha-blended, that brings the style's input back by `1 - blend` wherever the mask's id belongs to this style and `.g` is below 1, and is discarded everywhere else. It needs no target (the chain's ping-pong already holds input and output), costs one mask read and, on fading pixels, one input read and a blend, and is drawn only while some entity's blend is below 1 or a veil covers a styled one, so a fully styled scene draws it not at all (`SceneRenderer::style_fade_runs` counts). The mix is the blend unit's: linear light in the HDR stage and on an sRGB surface. Which style an id belongs to is a storage table written once a frame (id to registry index), and which style just drew is the draw's instance index, so one table serves every style in both stages. A style that does better than a cross-fade opts out with `.blends_itself()` and reads `.g` itself: ASCII does, for its display-space `fade` and its cell-by-cell `dissolve`.
 - **Timing.** Each style is a GPU-timer scope under its `label`, so `flint render --gpu-time` and the player's `--perf` name it.
@@ -1345,7 +1593,13 @@ flint style list levels/a.scene.toml         # the same list as flint render --l
 flint render levels/a.scene.toml --style dusk:amount=1
 ```
 
-`new` writes a commented passthrough: its header lists every field of `p` and `flint`, and every helper the chosen stage and inputs give (and which inputs would give more), with commented-out calls to the input helpers and one example parameter, `amount`, that does nothing at its default (so the new style renders byte-identical to no style until you change it). It refuses a built-in's name, a name that isn't lowercase letters, digits and `_`, and files that are already there (`--force` overwrites them), and it checks what it wrote. `check` runs the same naga check the hosts run on load, prints `file:line:col` errors with the line quoted (and the hint for a helper of an undeclared input) and the loop and texture-read warnings, and exits 1 if any style failed: the fast loop for an agent, or for CI. For a longer worked example, `examples/styles/template.shader.toml` and `template.wgsl` are a split tone.
+`new` writes a commented passthrough: its header lists every field of `p` and `flint`, and every helper the chosen stage and inputs give (and which inputs would give more), with commented-out calls to the input helpers and one example parameter, `amount`, that does nothing at its default (so the new style renders byte-identical to no style until you change it). It refuses a built-in's name, a name that isn't lowercase letters, digits and `_`, and files that are already there (`--force` overwrites them), and it checks what it wrote. `check` runs the same naga check the hosts run on load, prints `file:line:col` errors with the line quoted (and the hint for a helper of an undeclared input) and the loop and texture-read warnings, and exits 1 if any style failed: the fast loop for an agent, or for CI. Paths print with `/` on every platform (`styles/dusk.wgsl:38:15`, never `styles\dusk.wgsl`). With the global `--json` it prints one document instead (#567): `valid`, `failed`, and a `styles` entry for each file with `file`, `ok`, `loops`, `bounded_loops` and `texture_reads` (`null` when it doesn't compile), `warnings`, and `errors`, each error in parts (`file`, `line`, `col`, `message`, the quoted `source` line and `hints`), plus `error`, the whole text a host shows:
+
+```bash
+flint style check styles --json
+```
+
+For a longer worked example, [`flint-examples/styles/template.shader.toml`](https://github.com/chrischaps/flint-examples/blob/main/styles/template.shader.toml) and `template.wgsl` are a split tone.
 
 ```toml
 # styles/greyscale.shader.toml
@@ -1371,7 +1625,7 @@ fn style(p: StylePixel) -> vec4<f32> {
 }
 ```
 
-It is then a style like the built-ins: `[post_process.styles.greyscale]` turns it on, `--style greyscale:amount=0.5` and `--sweep greyscale.amount=0,0.5,1` reach it, and the F4 menu draws its sliders (`<base>_r/_g/_b` params become one colour picker).
+It is then a style like the built-ins: `[post_process.styles.greyscale]` turns it on, `--style greyscale:amount=0.5` and `--sweep greyscale.amount=0,0.5,1` reach it, and the F4 menu draws its sliders (`<base>_r/_g/_b` params become one colour picker, named and explained by the `_r` param's `label` and `help`, as a built-in colour is).
 
 Flint writes everything around the function: the bindings, a `params` struct with one `f32` per parameter, and the entry points. `p.uv` is 0..1 from the top left, `p.pos` the pixel, `p.color` the input there. At the display stage colours in and out are display values on any target, so a style never decodes sRGB itself. At the hdr stage they are linear HDR.
 
@@ -1380,13 +1634,15 @@ Flint writes everything around the function: the bindings, a `params` struct wit
 | `flint.resolution`, `flint.texel`, `flint.time`, `flint.frame`, `flint.pixels_per_point` | the frame |
 | `flint.near`, `flint.far`, `flint.camera_pos`, `flint.inv_view_proj` | the camera |
 | `flint_sample(uv)` | the input anywhere, in the same space as `p.color` |
-| `flint_luma(c)`, `flint_hash(v)`, `flint_to_display(c)`, `flint_to_linear(c)` | small helpers |
+| `flint_luma(c)`, `flint_to_display(c)`, `flint_to_linear(c)` | small helpers, `stylize/prelude_core.wgsl`, the same text the built-in styles include (#743) |
+| `flint_hash(v)`, `flint_hash1(x, y, seed)`, `flint_hash3(x, y, seed)`, `flint_vnoise(p, seed)` | `stylize/noise.wgsl`, the hash and value noise pencil, contour, Kuwahara, watercolor and ASCII's dissolve boil and grain with (#1256): a stable 0..1 for any `vec2` (by its bits, so every distinct value gets its own), for an integer lattice point under a seed (and three of them), and smooth value noise in 0..1. All integer PCG, so they read the same on every GPU and far from the origin |
+| `flint_unproject(inv_view_proj, uv, depth)`, `flint_unproject_h(..)`, `flint_safe_w(w)` | depth to world, as the built-ins do it: the world point, the homogeneous one, and a w held off 0 at the far plane |
 | `flint_depth(uv)`, `flint_view_depth(uv)`, `flint_world_pos(uv)` | with `inputs = ["depth"]`: raw depth, metres from the eye, the world position |
-| `flint_mask_id(uv)`, `flint_style_blend(uv)` | with `inputs = ["mask"]`: the [style mask](#the-entity-style-mask) id, and 0..1 for entities whose `style_mask` or `<name>_style` names this style (their `blend`), 0 elsewhere and on an opt-out. A shader that never calls `flint_style_blend` is [cross-faded](#blend-for-free) by the framework; one that calls it draws the blend itself and isn't (decided when the `.shader.toml` is read, so adding or removing the call takes effect at the next load or `.shader.toml` edit) |
+| `flint_mask_id(uv)`, `flint_style_blend(uv)` | with `inputs = ["mask"]`: the [style mask](#the-entity-style-mask) id, and 0..1 for entities whose `style_mask` or `<name>_style` names this style (their `blend`), 0 elsewhere and on an opt-out. A shader that never calls `flint_style_blend` is [cross-faded](#blend-for-free) by the framework; one that calls it draws the blend itself and isn't (decided when the `.shader.toml` is read, so adding or removing the call takes effect at the next load or `.shader.toml` edit). With them `flint_mask_load(texel)` (the id and the blend 0..65535, clamped), `flint_mask_texel(uv)`, `flint_mask_blend(m)` and `flint_slot(id)`: `stylize/mask_read.wgsl` and `mask_slot.wgsl`, the readers the built-in styles use (#1256) |
 | `flint_params_at(uv)` | with `inputs = ["mask"]`: the settings of the entity at `uv`, for reading a neighbour's (`params` is already this pixel's) |
 | `flint_edges(uv)`, `flint_edge(uv)` | with `inputs = ["edges"]`: the [shared edges](#shared-edges) (silhouette, crease, direction), and the stronger of the two strengths; 1 is an edge |
 
-**Per entity (#414).** A style with `"mask"` in its `inputs` is per-entity, like ASCII, pencil and watercolor. A `style_mask { style = "<name>" }` on an entity switches it on with no `[post_process.styles.<name>]` table, and the style gets a component of its own, `<name>_style`, whose fields are its parameters (plus `enabled` and `blend`, as on `ascii_style`). Each distinct set of settings is a variant with its own mask id, and the framework uploads a row of `Params` for each, so in the WGSL `params` holds the settings of the entity the pixel shows, each field falling back on the scene's table, then the default. A pixel that no entity of the style covers reads the scene's row. `enabled = false` opts an entity out: its pixels read `flint_style_blend` as 0. Scripts reach the component the way they reach ASCII's: `set_entity_style(id, "hologram")`, `set_style_param(id, "glow", 1.5)`, `tween_style_param`.
+**Per entity (#414).** A style with `"mask"` in its `inputs` is per-entity, like ASCII, pencil and watercolor. A `style_mask { style = "<name>" }` on an entity switches it on with no `[post_process.styles.<name>]` table, and the style gets a component of its own, `<name>_style`, whose fields are its parameters (plus `enabled` and `blend`, as on `ascii_style`). Each distinct set of settings is a variant with its own mask id, and the framework uploads a row of `Params` for each, so in the WGSL `params` holds the settings of the entity the pixel shows, each field falling back on the scene's table, then the default. A pixel that no entity of the style covers reads the scene's row. `enabled = false` opts an entity out: its pixels read `flint_style_blend` as 0. Scripts reach the component the way they reach ASCII's: `set_entity_style(id, "hologram")`, `set_style_param(id, "glow", 1.5)`, `tween_style_param`. The component needs no schema file in your game: its schema is made from the `.shader.toml` (see [Using a style](#using-a-style)), and a host loading the scene leaves `<name>_style` to the style it finds in `styles/` (#1320). A `<name>_style` on an entity for a style without `"mask"` in its `inputs` does nothing, and `flint check` and a drawing host warn about it (`bad-style-setting`), naming the fix.
 
 ```toml
 [entities.ybot.style_mask]        # on, with the scene's settings (or the defaults)
@@ -1398,35 +1654,58 @@ lines = 6.0
 blend = 0.6
 ```
 
-One frame holds 15 variants of a style (and mask ids up to 255); any more take the scene's settings, with a warning. The component has no schema file, so the scene loader neither fills in defaults nor checks its fields' types. A style that doesn't read the mask can't tell entities apart, so it stays whole-frame: only its table switches it on, and a `style_mask` naming it does nothing. The same holds for the built-ins without a component (`invert`, `mask_view`, `edges_view`, `palette`).
+**Reach (#538).** A per-entity style that gives back `p.color` everywhere but near its entities can say so, and then costs only what its entities cover. `reach = <points>` at the top of the `.shader.toml` (0 to 512, `inputs = ["mask"]` only) promises that further than that from every one of its entities, `style` returns `p.color` unchanged. The framework then draws the style's last pass only inside its entities' screen bounds grown by the reach (the same rect [pencil and ASCII scissor to](#drawn-only-where-the-entities-are)), and around it the style's own passthrough: the same prelude and entry point around `return p.color`, so those pixels are the ones the style would have returned. The hologram draws only on its entities' own pixels (its rim is inside them), so it says `reach = 0`; a style that draws a glow 4 points out around its props, or reads the mask 4 points away, says `reach = 4`. Passes that write a target still run over the whole frame, since nothing says how far a later pass reads them. The promise is the author's to keep: a pixel the shader changes past its reach is cut back to the input. `FLINT_STYLE_SCISSOR=0` draws the whole pass, for checking that the two frames match.
+
+Every variant gets a row of the settings table and every mask id a slot: `flint_params.rows` is a storage array as long as the frame needs, and `flint_params_at(uv)` reads a neighbour's (before #740 a frame held 15 variants and ids up to 255). The component has no schema file, so the scene loader neither fills in defaults nor checks its fields' types. A style that doesn't read the mask can't tell entities apart, so it stays whole-frame: only its table switches it on, and a `style_mask` naming it does nothing. The same holds for the built-ins without a component (`invert`, `mask_view`, `edges_view`, `palette`).
 
 | ![two holograms, one frame](../images/user-style-hologram-per-entity.png) |
 |---|
-| `examples/user_styles.scene.toml` with no hologram table. The YBot's `style_mask` takes the defaults (`glow = 0.8`, 3-point lines). The barrel's `hologram_style` sets a brighter rim and wider lines at `blend = 0.6` |
+| [`flint-examples/user_styles.scene.toml`](https://github.com/chrischaps/flint-examples/blob/main/user_styles.scene.toml) with no hologram table. The YBot's `style_mask` takes the defaults (`glow = 0.8`, 3-point lines). The barrel's `hologram_style` sets a brighter rim and wider lines at `blend = 0.6` |
 
 **When it goes wrong.** Flint checks the composed shader with naga before the GPU sees it. An error names your file, line and column, quotes the line, and gives a hint if you called a depth or mask helper without declaring the input. A style that doesn't compile still loads and draws its input unchanged, so the scene keeps its other styles.
 
-**Loops are guarded.** Natively, every loop in your code gets a counter: one run of a loop turns at most `LOOP_LIMIT` = 4096 times, then breaks out. A loop that ends by itself within that (a blur, a kernel, a march of a few hundred steps) draws exactly as written. A loop that never ends draws whatever its pixel had reached after 4096 turns, a wrong colour you can see and fix, instead of hanging the GPU until the driver resets it. Each loop counts on its own and starts again each time it is entered, so nested loops multiply (a 64x64 kernel is fine). Flint compiles naga's rewrite of your module, but errors still name the lines of your file. On the web the guard doesn't run yet ([ADR 0112](https://github.com/chrischaps/Flint/blob/main/docs/adr/0112-user-authored-styles.md)): keep loop bounds constant or a clamped parameter, as `examples/styles/radial_blur.wgsl` does with its `samples`.
+**Loops are guarded.** Natively, every loop in your code gets a counter: one run of a loop turns at most `LOOP_LIMIT` = 4096 times, then breaks out. A loop that ends by itself within that (a blur, a kernel, a march of a few hundred steps) draws exactly as written. A loop that never ends draws whatever its pixel had reached after 4096 turns, a wrong colour you can see and fix, instead of hanging the GPU until the driver resets it. Each loop counts on its own and starts again each time it is entered, so nested loops multiply (a 64x64 kernel is fine). A loop Flint can prove ends within the limit is left exactly as you wrote it (#424): a `for` whose counter starts at a constant, is compared with a constant and is stepped by a constant, with nothing else writing it, as in `for (var i = 0; i < 3; i++)` over octaves or `for (var x = -4; x <= 4; x++)` over kernel taps. A bound read from a parameter or a texture is guarded. Flint compiles naga's rewrite of your module when it guards a loop, but errors still name the lines of your file. The web player has no naga to guard with, so `flint bundle` packs the guarded module beside your style (`styles/<name>.guarded.wgsl`, one a pass for a style of several) and the browser compiles that instead (#550). A style with no loop to guard packs nothing extra. The module records the text it was made from, and a module made from another version of your WGSL or the engine is not used: the loop then runs as written, so pack the bundle again after an edit.
 
 **Hot reload.** Natively, both files reload while the player or viewer runs, a few times a second:
 
-- Save the `.wgsl` and the next frames draw it. If the edit doesn't compile, the last good build keeps drawing.
+- Save the `.wgsl` and the next frames draw it. If the edit doesn't compile, the last good build keeps drawing. Nothing else is rebuilt: under `flint edit --watch`, which reloads the whole scene for most files under its folder, a style's `.wgsl` and `.shader.toml` are left to the style (#429), so the world, the selection and any unsaved entity edits stay as they were.
 - Save the `.shader.toml` and the style is replaced where it stands in the chain, with its new parameters, label, stage, inputs or shader. The scene's `[post_process.styles.<name>]` is read again against them (other F4 edits stay). A description that no longer reads keeps the old style and reports.
 - A new `*.shader.toml` dropped into any `styles/` folder the scene searches is picked up too. One dropped nearer the scene than the style of its name takes over from it, and gives the name back when it is deleted.
 
-Until a broken style compiles, a card in the bottom-left corner of the player and the viewer shows its error with the line it points at, and the style's F4 header is tagged `error` (hover it for the message; the `user` tag beside it names both files). `flint render` prints the same message and renders the passthrough. The goldens hold both of those to account (#417): `user-style-broken` renders a bench with a fixture style that fails (`crates/flint-cli/tests/golden/fixtures/styles/broken.*`), requires the frame to equal the same bench rendered without the style, and requires the error to name `broken.wgsl:9:9`. Next to it, `user-styles`, `user-style-risograph` and `user-style-contour-map` pin the three demo styles over `examples/user_styles.scene.toml`.
+**Headless, with `flint render --watch`** (#432). Leave a render running and it writes the same `--output` (or `--sweep` sheet) again after every save, in one process:
+
+```bash
+flint render levels/garden.scene.toml -o print.png --watch
+flint render levels/garden.scene.toml -o sheet.png --sweep cyanotype.exposure=0.8,1.3,2.2 --watch
+```
+
+A save of a style's `.wgsl` is drawn again on the GPU, scene and renderer that drew the last frame, so only the style's own pass is built again. On the Sun Prints garden at 960x540 (debug build, RTX 4070) the PNG was rewritten 0.14 to 0.19 s after the save, where a fresh `flint render` took 1.2 to 1.6 s. The image is the one a fresh render of the same files writes, byte for byte. Any other save loads the scene again on the same GPU (0.75 s there): the scene, a model, a schema, the `--look` file, or a `.shader.toml` whose description changed, since the scene's table for the style must be read against its new parameters. A render with clocks (`--time`, `--scripts`, a `--frames` sequence) always loads again. Each render prints one line, then each style's error as it stands:
+
+```text
+watch: render 2 in 0.04 s (same renderer; styles/cyanotype.wgsl changed)
+watch: render 3 in 0.06 s (same renderer; styles/cyanotype.wgsl changed)
+  style 'cyanotype': styles/cyanotype.wgsl:39:5: expected ';', found 'let'
+```
+
+A broken shader keeps its last good build in the PNG, as in the player. The files the render writes (`-o` and the files named after it, `--report`, `--ascii-text`) aren't changes, so an output inside the scene's folder doesn't loop.
+
+Until a broken style compiles, a card in the bottom-left corner of the player and the viewer shows its error with the line it points at, and the style's F4 header is tagged `error` (hover it for the message; the `user` tag beside it names both files). `flint render` prints the same message and renders the passthrough. The goldens hold both of those to account (#417): `user-style-broken` renders a bench with a fixture style that fails (`crates/flint-cli/tests/golden/fixtures/styles/broken.*`), requires the frame to equal the same bench rendered without the style, and requires the error to name `broken.wgsl:9:9`. Next to it, `user-styles`, `user-style-risograph` and `user-style-contour-map` pin the three demo styles over [`flint-examples/user_styles.scene.toml`](https://github.com/chrischaps/flint-examples/blob/main/user_styles.scene.toml).
 
 | ![a cyanotype from a game folder, drawn by flint-player](../images/user-style-cyanotype.png) | ![the same style mid-edit: a typo, the card, the last good build](../images/user-style-error-card.png) |
 |---|---|
 | A game outside the engine (`levels/`, `styles/cyanotype.*`) in `flint-player`, after its `.wgsl` was edited live | The next save had a typo (`params.exposre`): the card names `cyanotype.wgsl:7:57` and quotes the line while the last good build keeps drawing |
 
-**On the web.** `flint bundle` packs `styles/` with the rest of the game. It loads every user style each scene sees from the packed files, the way the browser will, and refuses the bundle if a description doesn't read, its shader isn't packed or the shader doesn't compile. In the browser the style is checked by the browser's own compiler, and nothing reloads. The compiler answers a frame or two after the style is built: until then the style draws its input, and if the compiler refused it, the same card shows its error with the line in your file, and the console logs it (#415). The browser is stricter than the bundle check in one place: it refuses a derivative (`dpdx`, `dpdy`, `fwidth`) inside a branch on the pixel's own value, which naga lets through. Take the derivative before the `if`, and use it inside. (`flint_sample` reads at mip 0, so it is fine anywhere.)
+**A description that never loads** is on the card too (#425). A new `.shader.toml` with a TOML typo, a `name` that isn't the file's, a stage or input Flint doesn't know, or a default outside its range registers nothing, so the scene's `[post_process.styles.<name>]` for it is warned of as an unknown style and nothing of it draws. The card says the style "doesn't load", names the file and the mistake, and stays until the file loads (save it fixed and the next poll, a few times a second, picks it up) or is deleted. `flint render` prints the same line as a warning.
+
+![flint-player over flint-examples/user_styles.scene.toml a moment after a new styles/wash.shader.toml was saved with stage = "hrd": the card reads style 'wash' doesn't load and names the file and the stage](../images/user-style-load-error.png)
+
+**On the web.** `flint bundle` packs `styles/` with the rest of the game. It loads every user style each scene sees from the packed files, the way the browser will, and refuses the bundle if a description doesn't read, its shader isn't packed or the shader doesn't compile. In the browser the style is checked by the browser's own compiler, and nothing reloads. The compiler answers a frame or two after the style is built: until then the style draws its input, and if the compiler refused it, the same card shows its error with the line in your file, and the console logs it (#415). The browser is stricter than naga in one place: it refuses a derivative (`dpdx`, `dpdy`, `fwidth`, and `textureSample`, which takes its own) where the pixels of a 2x2 quad may not all arrive together: under an `if` or `switch` on a value that can differ from pixel to pixel, in a loop whose turns can, or after a `return` only some pixels take. A branch on a parameter counts, since `params` is a per-pixel `var<private>` in the prelude; one on `flint.*` (a uniform) or a constant doesn't. `flint style check`, `flint render`, `flint check` and `flint bundle` warn about each at its line and column (#573) and still pack the style, since it draws natively. Take the derivative before the branch and use the result inside it, or, when a quad's pixels always agree, put `@diagnostic(off, derivative_uniformity)` on the function that takes it. (`flint_sample` reads at mip 0, so it is fine anywhere.)
 
 ![the web player at ?game=frost: the card names frost.wgsl:12:42, 'fwidth' must only be called from uniform control flow](../images/user-style-web-error.png)
 
 | ![hologram](../images/user-style-hologram.png) `hologram`: `inputs = ["mask"]`; the YBot and the barrel carry `style_mask { style = "hologram" }`, the barrel at `blend = 0.6` (rendered before #414, with the table the scene then needed; [per entity](#user-authored-styles) shows it now) | ![contour map](../images/user-style-contour-map.png) `--style contour_map` (named `contour` until #599 gave the name to the built-in ink): `inputs = ["depth"]`; height lines from `flint_world_pos`, range rings round the eye |
 |---|---|
-| ![risograph](../images/user-style-risograph.png) `--style risograph` (a crop at 1:1): two dot screens out of register, colour only | Each is one `.shader.toml` and under 50 lines of WGSL in `examples/styles/`; none needed a rebuild of the engine |
+| ![risograph](../images/user-style-risograph.png) `--style risograph` (a crop at 1:1): two dot screens out of register, colour only | Each is one `.shader.toml` and under 50 lines of WGSL in [`flint-examples/styles/`](https://github.com/chrischaps/flint-examples/tree/main/styles); none needed a rebuild of the engine |
 
 ### Images and options
 
@@ -1447,15 +1726,16 @@ label = "Finish"           # optional, with help
 
 # An image the scene picks by file name: read as flint_image_paper(uv), and
 # its index in params.paper. Without choices it offers every image in its
-# default's folder (papers/ here), found when the style loads.
+# default's folder (papers/ here), listed again while the game runs.
 [options.paper]
 kind = "image"
 default = "papers/cotton.png"
+mips = true                # a mip chain, for a paper tiled smaller than its texels (#558)
 ```
 
 The scene picks with strings, as for any built-in's options: `[post_process.styles.darkroom] paper = "papers/washi.png"`, `--style darkroom:finish=gloss`, `--sweep darkroom.grade=luts/neutral.png,luts/bleach.png`. F4 draws each option as a combo box of its choices. A value outside them is warned when the scene loads, naming the choices and the default it draws as (#318), and `--style` refuses it.
 
-Each image `<name>` gets four helpers. They read through the input's sampler, so images add no sampler to the bind group (the DX12 heap, see Critical Gotchas):
+Each image `<name>` gets four helpers. They read through the input's sampler, so images add no sampler to the bind group (DX12's sampler heap; `crates/flint-render/CLAUDE.md`, "Frame and GPU rules"):
 
 | | |
 |---|---|
@@ -1464,17 +1744,31 @@ Each image `<name>` gets four helpers. They read through the input's sampler, so
 | `flint_image_size_<name>()` | its size in texels, e.g. to tile it at one texel a point: `p.pos / (flint_image_size_paper() * flint.pixels_per_point)` |
 | `flint_lut_<name>(rgb)` | the image read as a 3D LUT strip: N slices of N x N side by side (N*N wide, N high), blue choosing the slice left to right, red across a slice and green down it, as Unreal's `RGBTable16x1.png` is laid out. Trilinear |
 
-Images are PNG or JPEG, 8 bits a channel and one mip, read through the vfs (so a bundle carries them; `flint bundle` refuses one that names an image it didn't pack). Without `srgb`, the shader gets the values as stored: at the display stage those are display values like `p.color`, and a LUT wants them untouched. A style may bind up to 8 images, image options among them, in group 3. Every file an image may read must exist when the style loads; a missing one is reported, and until it reads the style draws its input unchanged.
+Images are PNG or JPEG, 8 bits a channel, read through the vfs (so a bundle carries them; `flint bundle` refuses one that names an image it didn't pack). Without `srgb`, the shader gets the values as stored: at the display stage those are display values like `p.color`, and a LUT wants them untouched. A style may bind up to 8 images, image options among them, in group 3. Every file an image may read must exist when the style loads; a missing one is reported, and until it reads the style draws its input unchanged.
+
+**A folder of choices is listed again while the game runs** (#558, natively). An image option with no `choices` offers the images in its default's folder, and the hot-reload poll that watches the `.shader.toml` lists that folder too, without waiting on the disk. When another set of images is there (a PNG dropped into `luts/`, one deleted), the style is installed again with the new choices: F4's combo offers it, `--style` and a scene's table take it, and the settings the game has are kept, since no parameter changed. A scene that names a file before it exists is warned and draws the default, then draws the file once it lands. Saving an image that is already a choice was always picked up, by the image's own poll. On the web a bundle never changes, so nothing is listed again.
+
+**Mips** (#558). An image read smaller than its texels aliases: a paper tiled at `paper_scale = 0.25` puts sixteen texels under each pixel and keeps one of them, so the fibres turn into a hard grit the paper doesn't have. `mips = true`, on an `[images.<name>]` table or an image option, uploads a mip chain (each level a box filter of the one above, in linear light for an `srgb` image), and the helpers read the level the screen asks for:
+
+| | |
+|---|---|
+| `flint_image_<name>(uv)`, `flint_image_tiled_<name>(uv)` | as above, at the level `flint_image_lod_<name>(uv)` gives, two levels mixed (trilinear) |
+| `flint_image_lod_<name>(uv)` | log2 of how many of the image's texels one pixel spans along `uv`, from its screen derivatives; 0 when one or fewer |
+| `flint_image_level_<name>(uv, level)`, `flint_image_tiled_level_<name>(uv, level)` | at a level you give (0 is the file; a fraction mixes two) |
+
+`flint_lut_<name>` and `flint_image_size_<name>` still read level 0, the file. Leave `mips` off for a LUT: there a texel is a colour, not a detail, and its neighbours aren't its average. The level comes from derivatives, which WGSL defines only where neighbouring pixels run the same code: `flint_image_lod_<name>` waives the rule for itself, so a helper called inside an `if` still compiles in a browser, but where neighbours take different branches its level is a guess at the branch's edge. Pass a level there. An image without `mips` has exactly the helpers it had before, and draws the same bytes.
+
+On [`flint-examples/user_styles.scene.toml`](https://github.com/chrischaps/flint-examples/blob/main/user_styles.scene.toml) at `--style darkroom:paper_scale=0.25`, against a 4x supersample (the paper at one texel a pixel, box-filtered down), the sky's luma was off by 2.6, 3.8 and 4.9 levels RMS on cotton, kraft and washi with one mip, and by 1.2, 1.2 and 1.3 with mips. At `paper_scale = 1` the two renders are the same file. `darkroom`'s paper has `mips = true`; its LUTs don't.
 
 A per-entity style (one with `inputs = ["mask"]`) takes options from each entity's `<name>_style` too, a row each. An image is one binding for the whole frame, so an image option always shows the scene's file, and an entity's value changes only its index in `params`.
 
 Natively, images reload like the shader: save a PNG and the next poll (a few times a second) reads it again. A file that no longer decodes keeps the last good picture drawing and shows its error on the card.
 
-`examples/styles/darkroom.*` uses all three: a LUT grade and a paper as image options (`luts/`, `papers/`, made by `tools/darkroom_images.py`), and a matte or gloss finish.
+`flint-examples/styles/darkroom.*` uses all three: a LUT grade and a paper as image options (`luts/`, `papers/`, made by `tools/darkroom_images.py`), and a matte or gloss finish.
 
 | ![darkroom on the user styles scene: warm print grade on cotton paper, with a white border](../images/user-style-darkroom.png) | ![four LUTs: neutral, warm print, bleach bypass, cyanotype](../images/user-style-darkroom-grades.png) |
 |---|---|
-| `--style darkroom`: the warm print LUT on cotton paper, matte | `--sweep darkroom.grade=...`: the four LUTs in `examples/styles/luts/` |
+| `--style darkroom`: the warm print LUT on cotton paper, matte | `--sweep darkroom.grade=...`: the four LUTs in [`flint-examples/styles/luts/`](https://github.com/chrischaps/flint-examples/tree/main/styles/luts) |
 
 ![The three papers across, matte and gloss down, over the neutral LUT](../images/user-style-darkroom-papers.png)
 
@@ -1485,7 +1779,7 @@ Natively, images reload like the shader: save a PNG and the next poll (a few tim
 *#412.* Four of the six built-ins need more than one pass: a blur is two (across, then down), a wash is painted and then read, ASCII keeps last frame's cells. A user style does this with `[[passes]]` in place of the top-level `shader`. Each pass is a WGSL `fn style` of its own, run in the order listed. Every pass but the last writes a **target** of the style's own, and the last writes the stage's output:
 
 ```toml
-# styles/orton.shader.toml (examples/styles/orton.*): a blurred, overexposed copy screened over the frame
+# styles/orton.shader.toml (flint-examples/styles/orton.*): a blurred, overexposed copy screened over the frame
 version = 1
 name = "orton"
 stage = "display"
@@ -1564,19 +1858,19 @@ Style targets: 7 (16.70 MB)
   ...
 ```
 
-That is `examples/user_styles.scene.toml --style orton --gpu-time 240` at 1280x720 on an RTX 4070: the four passes of the Orton glow together cost 0.032 ms.
+That is `flint-examples/user_styles.scene.toml --style orton --gpu-time 240` at 1280x720 on an RTX 4070: the four passes of the Orton glow together cost 0.032 ms.
 
-The F2 overlay's `Style targets` line includes them in its total. F4's `user` tag lists each pass's file and each target when you hover it.
+The player's F2 overlay lists the same textures while the style runs: under its `Style targets` total, a row for each with its name, size and MB, in name order, so a style's own targets and a history pair's `.a`/`.b` sit together (past 16 textures, the rest share one row). F4's `user` tag lists each pass's file and each target when you hover it.
 
-![examples/user_styles.scene.toml under --style orton: the yard's light blooms softly, edges stay crisp](../images/user-style-orton.png)
+![flint-examples/user_styles.scene.toml under --style orton: the yard's light blooms softly, edges stay crisp](../images/user-style-orton.png)
 
 **Passes, images and per-entity settings together.** A pass that reads targets binds them in group 3 after the style's [images](#images-and-options), so `flint_image_<name>` and `flint_target_<name>` work side by side in any pass. Every pass reads the same `params`, and for a per-entity style (`inputs = ["mask"]`) that is the pixel's own entity's settings in every pass.
 
-**What a user style can't do yet:** compute passes, mip chains, or targets whose size isn't a fraction of the stage's. The built-ins that need those stay in Rust. The demos in `examples/styles/` show what user styles reach: `risograph` (two misregistered inks), `contour_map` (survey lines from depth; `contour` before #599), `darkroom` (a LUT and a paper picked by the scene), `neon` (an hdr style that feeds bloom, `examples/neon_bloom.scene.toml`), `hologram` (a style mask on chosen props, `examples/user_styles.scene.toml`) and `orton` (four passes through three half-size targets).
+**What a user style can't do yet:** compute passes, mip chains of its own targets (its images can have one, [above](#images-and-options)), or targets whose size isn't a fraction of the stage's. The built-ins that need those stay in Rust. The demos in [`flint-examples/styles/`](https://github.com/chrischaps/flint-examples/tree/main/styles) show what user styles reach: `risograph` (two misregistered inks), `contour_map` (survey lines from depth; `contour` before #599), `darkroom` (a LUT and a paper picked by the scene), `neon` (an hdr style that feeds bloom, [`flint-examples/neon_bloom.scene.toml`](https://github.com/chrischaps/flint-examples/blob/main/neon_bloom.scene.toml)), `hologram` (a style mask on chosen props, [`flint-examples/user_styles.scene.toml`](https://github.com/chrischaps/flint-examples/blob/main/user_styles.scene.toml)) and `orton` (four passes through three half-size targets).
 
 ## Goldens
 
-Every registered style is pinned by a golden image in `crates/flint-cli/tests/golden/`, listed in `stylize.goldens.toml` (#271). `flint goldens` renders each case as `flint render` would, all in one process (#329), and fails when one moves past its tolerance; `cargo test -p flint-cli --test render_goldens` runs the same suite. CI runs it on WARP for every PR (#314), against a `<stem>.warp.png` variant where WARP's render differs from the golden by more than the tolerance allows ([adapters and variants](../guides/headless-rendering.md#adapters-and-golden-variants)). Each run leaves an `index.html` contact sheet in its out dir, failures first, with golden, render and diff side by side ([the contact sheet](../guides/headless-rendering.md#the-contact-sheet)). Review a `--bless` there.
+Every registered style is pinned by a golden image in `crates/flint-cli/tests/golden/`, listed in `stylize.goldens.toml` (#271). `flint goldens` renders each case as `flint render` would, all in one process (#329), and fails when one moves past its tolerance; `cargo test -p flint-cli --test render_goldens` runs the same suite. CI runs it on WARP for every PR (#314), against a `<stem>.warp.png` variant where WARP's render differs from the golden by more than the tolerance allows ([adapters and variants](../guides/headless-rendering.md#adapters-and-golden-variants)). Each run leaves an `index.html` contact sheet in its out dir, failures first, with golden, render and diff side by side ([the contact sheet](../guides/headless-rendering.md#the-contact-sheet)). Review a `--bless` there. The ASCII history (#277, #477) has no frame to pin, so two sequence cases, `ascii-motion-tone` and `ascii-motion-edges`, orbit a clearing for 60 frames and hold its glyph reversals a frame to a budget instead ([sequence cases](../guides/headless-rendering.md#sequence-cases-a-shimmer-budget), #478).
 
 `--case` takes a case's name or part of one. An exact name picks that case alone: `--case ascii-silhouette-cell` blesses `ascii-silhouette-cell` and leaves `ascii-silhouette-cell-object` as it was. A part that names no case picks every case containing it, so `--case ascii-silhouette` runs both. After blessing a single case, run the whole suite before committing.
 
@@ -1597,27 +1891,27 @@ A run names every case that passes without being byte-identical with its golden,
 | `ascii-full-msaa4` | `--msaa 4` scene passes under the glyph grid (edges off) |
 | `ascii-edges-pbr` | [edges](#edges) on `pbr_test`, grid off |
 | `ascii-edges-pbr-grid` | the same with the editor grid on: the grid writes no depth, so no edge traces it (#346) |
-| `ascii-edges`, `ascii-edges-msaa4`, `ascii-edges-scale05` | the styled sphere and box of `examples/ascii_edges.scene.toml` outlined, at 1x, under MSAA 4 and at `--render-scale 0.5` |
+| `ascii-edges`, `ascii-edges-msaa4`, `ascii-edges-scale05` | the styled sphere and box of [`flint-examples/ascii_edges.scene.toml`](https://github.com/chrischaps/flint-examples/blob/main/ascii_edges.scene.toml) outlined, at 1x, under MSAA 4 and at `--render-scale 0.5` |
 | `ascii-entity`, `ascii-entity-object` | the spike's per-entity modes (#261), screen and object grids |
 | `style-mask` | the entity style mask the per-entity styles read (`--debug-mode style`) |
 | `styles-mixed` | ASCII and pencil props in one frame, on the mixed bench: each style leaves the other's pixels alone (#386) |
 | `edges-view`, `edges-inkline-scale05` | the [shared edges](#shared-edges) on the props scene, and a user style reading them beside `edges_view` at `--render-scale 0.5` |
 | `invert`, `kuwahara` | the other styles, with a tighter tolerance |
-| `contour`, `contour-over-kuwahara`, `contour-flags-are-its-table`, `contour-blend-zero` | the ink alone and over Kuwahara's paint (#599), the old `--contour-*` flags against the table they set, and a blend of 0 against no ink at all |
+| `contour`, `contour-over-kuwahara`, `contour-blend-zero` | the ink alone and over Kuwahara's paint (#599), and a blend of 0 against no ink at all |
 | `palette-phosphor-dither`, `palette-cga16` | the [palette style](#palette) on the props scene: a ladder dithered in 2-point blocks, and nearest colours flat. Glyph tolerance, since a colour on a boundary flips a whole block |
 
-Cases render single-sample with the post clock at 0 unless they say otherwise. The props cases share one clearing, `examples/prefabs/stylize_props.prefab.toml`, which loads in a few seconds in a debug build, with the grid off. Each style has a bench of its own on it (#386): `stylize_props_ascii` (the barrel and YBot in glyphs), `stylize_props_pencil` (the cask and crate sketched) and `stylize_props_plain` (nothing styled, for whole-frame styles and looks), so a change to pencil moves only the pencil cases and `look-graphite`. The mixed bench, `stylize_props.scene.toml`, keeps both styles for the mask cases and `styles-mixed`, the one case that moves with either: it holds that each style leaves the other's pixels alone. A new per-entity style adds a bench of its own (a scene placing the prefab, with overrides giving its props a `style_mask`); a whole-frame style or a look goes on the plain one. Glyph styles share #265's tolerance (fail when more than 2% of pixels differ by more than 48 levels, or the mean passes 3), since a cell on a ramp step's border can flip glyph on another GPU; smooth styles take `level = 8, share = 0.003, mean = 0.25`, because Kuwahara at radius 4 against a radius-5 golden is a 0.39 mean the glyph limits would pass. On one machine, every case is byte-identical run to run. **A new style adds a case here.** The manifest format is in [Headless Rendering](../guides/headless-rendering.md#golden-suites).
+Cases render single-sample with the post clock at 0 unless they say otherwise. The props cases share one clearing, [`flint-examples/prefabs/stylize_props.prefab.toml`](https://github.com/chrischaps/flint-examples/blob/main/prefabs/stylize_props.prefab.toml), which loads in a few seconds in a debug build, with the grid off. Each style has a bench of its own on it (#386): `stylize_props_ascii` (the barrel and YBot in glyphs), `stylize_props_pencil` (the cask and crate sketched) and `stylize_props_plain` (nothing styled, for whole-frame styles and looks), so a change to pencil moves only the pencil cases and `look-graphite`. The mixed bench, `stylize_props.scene.toml`, keeps both styles for the mask cases and `styles-mixed`, the one case that moves with either: it holds that each style leaves the other's pixels alone. A new per-entity style adds a bench of its own (a scene placing the prefab, with overrides giving its props a `style_mask`); a whole-frame style or a look goes on the plain one. Glyph styles share #265's tolerance (fail when more than 2% of pixels differ by more than 48 levels, or the mean passes 3), since a cell on a ramp step's border can flip glyph on another GPU; smooth styles take `level = 8, share = 0.003, mean = 0.25`, because Kuwahara at radius 4 against a radius-5 golden is a 0.39 mean the glyph limits would pass. On one machine, every case is byte-identical run to run. **A new style adds a case here.** The manifest format is in [Headless Rendering](../guides/headless-rendering.md#golden-suites).
 
 ## Shared edges
 
-Line styles are defined by their edges, and the edges that read best come from the geometry, not the picture's colour: a wood texture makes none, while a table's outline and the creases where its faces meet do (the ASCII spike's round 2, #261). Finding them costs a 5x5 patch of positions unprojected from the depth for every pixel, so the framework does it once a frame (#301) and hands the result to every style that asks. A style asks in its descriptor, `needs: &[StyleNeed::Edges]`, and reads `frame.edges` (bind it with `frame.edges_bind(...)` over a `kit::texture_layout`); a [user style](#user-authored-styles) adds `"edges"` to its `inputs` and calls `flint_edges(uv)`.
+Line styles are defined by their edges, and the edges that read best come from the geometry, not the picture's colour: a wood texture makes none, while a table's outline and the creases where its faces meet do (the ASCII spike's round 2, #261). Finding them costs a 5x5 patch of positions unprojected from the depth, so the framework does it once a frame (#301) and hands the result to every style that asks. It is the only geometry edge detector in the stylize framework since #743: ASCII, pencil and contour read it, as `edges_view` and user styles do. A style asks in its descriptor, `needs: &[StyleNeed::Edges]` (or `.needs_edges_when(f)`, when only some frames read them: ASCII asks only while its `edges` are on or the edge view draws them), and reads `frame.edges` (bind it with `frame.edges_bind(...)` over a `kit::texture_layout`); a [user style](#user-authored-styles) adds `"edges"` to its `inputs` and calls `flint_edges(uv)`. `StyleNeed::EdgeSteps` asks for the depth steps alone: contour's, which inks silhouettes, and on a frame where no style that is on asks for the creases the pass leaves `g` at 0 and reads a 3x3 patch with no normals.
 
 The texture is `Rgba16Float` at the depth's size (the scene's, so under `--render-scale` a display style reads it by UV, like the depth and the mask):
 
 | channel | holds |
 |---|---|
-| `r` | silhouette strength: a 3x3 Sobel of the view distance relative to the centre pixel's (so a far edge counts as much as a near one), kept on the near side only, over `edge_depth` |
-| `g` | crease strength: the Sobel of normals rebuilt from the depth, counted only where the 5x5 patch is one surface (across a depth step rebuilt normals mark a band on both sides), over `edge_normal` |
+| `r` | silhouette strength: a 3x3 Sobel of the view distance relative to the centre pixel's (so a far edge counts as much as a near one), kept on the near side only and only where the depth really steps, over `edge_depth`. A floor seen edge-on changes its distance from row to row as fast as a silhouette, but its depth-buffer value is affine across the screen, so its second difference is 0; a step's is as big as the step. Pencil inked that floor as a black band along the horizon before #743 (#404's `grazing` was the cure, off by default) |
+| `g` | crease strength: the Sobel of normals rebuilt from the depth, each from the neighbour on each axis whose side lies on the pixel's own plane, so it stays on its own surface across a step or a fold (#484, #952), counted only where the 5x5 patch is one surface (across a depth step rebuilt normals mark a band on both sides), over `edge_normal` |
 | `ba` | the unit direction across the edge in screen space (x right, y down): the silhouette's where `r >= 1`, else the crease's, picked from both axes of the normal Sobel |
 
 A strength of 1 is an edge at the scene's thresholds. The two pixels at each border are always 0, where the patch clamps and makes a degenerate normal.
@@ -1628,13 +1922,15 @@ edge_depth = 0.6     # the relative view-distance step that is a silhouette
 edge_normal = 2.5    # the normal change that is a crease
 ```
 
-The thresholds are shared because the pass is: every style reading the edges sees the same strengths. A style that wants more or fewer lines compares them against a level of its own (`examples/styles/inkline.wgsl` multiplies them by its `reach`). `flint render --edge-depth` / `--edge-normal` set them for one render, and F4's Styles section has them under **Shared edges**.
+The thresholds are shared because the pass is: every style reading the edges sees the same strengths. A style that wants more or fewer lines compares them against a level of its own ([`flint-examples/styles/inkline.wgsl`](https://github.com/chrischaps/flint-examples/blob/main/styles/inkline.wgsl) multiplies them by its `reach`). Built-in styles read them back in the scene's own measures through `stylize/edges_read.wgsl`: `flint_edge_step(e, edge_depth)` is the depth step as a share of the distance (a Sobel of about 4 steps), `flint_edge_turn(e, edge_normal)` the fold's 1 - cos of its angle. Pencil's `depth` and `crease` scale those, so its contours keep their response whatever the scene's thresholds; ASCII's own `edge_depth` / `edge_normal` scale the strengths (the shared value over the style's), and the direction stored is the shared thresholds' choice. `flint render --set post.edge_depth=<v>` / `--set post.edge_normal=<v>` set them for one render, and F4's Styles section has them under **Shared edges**.
 
 | ![edges_view on the props scene: the scene in grey, every edge pixel a hue for its direction](../images/shared-edges-view.png) | ![inkline, a user style with inputs = ["edges"], over the same scene](../images/shared-edges-inkline.png) |
 |---|---|
-| `--style edges_view`: the texture itself. Hue is the direction (opposite sides of a line agree), silhouettes are solid, creases softer; `ghost` shows strengths just under the threshold while tuning | `--style inkline` (`examples/styles/inkline.*`): flat paper tones under ink from `flint_edges`, about 40 lines of WGSL. Here it runs after the scene's own ASCII and pencil props |
+| `--style edges_view`: the texture itself. Hue is the direction (opposite sides of a line agree), silhouettes are solid, creases softer; `ghost` shows strengths just under the threshold while tuning | `--style inkline` (`flint-examples/styles/inkline.*`): flat paper tones under ink from `flint_edges`, about 40 lines of WGSL. Here it runs after the scene's own ASCII and pencil props |
 
-At 1920x1080 on an RTX 4070 the pass costs about 0.16 ms, once, with one or two styles reading it (`--gpu-time` names it **Style edges**); `edges_view` and `inkline` add 0.04 ms each. While no style that needs the edges is on, the pipeline isn't built and nothing is drawn. The ASCII and pencil styles still find their own edges (ASCII's also outlines its own mask ids, pencil's adds luma edges); moving them onto the shared texture is still to do.
+`--gpu-time` names the pass **Style edges**. A patch whose 25 depths lie on one plane (every second difference along its rows and columns 0 beside the first ones) holds no step and no crease, so it skips the unprojections and normals; most of a frame is such patches. At 1920x1080 on an RTX 4070 it costs about 0.09 ms with creases and 0.04 ms for the steps alone, once, however many styles read it; `edges_view` and `inkline` add 0.04 ms each. When every reader is per-entity, each says which pixels it reads (`StylePass::edges_rect`: ASCII's glyph rect four cells out, pencil's prep rect) and the pass draws their union, 0 elsewhere. While no style that needs the edges is on, the pipeline isn't built and nothing is drawn.
+
+What each style adds of its own: ASCII the outline of its mask ids, one small pass a depth pixel drawn only while the mask is bound (`ascii_edge_outline.wgsl`); pencil its mask edges and luma edges by `detail`; contour its luma edges, and the line's width (it takes the strongest step within `width` pixels). Measured with #743 (min of three alternating runs, p50, 1920x1080, RTX 4070): ASCII, pencil and contour together 1.01 to 0.87 ms; ASCII alone 0.34 to 0.23 ms; ASCII with pencil 1.12 to 1.00 ms; pencil alone 0.51 to 0.54 ms; per-entity ASCII 0.17 to 0.19 ms; contour alone 0.05 to 0.12 ms, its own 9 depth reads having been cheaper than the steps pass plus 9 edge reads. #1257 took contour's own pass back to 0.054 ms (its taps read through the nearest sampler, and `fade` reads depth only where a line inks), so contour alone is 0.096 ms: main's cost plus the shared steps pass, about 0.03 ms of which any full-screen pass costs at 1080p.
 
 ## The entity style mask
 
@@ -1652,12 +1948,12 @@ enabled = false         # out of any style, including an inherited one
 
 Descendants inherit their ancestor's style until one of them carries a `style_mask` of its own. Ids are numbered from 1 in name order, so the same scene gets the same ids on every run; a style finds its own with `frame.style_id("pencil")`.
 
-![The style mask debug view over examples/style_mask.scene.toml: the bench and the skinned YBot in one hue ("ascii"), the barrel, the crate and the lantern it carries in another ("pencil"), the opted-out box on the crate grey, and the legend in the lower left naming each hue](../images/style-mask-debug.png)
+![The style mask debug view over flint-examples/style_mask.scene.toml: the bench and the skinned YBot in one hue ("ascii"), the barrel, the crate and the lantern it carries in another ("pencil"), the opted-out box on the crate grey, and the legend in the lower left naming each hue](../images/style-mask-debug.png)
 
 See it with the `style` debug view, which switches the `mask_view` style on and runs it alone: while the view is up the scene's other styles, of either stage, are suspended, so the hues lie over the plain scene rather than over glyphs or hatching (#334). A scene that turns `mask_view` on in its own `[post_process.styles]` keeps its chain, the mask view reading whatever ran before it:
 
 ```bash
-flint render examples/style_mask.scene.toml --debug-mode style --output mask.png
+flint render flint-examples/style_mask.scene.toml --debug-mode style --output mask.png
 ```
 
 Each style is a hue over the scene's shading, unstyled pixels are grey, and a white line marks where two ids meet. A legend in the image's lower left gives each id's swatch and name, and the command prints the same table (#309):
@@ -1673,8 +1969,8 @@ How it's drawn:
 - **A redraw, not a new attachment.** After the scene pass, each visible opaque draw of a styled entity is drawn again into the mask with its cached transform bind group (and bone bind group for skinned meshes). The scene pipelines don't change and the per-entity loop makes no buffers or bind groups; the ids go up in one write a frame.
 - **Depth without a depth buffer.** A mask fragment tests itself against the scene's single-sample depth with a tolerance of twice its own depth slope, so grass or a wall in front of a styled prop cuts its mask. Under `--render-scale` the mask is at the scaled size, and a display-stage style reads it by UV.
 - **MSAA: drawn 4x, resolved "any sample wins"** (#306). Under `--msaa 4` the mask is drawn into a 4x target of its own, and each sample the triangle covers is tested against that sample of the scene's multisampled depth. A resolve then folds the four samples into the single-sample mask the styles read: a pixel takes the id that covers the most samples, and is empty only if no sample was styled. Drawn single-sample at pixel centres, a feature about a pixel thin (the bench's seat edge at a grazing angle) lost the pixels the scene's samples gave it, and an outline style drew the gaps as white dashes. The 4x target costs 33 MB at 1080p, and only while MSAA and a mask-reading style are both on.
-- **Only when wanted.** The mask target and its pipelines exist only once a style whose `uses_mask` asks for it this frame (or the debug view) is on. At 1080p on an RTX 4070 the pass (with the veil) costs about 0.022 ms for `examples/style_mask.scene.toml`'s styled entities, or about 0.05 ms under MSAA 4 with the 4x draw and its resolve, some 0.025 ms more than the single-sample mask cost there before #306.
-- **What's masked.** Static glTF meshes, procedural boxes, skinned meshes, terrain (#310) and styled transparents (#310, below). Particles, sprites, grass and water never are: grass is instanced, and the rest write no depth to test against.
+- **Only when wanted.** The mask target and its pipelines exist only once a style whose `uses_mask` asks for it this frame (or the debug view) is on. At 1080p on an RTX 4070 the pass (with the veil) costs about 0.022 ms for [`flint-examples/style_mask.scene.toml`](https://github.com/chrischaps/flint-examples/blob/main/style_mask.scene.toml)'s styled entities, or about 0.05 ms under MSAA 4 with the 4x draw and its resolve, some 0.025 ms more than the single-sample mask cost there before #306.
+- **What's masked.** Static glTF meshes, procedural boxes, skinned meshes, terrain (#310), billboard sprites (#1011) and styled transparents (#310, below). A billboard is redrawn as the scene drew it, its quad cut out where its texture's alpha is under 0.5, so only the sprite's shape takes its style; the mask's billboard pipeline is built the first frame a styled sprite is drawn. A mesh under [shallow wooze](procgen.md#shallow-wooze) is redrawn through the mask's own woozy vertex stages (#737), which move each vertex as the scene's do, so its id covers where it was drawn rather than its rest pose; they're built the first frame a styled draw drifts. Particles, 2D sprites (`mode = "sprite2d"`), grass and water never are: grass is instanced, and the rest write no depth to test against.
 
 ### Terrain and transparents
 
@@ -1688,7 +1984,7 @@ color = "tint"
 tint = [1.0, 0.72, 0.32]
 ```
 
-The host names the terrain's entity (`SceneRenderer::set_terrain_entity`) beside `load_terrain`; `flint render` and the player do.
+Binding the scene (`SceneRenderer::bind_scene`, which every host calls when a scene loads) loads its terrain and names the terrain's entity for the mask, so a styled terrain is masked in `flint render`, the player and `flint edit` alike (the viewer loaded no terrain before #739).
 
 **A styled transparent is a lens.** Glass, a ghost or a hologram with a style of its own is drawn into the mask after every opaque, back to front as the scene drew it. It writes no depth, but it is tested against the depth the opaques wrote, so an opaque in front still hides it. Where it shows, its id (and its blend) replaces whatever was behind it, and the style draws that whole pixel: what you see through a green-glyph pane comes out in green glyphs. The decision, and the alternatives it was chosen over:
 
@@ -1697,29 +1993,31 @@ The host names the terrain's entity (`SceneRenderer::set_terrain_entity`) beside
 
 What the lens costs: the pixel the style redraws is the composite (glass and all behind it), and a transparent cut-out (an alpha-textured leaf card drawn blended) masks its whole quad, since the mask pass doesn't sample the material. Unstyled transparents in front of a styled entity, the lens included, are the veil's (below), the other side of the same question. The veil is depth-tested only against opaques, so an unstyled transparent *behind* a styled pane also thins the pane's blend where they overlap.
 
-![examples/style_terrain.scene.toml: amber ASCII hills under a smooth barrel and table, and a green glyph pane that draws the half of the table behind it, and the hill, in its own style](../images/style-terrain.png)
+![flint-examples/style_terrain.scene.toml: amber ASCII hills under a smooth barrel and table, and a green glyph pane that draws the half of the table behind it, and the hill, in its own style](../images/style-terrain.png)
 
 ### What's in front: the veil
 
-Transparents and particles write no depth, so the depth test alone can't see them: where fire or glass sits in front of a styled stone, the stone's id would stay in the mask and the style would draw the fire as if it were stone. The rule (#290) is that **what's in front unmasks by its coverage.** Just before the mask, a veil pass draws every visible transparent mesh (static and skinned) and every particle into an `R8Unorm` target, depth-tested against the scene and never writing it, with the alpha it is drawn with (an additive particle covers by its alpha times its brightest channel). Layers blend "over" each other, so two faces of 50% glass cover 75%. The mask then writes each styled pixel's blend times what the veil leaves uncovered.
+Transparents and particles write no depth, so the depth test alone can't see them: where fire or glass sits in front of a styled stone, the stone's id would stay in the mask and the style would draw the fire as if it were stone. The rule (#290) is that **what's in front unmasks by its coverage.** Just before the mask, a veil pass draws every visible transparent mesh (static and skinned), every living prop's [echo](procgen.md#echoes) and every particle into an `R8Unorm` target, depth-tested against the scene and never writing it, with the alpha it is drawn with (an additive particle covers by its alpha times its brightest channel). Layers blend "over" each other, so two faces of 50% glass cover 75%. The mask then writes each styled pixel's blend times what the veil leaves uncovered.
+
+Echoes (#737) cover by their alpha and draw front faces only, as the scene draws them, so a two-sided leaf card covers once; an echo that only lightens (`echo_blend = "lighten"`) covers by its alpha too, since the veil can't know how much light it adds. Billboards need no veil: a sprite's alpha only cuts it out, and what it keeps writes depth, so the mask's own depth test already leaves a sprite in front of a styled stone out of the stone's mask. Which draws the veil takes is a selector over the frame's one draw list, with an arm for every kind of draw, so a new kind can't be left out without the compiler asking.
 
 ![Before #290: the campfire in front of the glyph stone is turned into stone glyphs, and the glass in front of the crate disappears into the crate's](../images/style-veil-before.png)
 
 ![After: the fire draws as fire over the stone, and behind the 45% glass the crate's glyphs show through at the share the glass leaves](../images/style-veil-after.png)
 
 ```bash
-flint render examples/style_veil.scene.toml --particle-time 2 --output veil.png
+flint render flint-examples/style_veil.scene.toml --particle-time 2 --output veil.png
 ```
 
 - Every mask-reading style honours the blend, so it shows the fire as fire and the stone through any uncovered share: ASCII and user styles that call `flint_style_blend` by their own code, and pencil, watercolor and the rest through the framework's [cross-fade](#blend-for-free) (#396). A fully covered pixel keeps its id at blend 0, so under a whole-frame ASCII the stone behind thick smoke is a smooth hole, as a blend-0 entity is.
 - A transparent that is itself styled stays out of the veil: it is in the mask as a lens ([above](#terrain-and-transparents)).
-- The pass costs about 0.02 ms at 1080p on an RTX 4070 for `examples/style_veil.scene.toml` (69 particles and a pane), and is skipped in a frame with no styled draws.
+- The pass costs about 0.02 ms at 1080p on an RTX 4070 for [`flint-examples/style_veil.scene.toml`](https://github.com/chrischaps/flint-examples/blob/main/style_veil.scene.toml) (69 particles and a pane), and is skipped in a frame with no styled draws.
 
 ### The style albedo
 
-A display-stage style sees the finished picture, which is each surface's colour times its light. A style that wants the light alone (pencil's `tone = "light"`, #869) asks for the **style albedo**: `.uses_albedo(MaskUse::When(f))` (or `Always`) on its descriptor. While such a style is on, the renderer redraws the frame's opaque static, procedural and skinned draws once more after the scene pass, with their cached transform and material bind groups and the scene's own vertex stages, through a fragment stage (`fs_albedo` in `shader.wgsl` and `skinned_shader.wgsl`) that builds only the base colour (vertex colour and tint, base texture, the glowing share of a vertex-emissive surface taken out) and no light. It writes an `Rgba8Unorm` target at the depth's size: linear rgb, and alpha 1 where a mesh was drawn. The pass tests against the depth the scene drew, read-only with `LessEqual`, so each mesh lands on its own depth. Under `--msaa 4` it draws against the scene's samples and resolves, so its silhouettes are the picture's (the rgb then comes back times the coverage in alpha). A style reads it as `StyleFrame::albedo` by UV with `textureLoad`, and keys its bind groups by `frame.albedo_key()`.
+A display-stage style sees the finished picture, which is each surface's colour times its light. A style that wants the light alone (pencil's `tone = "light"`, #869) asks for the **style albedo**: `.uses_albedo(MaskUse::When(f))` (or `Always`) on its descriptor. While such a style is on, the renderer redraws the frame's opaque static, procedural and skinned draws once more after the scene pass, with their cached transform and material bind groups and the scene's own vertex stages, through a fragment stage (`fs_albedo` in `pbr_surface.wgsl`, the surface both mesh shaders share) that builds only the base colour (vertex colour and tint, base texture, the glowing share of a vertex-emissive surface taken out) and no light. It writes an `Rgba8Unorm` target at the depth's size: linear rgb, and alpha 1 where a mesh was drawn. The pass tests against the depth the scene drew, read-only with `LessEqual`, so each mesh lands on its own depth. Under `--msaa 4` it draws against the scene's samples and resolves, so its silhouettes are the picture's (the rgb then comes back times the coverage in alpha). A style reads it as `StyleFrame::albedo` by UV with `textureLoad`, and keeps its bind groups over it with `frame.bind_over(name, variant, &[frame.albedo_or(&blank)], make)`: the group is kept while the albedo is the same texture, and made again in its place when the albedo is made again (wgpu 30 compares views by identity, #960).
 
-What it leaves out keeps alpha 0, and a reader falls back on the picture there: terrain, grass, the ocean, billboards, particles, transparents, and draws with shallow wooze (#215), whose vertices move in a stage of their own. On an RTX 4070 at 1080p the pass costs 0.028–0.035 ms (p50 of `--gpu-time 240`, three alternating runs each on `stylize_props_plain` and `examples/ascii_dark_props`), and the pencil pass drew about 0.04 ms less, since it had less floor to hatch.
+What it leaves out keeps alpha 0, and a reader falls back on the picture there: terrain, grass, the ocean, billboards, particles, transparents, and draws with shallow wooze (#215), whose vertices move in a stage of their own. On an RTX 4070 at 1080p the pass costs 0.028–0.035 ms (p50 of `--gpu-time 240`, three alternating runs each on `stylize_props_plain` and `flint-examples/ascii_dark_props.scene.toml`), and the pencil pass drew about 0.04 ms less, since it had less floor to hatch.
 
 To read it in a style, set `uses_mask: MaskUse::Always` (or `MaskUse::When(f)` to read it only under some settings), make a layout with `kit::mask_layout` and bind it with `frame.mask_bind(...)`; in WGSL it is a `texture_2d<u32>` read with `textureLoad`, the id in `.r` and the blend in `.g` (`stylize/mask_view.rs` and `mask_view.wgsl` show the whole thing). A style needn't do anything with `.g`: the framework [cross-fades](#blend-for-free) its entities by it. One that does better than a cross-fade reads `.g` itself and sets `.blends_itself()`.
 
@@ -1735,13 +2033,15 @@ In `encode`, `frame.variants()` lists this style's `(id, variant)` pairs, `frame
 
 ### Drawn only where the entities are
 
-A per-entity style changes its entities' pixels and passes every other pixel through, so running its passes over the whole frame spends most of the GPU on pixels it gives back unchanged (#385). The framework knows where the entities can be: each frame it projects the world bounds of exactly the draws the mask draws for each id (terrain chunks in view, models, procedural boxes, and skinned meshes as posed, their bind-pose box under every bone matrix) and hands them to the style as `frame.styled_rect(pad)`. That is the union of the style's own variants' rects in pixels, grown by `pad` for how far a styled pixel reaches and by a pixel or two for the mask's rounding (its texels are larger under a render scale). It is `None` when the style covers the frame (`frame.covers_frame()`: its table on and `scope` not `entities`), when a draw has no bounds or crosses the camera plane, or under `FLINT_STYLE_SCISSOR=0`; an empty rect means none of its entities is in view.
+A per-entity style changes its entities' pixels and passes every other pixel through, so running its passes over the whole frame spends most of the GPU on pixels it gives back unchanged (#385). The framework knows where the entities can be: each frame it projects the world bounds of exactly the draws the mask draws for each id (terrain chunks in view, models, procedural boxes, skinned meshes as posed, their bind-pose box under every bone matrix, and billboards, a box around the sprite that holds its quad however the camera turns it) and hands them to the style as `frame.styled_rect(pad)`. That is the union of the style's own variants' rects in pixels, grown by `pad` for how far a styled pixel reaches and by a pixel or two for the mask's rounding (its texels are larger under a render scale). It is `None` when the style covers the frame (`frame.covers_frame()`: its table on and `scope` not `entities`), when a draw has no bounds or crosses the camera plane, or under `FLINT_STYLE_SCISSOR=0`; an empty rect means none of its entities is in view.
 
 Two helpers in `stylize::kit` use it:
 
-- `kit::scissored_pass` for the pass that writes the style's output: the style draws inside the rect, and a blit (`kit::Blit`, made in `create` over the style's own input layout) copies the input into the up to four bands around it, so every pixel is written once. The blit reads with `textureLoad` at the pixel, as the styles' passthrough does, so the frame is the full pass's byte for byte, provided the style returns its input outside the rect.
+- `kit::scissored_pass` for the pass that writes the style's output: the style draws inside the rect, and a blit (`kit::Blit`, made in `create` over the style's own input layout) copies the input into the up to four bands around it, so every pixel is written once. The blit reads with `textureLoad` at the pixel, as the styles' passthrough does, so the frame is the full pass's byte for byte, provided the style returns its input outside the rect. `kit::scissored_pass_around` (#538) draws the bands with a pipeline the style gives instead, for a style whose passthrough isn't a `textureLoad`: watercolor's samples its input, so its bands are an entry point of its own shader (`fs_passthrough`) that returns exactly what its paint pass returns for an unpainted pixel, and a user style's are its own passthrough.
 - `kit::fullscreen_pass_in` for an intermediate pass whose result is read only near the entities: it draws inside the rect, and the rest stays cleared.
 
-Pencil scissors its draw pass to the rect and its prep to the rect grown by how far a styled pixel reads the prep (the flow blur's `1.5 * spacing`, or a contour's wobble plus half its width). ASCII scissors its glyph pass to the rect grown by two of the largest cell in play (a snapped silhouette draws a whole cell around a styled pixel), its edge cell pass to the cells under that and one more on each side (thinning asks a neighbour), and its edge pixel pass, the 5x5 unprojection that is most of its cost, to those cells' pixels. On `examples/stylize_props.scene.toml` at 1080p (RTX 4070 laptop, best of five, alternating binaries) ASCII went from 0.42 to 0.22 ms and pencil from 0.072 to 0.048 ms; on `examples/ascii_entities.scene.toml` ASCII went from 0.45 to 0.17 ms. A whole-frame style isn't scissored, and the control case (`--style ascii` over the same props) was unchanged.
+Pencil scissors its draw pass to the rect and its prep to the rect grown by how far a styled pixel reads the prep (the flow blur's `1.5 * spacing`, or a contour's wobble plus half its width). ASCII scissors its glyph pass to the rect grown by two of the largest cell in play (a snapped silhouette draws a whole cell around a styled pixel), its edge cell pass to the cells under that and one more on each side (a drawn cell's corner glyph reads edge cells up to three cells away, and the rect already holds two of them; #930), and its edge pixel pass, the 5x5 unprojection that is most of its cost, to those cells' pixels. On [`flint-examples/stylize_props.scene.toml`](https://github.com/chrischaps/flint-examples/blob/main/stylize_props.scene.toml) at 1080p (RTX 4070 laptop, best of five, alternating binaries) ASCII went from 0.42 to 0.22 ms and pencil from 0.072 to 0.048 ms; on [`flint-examples/ascii_entities.scene.toml`](https://github.com/chrischaps/flint-examples/blob/main/ascii_entities.scene.toml) ASCII went from 0.45 to 0.17 ms. A whole-frame style isn't scissored, and the control case (`--style ascii` over the same props) was unchanged.
 
-`SceneRenderer::set_style_scissor(false)` (or `FLINT_STYLE_SCISSOR=0`) draws the full passes, for checking: `per_entity_styles_scissored_to_their_props_draw_the_same_bytes` in `tests/stylize.rs` holds the two frames equal. A new per-entity style that scissors must keep its passthrough exact outside the rect, and must say how far a styled pixel reads in the pad.
+Watercolor (#538) scissors all three of its passes. Its paint pass runs inside the rect grown by the widest `wobble` of any row (an unpainted pixel takes the paint its wobbled mask read finds, so a painted silhouette wanders that far out), the second blur inside that grown by the wobble and the glazes' 1.5 points (where a painted pixel reads the wash), and the first blur inside that grown by two wash radii (the second blur's taps). On [`flint-examples/watercolor.scene.toml`](https://github.com/chrischaps/flint-examples/blob/main/watercolor.scene.toml) at 1080p (RTX 4070 laptop, alternating binaries) the per-entity pass went from 0.236 to 0.110 ms; the whole frame (`--style watercolor:scope=screen`) stayed at 0.391 ms. A [user style](#user-authored-styles) is scissored when its `.shader.toml` says how far it reaches (its `reach`): the hologram at `reach = 0` went from 0.026 to 0.022 ms on [`flint-examples/user_styles.scene.toml`](https://github.com/chrischaps/flint-examples/blob/main/user_styles.scene.toml).
+
+`SceneRenderer::set_style_scissor(false)` (or `FLINT_STYLE_SCISSOR=0`) draws the full passes, for checking: `per_entity_styles_scissored_to_their_props_draw_the_same_bytes` in `tests/stylize.rs` holds the two frames equal, and `a_moving_ascii_crate_draws_the_same_scissored_as_full_frame_after_frame` holds them equal over a dozen frames of an ASCII crate moving past plain ones, history and all. One pass stays cut with the scissor off: ASCII's edge cell pass, to `frame.styled_area(pad)` (`styled_rect` whether or not the scissor is on). The cells outside it are left empty either way, so the history each cell starts the next frame from (#477) is the same; drawn whole, they held the plain crates' lines, and the frame after the crate jumped four cells started from a different past (#930). A new per-entity style that scissors must keep its passthrough exact outside the rect, and must say how far a styled pixel reads in the pad; state it carries from frame to frame belongs inside `styled_area`.

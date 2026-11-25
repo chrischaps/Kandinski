@@ -9,6 +9,7 @@ use flint_core::EntityId;
 use flint_ecs::FlintWorld;
 use flint_physics::PhysicsSystem;
 use flint_runtime::{GameStateMachine, PersistentStore};
+use flint_schema::post_effects::{self, PostValue};
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
@@ -86,6 +87,9 @@ pub struct InputSnapshot {
     pub touch_taps: Vec<(f64, f64)>,
     /// Swipe gestures detected this frame (direction_str, start_norm_x, start_norm_y)
     pub touch_swipes: Vec<(String, f64, f64)>,
+    /// What was typed this frame, in order: what a focused `text_input`
+    /// takes (#1229).
+    pub text_edits: Vec<flint_runtime::TextEdit>,
 }
 
 /// Where a scene's music is this frame (#745): what `music_beat()`,
@@ -116,6 +120,40 @@ impl Default for MusicClock {
     }
 }
 
+/// How a script's sound plays (#699): `play_sound` / `play_sound_at`'s
+/// volume and pitch, and their opts map's `looping` and `bus`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SoundPlay {
+    /// 0..1.
+    pub volume: f64,
+    /// A playback-rate multiplier.
+    pub pitch: f64,
+    /// Plays until `stop_sound`, or the scene's end.
+    pub looping: bool,
+    /// The mixer bus by name: `sfx` (the default), `music` or one the game
+    /// declares in `flint.toml` (#730).
+    pub bus: String,
+}
+
+impl Default for SoundPlay {
+    fn default() -> Self {
+        Self {
+            volume: 1.0,
+            pitch: 1.0,
+            looping: false,
+            bus: "sfx".into(),
+        }
+    }
+}
+
+/// Which sounds `stop_sound` stops: the one its handle names, or every one
+/// a script started by that name.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SoundRef {
+    Handle(u64),
+    Name(String),
+}
+
 /// Log severity levels
 #[derive(Debug, Clone)]
 pub enum LogLevel {
@@ -127,24 +165,55 @@ pub enum LogLevel {
 /// Deferred commands produced by scripts, processed by PlayerApp after script update
 #[derive(Debug, Clone)]
 pub enum ScriptCommand {
+    /// `play_sound`: `handle` is what it returned, for `stop_sound` and
+    /// `set_sound_volume` (#699).
     PlaySound {
+        handle: u64,
         name: String,
-        volume: f64,
-        pitch: f64,
+        play: SoundPlay,
     },
+    /// `play_sound_at`, with its handle as for `PlaySound`.
     PlaySoundAt {
+        handle: u64,
         name: String,
         position: (f64, f64, f64),
-        volume: f64,
-        pitch: f64,
+        play: SoundPlay,
         /// `(min, max)` metres from the listener; `None` is the engine's
         /// default (1 to 25).
         distances: Option<(f32, f32)>,
         /// The falloff curve between them; `None` is the engine's default.
         rolloff: Option<f32>,
     },
+    /// `stop_sound`: one sound by its handle, or every sound a script
+    /// started by that name, fading over `fade` seconds.
     StopSound {
-        name: String,
+        sound: SoundRef,
+        fade: f64,
+    },
+    /// `set_sound_volume`: fade a sound a script started to `volume` (0..1)
+    /// over `fade` seconds.
+    SetSoundVolume {
+        handle: u64,
+        volume: f64,
+        fade: f64,
+    },
+    /// `set_bus_volume`: a mixer bus's volume (linear, 1 = unity), by name:
+    /// `sfx`, `music` or one the game declares in `flint.toml` (#730).
+    SetBusVolume {
+        bus: String,
+        volume: f64,
+    },
+    /// `set_user_bus_volume`: the player's own volume for a bus (0..1),
+    /// multiplied with the game's and saved for the next run (#1217).
+    SetUserBusVolume {
+        bus: String,
+        volume: f64,
+    },
+    /// `set_bus_lowpass`: a mixer bus's own low-pass cutoff, Hz (20000 is
+    /// open), by name (#1218).
+    SetBusLowpass {
+        bus: String,
+        hz: f64,
     },
     FireEvent {
         name: String,
@@ -202,6 +271,17 @@ pub enum ScriptCommand {
         /// `linear`, `smooth` (the default), `ease_in`, `ease_out` or
         /// `ease_in_out`
         easing: String,
+    },
+    /// `tween`: ease a numeric component field (`path` is
+    /// `component.field`) to `target` over `seconds` of game time (#734).
+    /// The host steps it with the scripts and fires `tween_done` at the end;
+    /// a new tween of the same field replaces the old one.
+    Tween {
+        entity: EntityId,
+        path: String,
+        target: toml::Value,
+        seconds: f64,
+        easing: flint_core::tween::Easing,
     },
     /// Take an entity's own style off again.
     ClearEntityStyle {
@@ -277,9 +357,17 @@ pub enum ScriptCommand {
     },
     /// Lay a look under the scene's `[post_process]` keys in place of the
     /// one it has (#356): a `styles/<name>.look.toml` or a built-in.
-    /// `None` takes the look off (the scene's keys alone).
+    /// `None` takes the look off (the scene's keys alone). `seconds` above
+    /// 0 cross-fades from the look drawn now to the new one (#496);
+    /// 0 is a cut.
     SetLook {
         name: Option<String>,
+        seconds: f64,
+    },
+    /// `prepare_look(name)` (#1121): build a look's styles on worker
+    /// threads now, so the frame that later sets it pays nothing.
+    PrepareLook {
+        name: String,
     },
     /// A function of a module an optional feature owns (#698): Living
     /// Props' knobs, the wooze field, the A/B. The subsystem that declared
@@ -323,14 +411,11 @@ pub enum ScriptCommand {
     SetCamera {
         camera: CameraOverrides,
     },
-    /// `set_vignette`, `set_bloom_intensity`, `set_exposure` and the other
-    /// post-processing overrides: each held, once set, until set again.
+    /// `set_post(param, value)` and the deprecated setters it replaced
+    /// (`set_vignette`, `set_fog_color`, ...; #853): `[post_process]` keys,
+    /// each held, once set, until set again.
     SetPostProcess {
         post: PostProcessOverrides,
-    },
-    /// `set_fog_color`, linear 0..1, held until set again.
-    SetFogColor {
-        color: [f32; 3],
     },
     /// `set_render_mode` (mode, mix: shown only the frames it is called)
     /// and `set_render_mode_params` (held).
@@ -366,44 +451,82 @@ pub enum ScriptCommand {
     },
 }
 
-/// The post-processing overrides scripts set: each `Some` only if its
-/// `set_*` was called since the last drain.
-#[derive(Debug, Clone, Copy, Default, PartialEq)]
+/// The `[post_process]` values scripts set (`set_post`, #853): each key
+/// only if it was set since the last drain, the last value a key was given
+/// winning. Every key is a [`post_effects`] parameter and every value its
+/// kind, checked when set, so a host writes them over its config with
+/// `config.param_mut(key)` and [`PostParamMut::put`].
+///
+/// [`PostParamMut::put`]: flint_schema::post_effects::PostParamMut::put
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct PostProcessOverrides {
-    pub vignette: Option<f32>,
-    pub bloom: Option<f32>,
-    pub exposure: Option<f32>,
-    pub chromatic_aberration: Option<f32>,
-    pub radial_blur: Option<f32>,
-    pub ssao_intensity: Option<f32>,
-    pub fog_density: Option<f32>,
-    pub desaturation: Option<f32>,
-    pub dof_strength: Option<f32>,
-    pub dof_focus_distance: Option<f32>,
-    pub dof_focus_range: Option<f32>,
+    values: std::collections::BTreeMap<&'static str, PostValue>,
 }
 
 impl PostProcessOverrides {
+    /// Set `key` to `value`, refused with why when `key` is no
+    /// `[post_process]` key (the message lists them) or `value` is not its
+    /// kind ("`fog_color` is three numbers: [r, g, b], not 0.5").
+    pub fn set(&mut self, key: &str, value: &toml::Value) -> Result<(), String> {
+        let param = post_effects::param(key).ok_or_else(|| post_effects::unknown_key(key))?;
+        let value = param
+            .value_of(value)
+            .map_err(|why| format!("`{key}` {why}, not {value}"))?;
+        self.values.insert(param.key, value);
+        Ok(())
+    }
+
+    /// Set `key` to `value`, which the caller knows is the key's kind (a
+    /// deprecated setter's body). Panics on a key that is no parameter or a
+    /// value of another kind: a mistake in the engine, not a script's.
+    pub fn put(&mut self, key: &'static str, value: PostValue) {
+        let param = post_effects::param(key).unwrap_or_else(|| panic!("no post key {key}"));
+        assert_eq!(
+            std::mem::discriminant(&param.default),
+            std::mem::discriminant(&value),
+            "{key} is a {}",
+            param.kind.name()
+        );
+        self.values.insert(param.key, value);
+    }
+
+    /// A number key's value, when it was set.
+    pub fn f32(&self, key: &str) -> Option<f32> {
+        match self.values.get(key)? {
+            PostValue::F32(v) => Some(*v),
+            _ => None,
+        }
+    }
+
+    /// Set or clear a number key (the rhythm ladder's merge writes over
+    /// what scripts asked of `radial_blur` and two more).
+    pub fn set_f32(&mut self, key: &'static str, value: Option<f32>) {
+        match value {
+            Some(v) => self.put(key, PostValue::F32(v)),
+            None => {
+                self.values.remove(key);
+            }
+        }
+    }
+
+    /// The value `key` was set to.
+    pub fn get(&self, key: &str) -> Option<PostValue> {
+        self.values.get(key).copied()
+    }
+
+    /// Nothing set.
+    pub fn is_empty(&self) -> bool {
+        self.values.is_empty()
+    }
+
+    /// Each key set and its value, in key order.
+    pub fn iter(&self) -> impl Iterator<Item = (&'static str, PostValue)> + '_ {
+        self.values.iter().map(|(k, v)| (*k, *v))
+    }
+
     /// Lay `later` over these: what it sets wins, what it leaves stays.
     pub fn merge(&mut self, later: PostProcessOverrides) {
-        macro_rules! keep {
-            ($($field:ident),*) => {
-                $(if later.$field.is_some() { self.$field = later.$field; })*
-            };
-        }
-        keep!(
-            vignette,
-            bloom,
-            exposure,
-            chromatic_aberration,
-            radial_blur,
-            ssao_intensity,
-            fog_density,
-            desaturation,
-            dof_strength,
-            dof_focus_distance,
-            dof_focus_range
-        );
+        self.values.extend(later.values);
     }
 }
 
@@ -442,7 +565,6 @@ impl CameraOverrides {
 pub struct FrameRequests {
     pub camera: CameraOverrides,
     pub post: PostProcessOverrides,
-    pub fog_color: Option<[f32; 3]>,
     /// Shown only the frames a script asks for it (a reality tear).
     pub render_mode: Option<(u32, f32)>,
     pub mode_params: Option<[f32; 4]>,
@@ -651,6 +773,8 @@ pub struct ScriptCallContext {
     pub camera_view_proj: [[f32; 4]; 4],
     /// Entity currently being scripted
     pub current_entity: EntityId,
+    /// Its script's file and entity name, for what it prints (#703)
+    pub speaker: Arc<crate::engine::output::Speaker>,
     /// Accumulated commands to be drained after all scripts run
     pub commands: Vec<ScriptCommand>,
     /// Accumulated 2D draw commands for the current frame, each stamped
@@ -662,6 +786,13 @@ pub struct ScriptCallContext {
     /// Depth-tested world text queued this frame (`draw_world_text`,
     /// ADR 0104). The host lays it out and draws it before the HUD.
     pub world_texts: Vec<flint_core::world_text::WorldText>,
+    /// The screen field scripts filled this frame (`field_disc`,
+    /// `field_ring`, `field_cone`; #859). The host hands it to the
+    /// renderer, where a style with `blend_source = "field"` follows it.
+    pub style_field: flint_core::style_field::StyleField,
+    /// Whether a frame asking for more field shapes than the field holds
+    /// has been said (once a run).
+    pub style_field_warned: bool,
     /// `push_clip` / `pop_clip` stack; each entry is already intersected
     /// with its parent. Cleared when the frame's draw commands are drained.
     pub clip_stack: Vec<[f32; 4]>,
@@ -694,6 +825,13 @@ pub struct ScriptCallContext {
     pub quality: flint_core::quality::QualitySettings,
     /// What the GPU is, for `gpu_info()`. The host sets it once.
     pub gpu_info: flint_core::quality::GpuInfo,
+    /// The look the scene draws with now, for `get_look()` (#497): the one
+    /// it names, or the one a script or F4 chose since; `""` for none. The
+    /// host sets it whenever it changes and once a frame.
+    pub look: String,
+    /// Every look the scene can see, by name, for `list_looks()` (#497).
+    /// The host sets it at each scene's entry.
+    pub looks: Vec<String>,
     /// Whether the cursor is captured now, for `is_cursor_captured()`
     /// (ADR 0110). The host sets it each frame.
     pub cursor_captured: bool,
@@ -736,6 +874,9 @@ pub struct ScriptCallContext {
     pub camera_follow: CameraFollowState,
     /// Persistent screen shake state
     pub shake: ShakeState,
+    /// The 3D camera rig's shake, hand-held camera and shot lists (#1158),
+    /// laid over the camera asked for when the requests are taken
+    pub camera_rig: crate::rig::CameraRig,
     /// Set of currently loaded chunk IDs (synced from PlayerApp before scripts run)
     pub loaded_chunk_ids: HashSet<String>,
     /// The modules an optional feature owns that may run now (#698): what
@@ -763,9 +904,22 @@ pub struct ScriptCallContext {
     /// for `audio_position` (#658). The host sets it each frame, paused or
     /// not; a source missing from it hasn't started.
     pub audio_positions: std::collections::HashMap<EntityId, f64>,
+    /// The handles of the sounds scripts started that are playing, for
+    /// `is_sound_playing` (#1000). The host sets it each frame before
+    /// scripts run, as it does `audio_positions`; a headless host never
+    /// does, so there every handle is silent.
+    pub sounds_playing: HashSet<u64>,
+    /// The player's own volume for each bus they set, by name, for
+    /// `user_bus_volume` (#1217). The host sets it at start and whenever
+    /// it changes; `set_user_bus_volume` writes it too, so a script reads
+    /// back what it set on the same frame.
+    pub user_bus_volumes: std::collections::HashMap<String, f64>,
     /// How long after it is mixed a sound is heard, seconds, where the
     /// platform says (the browser), for `audio_output_latency`.
     pub audio_output_latency: Option<f64>,
+    /// What `test_assert`, `test_fail`, `test_pass` and `test_log` said
+    /// (#714), for the whole run: a scene change keeps it.
+    pub test: crate::testing::TestRecord,
 }
 
 // SAFETY: ScriptCallContext is only accessed from the main thread within
@@ -817,9 +971,12 @@ impl ScriptCallContext {
             ],
             camera_direction: [0.0, 0.0, 1.0],
             current_entity: EntityId::from_raw(0),
+            speaker: crate::engine::output::Speaker::nobody(),
             commands: Vec::new(),
             draw_commands: Vec::new(),
             world_lines: Vec::new(),
+            style_field: Default::default(),
+            style_field_warned: false,
             world_texts: Vec::new(),
             clip_stack: Vec::new(),
             over_ui_depth: 0,
@@ -834,6 +991,8 @@ impl ScriptCallContext {
             draw_distance_scale: 1.0,
             quality: Default::default(),
             gpu_info: Default::default(),
+            look: String::new(),
+            looks: Vec::new(),
             cursor_captured: false,
             state_machine: std::ptr::null_mut(),
             persistent_store: std::ptr::null_mut(),
@@ -850,6 +1009,7 @@ impl ScriptCallContext {
             text_measurer: None,
             camera_follow: CameraFollowState::default(),
             shake: ShakeState::default(),
+            camera_rig: crate::rig::CameraRig::default(),
             loaded_chunk_ids: HashSet::new(),
             enabled_modules: Vec::new(),
             module_state: Default::default(),
@@ -858,7 +1018,10 @@ impl ScriptCallContext {
             bad_target_warned: HashSet::new(),
             opts_warned: HashSet::new(),
             audio_positions: std::collections::HashMap::new(),
+            sounds_playing: HashSet::new(),
+            user_bus_volumes: std::collections::HashMap::new(),
             audio_output_latency: None,
+            test: Default::default(),
         }
     }
 
@@ -893,9 +1056,8 @@ impl ScriptCallContext {
         }
         let caller = self.current_entity;
         let script = world
-            .get_components(caller)
-            .and_then(|c| c.get_field("script", "source"))
-            .and_then(|v| v.as_str())
+            .view(caller, flint_core::components::SCRIPT)
+            .opt_str("source")
             .filter(|s| !s.is_empty())
             .map(str::to_string)
             .or_else(|| world.get_name(caller).map(|n| format!("entity '{n}'")))
@@ -984,18 +1146,23 @@ impl ScriptCallContext {
     /// commands in the order they were made, then this frame's requests
     /// (camera, post-processing, time scale...), one command each, for
     /// those asked for. A distance scale asked for reads back from here on
-    /// (`get_lod_scale()`) until the host says what it applied.
+    /// (`get_lod_scale()`) until the host says what it applied. A camera
+    /// asked for takes the rig's shake and hand-held jitter here, after
+    /// every script's own position and target (#1158).
     pub fn take_commands(&mut self) -> Vec<ScriptCommand> {
         let mut out = std::mem::take(&mut self.commands);
-        let r = std::mem::take(&mut self.requests);
+        let mut r = std::mem::take(&mut self.requests);
+        self.camera_rig.shake_requested(
+            self.total_time,
+            &mut r.camera,
+            self.camera_position,
+            self.camera_direction,
+        );
         if r.camera != CameraOverrides::default() {
             out.push(ScriptCommand::SetCamera { camera: r.camera });
         }
-        if r.post != PostProcessOverrides::default() {
+        if !r.post.is_empty() {
             out.push(ScriptCommand::SetPostProcess { post: r.post });
-        }
-        if let Some(color) = r.fog_color {
-            out.push(ScriptCommand::SetFogColor { color });
         }
         if r.render_mode.is_some() || r.mode_params.is_some() {
             out.push(ScriptCommand::SetRenderMode {

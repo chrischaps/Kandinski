@@ -22,13 +22,37 @@
 use crate::glyph_atlas::{GlyphAtlas, GlyphError, GlyphSetCache, BUILTIN_SET};
 use crate::sprite2d_pipeline::Sprite2dInstanceGpu;
 use flint_core::project::{shown, AssetKind, AssetScope};
-use flint_core::toml_util::toml_f32;
+use flint_core::toml_util::{check_keys, toml_f32, KeyIssue, Shape};
 use flint_core::vfs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 /// The suffix of the older bitmap-font description.
 pub const FONT_TOML_SUFFIX: &str = ".font.toml";
+
+/// The keys a `.font.toml` may hold (#282).
+const FONT_FILE: Shape = Shape::Table(&[(
+    "font",
+    Shape::Table(&[
+        ("glyphs", Shape::Value),
+        ("texture", Shape::Value),
+        ("glyph_width", Shape::Value),
+        ("glyph_height", Shape::Value),
+        ("columns", Shape::Value),
+        ("first_char", Shape::Value),
+        ("char_count", Shape::Value),
+        ("spacing", Shape::Value),
+    ]),
+)]);
+
+/// The keys of a `.font.toml` document that a load ignores (misspelled,
+/// misplaced or unknown), as it warns about them. Empty for a document
+/// that doesn't parse: the load says why.
+pub fn font_toml_issues(text: &str) -> Vec<KeyIssue> {
+    text.parse::<toml::Value>()
+        .map(|doc| check_keys(&doc, &FONT_FILE))
+        .unwrap_or_default()
+}
 
 /// Prefix of the `TextureCache` names fonts upload under, so a font never
 /// shares a name with an image file.
@@ -80,6 +104,9 @@ impl BitmapFont {
         let table: toml::Value = text
             .parse()
             .map_err(|e: toml::de::Error| parse_error(path, e.to_string().trim_end()))?;
+        for issue in check_keys(&table, &FONT_FILE) {
+            tracing::warn!("{}: {issue}", shown(path));
+        }
         let font = table
             .get("font")
             .ok_or_else(|| parse_error(path, "no [font] table"))?;
@@ -258,7 +285,7 @@ mod tests {
     use super::*;
     use flint_core::vfs::MemorySource;
 
-    /// A 16-column, 6-row grid of 8x16 cells, like `examples/ui_test`'s font:
+    /// A 16-column, 6-row grid of 8x16 cells, like `flint-examples/ui_test`'s font:
     /// each glyph's cell has a solid column at `x = index % 8`, so which cell
     /// a character came from can be read back off the atlas.
     fn grid_png() -> Vec<u8> {
@@ -414,6 +441,25 @@ mod tests {
     }
 
     #[test]
+    fn font_toml_keys_it_ignores_are_named() {
+        // #282: `spacng` used to be ignored and the spacing stayed 1.0
+        assert!(font_toml_issues(LEGACY).is_empty());
+        assert!(font_toml_issues("[font]\nglyphs = \"builtin\"\nspacing = 2.0\n").is_empty());
+        let typo = font_toml_issues(&LEGACY.replace("spacing", "spacng"));
+        assert_eq!(typo.len(), 1);
+        let message = typo[0].to_string();
+        assert!(message.contains("`spacng` in [font]"), "{message}");
+        assert!(message.contains("did you mean `spacing`?"), "{message}");
+        // A glyph set named in the wrong spelling would draw the grid's font
+        let glyph = font_toml_issues("[font]\nglyph = \"kana\"\n");
+        assert!(
+            glyph[0].to_string().contains("did you mean `glyphs`?"),
+            "{}",
+            glyph[0]
+        );
+    }
+
+    #[test]
     fn bad_fonts_say_why() {
         vfs::scoped(scene_files(), || {
             let dir = &scope("game/levels");
@@ -509,6 +555,34 @@ mod tests {
         }
     }
 }
+
+/// `sprite.mode`'s values (`schemas/components/sprite.toml` lists the same;
+/// a test holds the two together).
+pub const SPRITE_MODES: &[&str] = &["billboard", "sprite2d"];
+
+/// `screen_anchor.anchor`'s values, as [`anchor_origin`] matches them.
+pub const SCREEN_ANCHORS: &[&str] = &[
+    "top-left",
+    "top-center",
+    "top-right",
+    "center-left",
+    "center",
+    "center-right",
+    "bottom-left",
+    "bottom-center",
+    "bottom-right",
+];
+
+/// `ui_fill.direction`'s values, as [`apply_fill`] matches them.
+pub const FILL_DIRECTIONS: &[&str] = &[
+    "left_to_right",
+    "right_to_left",
+    "bottom_to_top",
+    "top_to_bottom",
+];
+
+/// `ui_text.align`'s values, as `BitmapFont::layout_text` matches them.
+pub const TEXT_ALIGNS: &[&str] = &["left", "center", "right"];
 
 /// Compute the screen-space origin for a named anchor point.
 ///

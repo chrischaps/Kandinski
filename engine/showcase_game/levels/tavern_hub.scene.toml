@@ -22,7 +22,7 @@
 name = "The Overgrown Ruins — Tavern Hub"
 version = "1.0"
 description = "Hub tavern with procgen textures, NPCs, and doors to three ruin zones"
-input_config = "showcase_game/config/input_ruins.toml"
+input_config = "config/input_ruins.toml"
 
 [post_process]
 bloom_enabled = true
@@ -59,8 +59,6 @@ gravity_scale = 0.0
 move_speed = 5.0
 jump_force = 6.0
 height = 1.8
-radius = 0.3
-camera_mode = "first_person"
 
 [entities.player.script]
 source = "footsteps.rhai"

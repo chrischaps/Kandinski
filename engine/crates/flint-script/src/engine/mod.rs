@@ -12,10 +12,11 @@
 //! can interact with.
 
 use crate::api;
-use crate::context::{DrawItem, InputSnapshot, ScriptCallContext, ScriptCommand};
+use crate::context::{DrawItem, InputSnapshot, ScriptCallContext, ScriptCommand, WorldScope};
 use crate::module_resolver::{ModuleBase, VfsModuleResolver};
 use flint_core::vfs;
 use flint_core::EntityId;
+use flint_ecs::FlintWorld;
 use rhai::{Engine, Scope, AST};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -23,10 +24,9 @@ use std::sync::{Arc, Mutex};
 mod callbacks;
 pub mod instance;
 pub mod interact;
+pub mod output;
 
 pub use instance::ScriptInstance;
-#[cfg(test)]
-pub(crate) use instance::CALLBACK_ARITIES;
 pub use interact::{find_nearest_interactable, NearestInteractable};
 
 /// A Rhai engine that parses as Flint's does, with none of its API: what
@@ -50,20 +50,28 @@ pub struct ScriptEngine {
     /// Base directory for `import "name"` (`<scripts>/lib`). `None` until a
     /// scene sets it; the resolver then maps `import "x"` to `<lib>/x.rhai`.
     module_base: Option<ModuleBase>,
-    /// Each script's last `on_update`, ms, by source path: kept only while
-    /// [`set_update_timing`](Self::set_update_timing) is on (the perf
-    /// readout, Flint#120). Scripts sharing a file add up.
-    update_times: Option<Vec<(String, f32)>>,
+    /// Each callback's time, ms, by source path and callback, since the
+    /// host last took them: kept only while [`set_timing`](Self::set_timing)
+    /// is on (the perf readout, Flint#120; every callback since #703).
+    times: Option<output::Times>,
+    /// What a profiled callback's functions took (#1100), kept for its room
+    fn_took: Vec<crate::fn_times::Took>,
     /// Scripts' `random()` sequence, seeded once from the clock (#580)
     pub(crate) random: crate::random::ScriptRandom,
     /// What the declared API registered (ADR 0116); empty on the web
     registry: api::ApiRegistry,
+    /// Every script error of the run, counted (#693)
+    pub(crate) errors: crate::errors::ScriptErrors,
 }
 
 impl ScriptEngine {
     pub fn new() -> Self {
         let ctx = Arc::new(Mutex::new(ScriptCallContext::new()));
         let mut engine = compiler();
+        // print and debug to the log, never stdout (#703)
+        output::route_speech(&mut engine, &ctx);
+        // What a profiled script's function wrappers open (#1100)
+        crate::fn_times::register(&mut engine);
 
         // Register all API functions
         let mut registry = api::ApiRegistry::default();
@@ -78,9 +86,11 @@ impl ScriptEngine {
             ctx,
             scripts: HashMap::new(),
             module_base: None,
-            update_times: None,
+            times: None,
+            fn_took: Vec::new(),
             random,
             registry,
+            errors: crate::errors::ScriptErrors::new(),
         }
     }
 
@@ -158,24 +168,81 @@ impl ScriptEngine {
 
     /// Compile from a file path
     pub fn compile_file(&self, path: &std::path::Path) -> Result<AST, String> {
+        flint_core::scope!("script::compile", path);
         let source = vfs::read_to_string(path)
             .map_err(|e| format!("Failed to read {}: {}", path.display(), e))?;
         self.compile(&source)
     }
 
-    /// Add a compiled script for an entity
+    /// Add a compiled script for an entity. Its top-level statements (the
+    /// `let`s the callbacks share, and any call they make) run once, at the
+    /// next lending of the world ([`Self::lend`], which every callback batch
+    /// starts with), so a top-level `get_entity("door")` finds the door and
+    /// `self_entity()` is `entity` (#692).
     pub fn add_script(&mut self, entity: EntityId, ast: AST, source_path: String) {
+        self.add_named_script(entity, ast, source_path, "", None);
+    }
+
+    /// [`Self::add_script`], with the entity's name (see
+    /// [`Self::name_script`]) and the file it was found at (#693), so an
+    /// error in its top level (run at the next [`Self::lend`]) or in a
+    /// callback names them.
+    pub fn add_named_script(
+        &mut self,
+        entity: EntityId,
+        ast: AST,
+        source_path: String,
+        entity_name: &str,
+        file: Option<&str>,
+    ) {
         let mut instance = ScriptInstance::new(ast, source_path);
-        // Evaluate top-level statements to populate scope with module-level variables.
-        // Without this, `let x = 0.0;` at the top of a script never enters the Scope,
-        // so `call_fn` can't find it from within `on_init`/`on_update`.
-        if let Err(e) = self
-            .engine
-            .run_ast_with_scope(&mut instance.scope, &instance.ast)
-        {
-            tracing::warn!("module init error ({}): {}", instance.source_path, e);
+        instance.entity_name = entity_name.to_string();
+        if let Some(file) = file {
+            instance.file = file.to_string();
         }
         self.scripts.insert(entity, instance);
+    }
+
+    /// Lend `world` to scripts until the guard drops, first running the top
+    /// level of every script added since the last lending, in
+    /// [`Self::in_order`], each with `self_entity()` its own entity. A
+    /// failure there is counted as the script's `top level` error (#693).
+    pub(crate) fn lend(&mut self, world: &mut FlintWorld) -> WorldScope {
+        let scope = WorldScope::new(&self.ctx, world);
+        for entity in self.in_order(|s| s.top_level_pending) {
+            self.enter(entity);
+            let script = self.scripts.get_mut(&entity).unwrap();
+            script.top_level_pending = false;
+            if let Err(e) = self
+                .engine
+                .run_ast_with_scope(&mut script.scope, &script.ast)
+            {
+                let name = callbacks::name_of(script, entity);
+                self.errors.record(crate::errors::Failure::eval(
+                    &script.file,
+                    &name,
+                    crate::errors::TOP_LEVEL,
+                    &e,
+                ));
+            }
+            script.top_level_ran();
+        }
+        scope
+    }
+
+    /// Every script error of the run (#693).
+    pub fn errors(&self) -> &crate::errors::ScriptErrors {
+        &self.errors
+    }
+
+    /// Count an error found outside a callback: a load or compile error.
+    pub fn record_error(&mut self, failure: crate::errors::Failure) {
+        self.errors.record(failure);
+    }
+
+    /// `file` is being loaded again: its errors so far are off the screen.
+    pub(crate) fn file_reloaded(&mut self, file: &str) {
+        self.errors.file_reloaded(file);
     }
 
     /// Hot-reload an entity's script with a new AST (#634). The entity's scope
@@ -184,23 +251,37 @@ impl ScriptEngine {
     /// names it added (empty when there is no script on `entity`).
     ///
     /// The new source's top-level statements run once, into a scope of their
-    /// own, and only names the kept scope lacks are copied over. Running them
-    /// again has no cost a script doesn't already pay: `call_fn` evaluates a
-    /// script's top-level statements before every callback (that is how a
-    /// global `import` reaches `on_update`), rewinding the `let`s it pushes.
-    pub fn reload_script(&mut self, entity: EntityId, ast: AST) -> Vec<String> {
+    /// own, with `world` lent and `self_entity()` the script's entity, and
+    /// only names the kept scope lacks are copied over. A script whose top
+    /// level hasn't run yet takes the new source and runs it at the next
+    /// lending, as it would have.
+    pub fn reload_script(
+        &mut self,
+        world: &mut FlintWorld,
+        entity: EntityId,
+        ast: AST,
+    ) -> Vec<String> {
         let Some(script) = self.scripts.get_mut(&entity) else {
             return Vec::new();
         };
         script.hot_reload(ast);
-
+        // What failed in the old source is not what runs now
+        self.errors.file_reloaded(&script.file);
+        if script.top_level_pending {
+            return Vec::new();
+        }
+        let _world = self.lend(world);
+        self.enter(entity);
+        let script = self.scripts.get_mut(&entity).unwrap();
         let mut fresh = Scope::new();
         if let Err(e) = self.engine.run_ast_with_scope(&mut fresh, &script.ast) {
-            tracing::warn!(
-                "module init error on reload ({}): {}",
-                script.source_path,
-                e
-            );
+            let name = callbacks::name_of(script, entity);
+            self.errors.record(crate::errors::Failure::eval(
+                &script.file,
+                &name,
+                crate::errors::TOP_LEVEL,
+                &e,
+            ));
         }
         // A name the source declares twice appears twice, oldest first; the
         // last declaration is the one the callbacks would see.
@@ -223,6 +304,7 @@ impl ScriptEngine {
                 script.scope.push_dynamic(name.clone(), value.clone());
             }
         }
+        script.top_level_ran();
         new_vars.into_iter().map(|(name, ..)| name).collect()
     }
 
@@ -236,6 +318,7 @@ impl ScriptEngine {
     pub fn name_script(&mut self, entity: EntityId, name: &str) {
         if let Some(script) = self.scripts.get_mut(&entity) {
             script.entity_name = name.to_string();
+            script.speaker = None;
         }
     }
 
@@ -264,39 +347,59 @@ impl ScriptEngine {
         c.total_time = total_time;
     }
 
-    /// Time each script's `on_update` (see [`update_times`](Self::update_times)).
-    pub fn set_update_timing(&mut self, on: bool) {
-        self.update_times = on.then(Vec::new);
+    /// Time every callback from now on (see [`take_times`](Self::take_times)).
+    pub fn set_timing(&mut self, on: bool) {
+        self.times = on.then(output::Times::default);
     }
 
-    /// The last frame's time per script file, ms; empty unless timing is
-    /// on. The script system's own steps are there too, in brackets.
-    pub fn update_times(&self) -> &[(String, f32)] {
-        self.update_times.as_deref().unwrap_or(&[])
+    /// What was timed since the last take, ms: each callback under
+    /// `<source>:<callback>` (`scripts/hud.rhai:on_draw_ui`), scripts sharing
+    /// a file adding up, and the script system's own steps in brackets,
+    /// without the callbacks they ran. Empty unless timing is on.
+    pub fn take_times(&mut self) -> Vec<(String, f32)> {
+        self.times
+            .as_mut()
+            .map(output::Times::take)
+            .unwrap_or_default()
     }
 
-    /// Whether [`set_update_timing`](Self::set_update_timing) is on.
+    /// What each callback's functions took since the last take (#1100):
+    /// see [`crate::ScriptSystem::take_function_times`].
+    pub fn take_function_times(&mut self) -> Vec<output::FnTime> {
+        self.times
+            .as_mut()
+            .map(output::Times::take_functions)
+            .unwrap_or_default()
+    }
+
+    /// Whether [`set_timing`](Self::set_timing) is on.
     pub fn timing(&self) -> bool {
-        self.update_times.is_some()
+        self.times.is_some()
     }
 
-    /// Start a frame's times afresh.
-    pub(crate) fn clear_update_times(&mut self) {
-        if let Some(times) = &mut self.update_times {
-            times.clear();
+    /// A step of the script system begins now, when timing.
+    pub(crate) fn step_began(&self) -> Option<output::StepStart> {
+        self.times.as_ref().map(output::Times::begin)
+    }
+
+    /// The step `label` that began at `start` is done.
+    pub(crate) fn step_done(&mut self, label: &str, start: Option<output::StepStart>) {
+        if let (Some(times), Some(start)) = (&mut self.times, start) {
+            times.step(label, start);
         }
     }
 
-    /// Add the time since `began` to `label`'s, when timing.
-    pub(crate) fn add_update_time(&mut self, label: &str, began: web_time::Instant) {
-        let Some(times) = &mut self.update_times else {
-            return;
+    /// `entity`'s script is the one running: what `self_entity()` answers
+    /// and what its `print`s name. Whether the entity has a script.
+    pub(crate) fn enter(&mut self, entity: EntityId) -> bool {
+        let Some(script) = self.scripts.get_mut(&entity) else {
+            return false;
         };
-        let ms = began.elapsed().as_secs_f32() * 1000.0;
-        match times.iter_mut().find(|(p, _)| p == label) {
-            Some((_, t)) => *t += ms,
-            None => times.push((label.to_string(), ms)),
-        }
+        let speaker = script.speaker(entity);
+        let mut c = crate::lock_or_recover(&self.ctx);
+        c.current_entity = entity;
+        c.speaker = speaker;
+        true
     }
 
     /// Drain all accumulated draw commands (and reset the clip stack)
@@ -309,6 +412,13 @@ impl ScriptEngine {
     pub fn drain_world_lines(&self) -> Vec<flint_core::world_line::WorldLine> {
         let mut c = crate::lock_or_recover(&self.ctx);
         std::mem::take(&mut c.world_lines)
+    }
+
+    /// Take the screen field scripts filled this frame (#859); the next
+    /// frame starts with none.
+    pub fn drain_style_field(&self) -> flint_core::style_field::StyleField {
+        let mut c = crate::lock_or_recover(&self.ctx);
+        std::mem::take(&mut c.style_field)
     }
 
     /// Drain the depth-tested world text scripts queued this frame
@@ -331,11 +441,15 @@ impl ScriptEngine {
     /// Clear all script instances. Preserves the Rhai Engine and registered API.
     pub fn clear(&mut self) {
         self.scripts.clear();
+        // Kept for the run's count, off the screen
+        self.errors.scene_cleared();
         let mut c = crate::lock_or_recover(&self.ctx);
         c.commands.clear();
         c.draw_commands.clear();
+        c.style_field.clear();
         c.clip_stack.clear();
         c.ui_system.clear();
+        c.camera_rig.clear();
     }
 }
 
@@ -346,8 +460,20 @@ impl Default for ScriptEngine {
 }
 
 #[cfg(test)]
+mod callback_tests;
+#[cfg(test)]
+mod error_tests;
+#[cfg(test)]
+mod fn_time_tests;
+#[cfg(test)]
 mod hot_reload_tests;
+#[cfg(test)]
+mod output_tests;
 #[cfg(test)]
 pub(crate) mod test_support;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod top_level_tests;
+#[cfg(test)]
+mod ui_tests;

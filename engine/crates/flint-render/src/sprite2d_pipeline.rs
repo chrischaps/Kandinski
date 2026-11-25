@@ -10,8 +10,9 @@
 //! - Storage buffer instancing for efficient batched rendering
 //! - Layer-based Z-offset for draw ordering (depth write disabled)
 
+use crate::gpu_counts::CountedDevice;
+use crate::TrustedShader;
 use bytemuck::{Pod, Zeroable};
-use wgpu::util::DeviceExt;
 
 /// GPU instance data for a single 2D sprite — 80 bytes, 16-byte aligned (5 x vec4).
 #[repr(C)]
@@ -38,6 +39,8 @@ pub struct Sprite2dUniforms {
 
 /// A single 2D sprite batch draw call (one per texture group).
 pub struct Sprite2dBatch {
+    /// Held while its bind group draws from it.
+    #[allow(dead_code)]
     pub instance_buffer: wgpu::Buffer,
     pub instance_count: u32,
     pub texture_bind_group: wgpu::BindGroup,
@@ -47,6 +50,8 @@ pub struct Sprite2dBatch {
 /// The 2D sprite rendering pipeline.
 pub struct Sprite2dPipeline {
     pub pipeline: wgpu::RenderPipeline,
+    /// Held with the pipeline it was laid out for.
+    #[allow(dead_code)]
     pub uniform_bind_group_layout: wgpu::BindGroupLayout,
     pub instance_bind_group_layout: wgpu::BindGroupLayout,
     pub texture_bind_group_layout: wgpu::BindGroupLayout,
@@ -57,7 +62,7 @@ pub struct Sprite2dPipeline {
 
 impl Sprite2dPipeline {
     pub fn new(device: &wgpu::Device, format: wgpu::TextureFormat, sample_count: u32) -> Self {
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        let shader = device.create_trusted_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Sprite2D Shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("sprite2d_shader.wgsl").into()),
         });
@@ -121,24 +126,24 @@ impl Sprite2dPipeline {
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("Sprite2D Pipeline Layout"),
             bind_group_layouts: &[
-                &uniform_bind_group_layout,
-                &instance_bind_group_layout,
-                &texture_bind_group_layout,
+                Some(&uniform_bind_group_layout),
+                Some(&instance_bind_group_layout),
+                Some(&texture_bind_group_layout),
             ],
-            push_constant_ranges: &[],
+            immediate_size: 0,
         });
 
         // Alpha blending, depth test enabled but depth write DISABLED
         // (2D sprites rely on layer-based draw order, not depth buffer writes)
         let depth_stencil = wgpu::DepthStencilState {
             format: wgpu::TextureFormat::Depth32Float,
-            depth_write_enabled: false,
-            depth_compare: wgpu::CompareFunction::LessEqual,
+            depth_write_enabled: Some(false),
+            depth_compare: Some(wgpu::CompareFunction::LessEqual),
             stencil: wgpu::StencilState::default(),
             bias: wgpu::DepthBiasState::default(),
         };
 
-        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        let pipeline = device.create_render_pipeline_counted(&wgpu::RenderPipelineDescriptor {
             label: Some("Sprite2D Pipeline"),
             layout: Some(&pipeline_layout),
             vertex: wgpu::VertexState {
@@ -171,20 +176,21 @@ impl Sprite2dPipeline {
                 count: sample_count,
                 ..Default::default()
             },
-            multiview: None,
+            multiview_mask: None,
             cache: None,
         });
 
         // Shared quad index buffer (same as particle pipeline)
         let quad_indices: [u32; 6] = [0, 1, 2, 2, 1, 3];
-        let quad_index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Sprite2D Quad Index Buffer"),
-            contents: bytemuck::cast_slice(&quad_indices),
-            usage: wgpu::BufferUsages::INDEX,
-        });
+        let quad_index_buffer =
+            device.create_buffer_init_counted(&wgpu::util::BufferInitDescriptor {
+                label: Some("Sprite2D Quad Index Buffer"),
+                contents: bytemuck::cast_slice(&quad_indices),
+                usage: wgpu::BufferUsages::INDEX,
+            });
 
         // Persistent uniform buffer for view_proj
-        let uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        let uniform_buffer = device.create_buffer_init_counted(&wgpu::util::BufferInitDescriptor {
             label: Some("Sprite2D Uniform Buffer"),
             contents: bytemuck::cast_slice(&[Sprite2dUniforms {
                 view_proj: [[0.0; 4]; 4],
@@ -192,7 +198,7 @@ impl Sprite2dPipeline {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
 
-        let uniform_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        let uniform_bind_group = device.create_bind_group_counted(&wgpu::BindGroupDescriptor {
             layout: &uniform_bind_group_layout,
             entries: &[wgpu::BindGroupEntry {
                 binding: 0,

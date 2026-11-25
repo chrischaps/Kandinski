@@ -145,7 +145,10 @@ fn the_ported_modules_take_ints_for_numbers_and_whole_floats_for_ints() {
         assert_eq!(c.requests.render_mode, Some((1, 1.0)));
         assert_eq!(c.requests.camera.fov, Some(60.0));
         assert_eq!(c.requests.time_scale, Some(2.0));
-        assert_eq!(c.requests.fog_color, Some([1.0, 0.0, 0.0]));
+        assert_eq!(
+            c.requests.post.get("fog_color"),
+            Some(flint_schema::post_effects::PostValue::Rgb([1.0, 0.0, 0.0]))
+        );
         assert_eq!(c.commands.len(), 2, "the sound and the velocity");
     }
     let eid = flint_core::EntityId::from_raw(id as u64);
@@ -209,6 +212,34 @@ fn a_wrong_argument_names_the_function_the_parameter_and_the_kind() {
     assert!(err.contains("a number"), "{err}");
     assert!(err.contains("string"), "{err}");
     assert!(err.contains("line 2"), "{err}");
+}
+
+/// #680: a parent cycle from a script is a script error at its line, and
+/// nothing is stored (it used to be, and the next matrix walk overflowed).
+#[test]
+fn set_parent_refuses_a_cycle_with_a_script_error() {
+    let (engine, mut world, cube) = engine_and_world();
+    let lid = world.spawn("lid").unwrap().raw() as i64;
+    let err = eval::<()>(
+        &engine,
+        &mut world,
+        &format!(
+            "let x = 1;
+set_parent({cube}, {cube})"
+        ),
+    )
+    .unwrap_err();
+    assert!(
+        err.contains("set_parent: Parent cycle: `cube` can't be parented to itself"),
+        "{err}"
+    );
+    assert!(err.contains("line 2"), "{err}");
+
+    eval::<()>(&engine, &mut world, &format!("set_parent({lid}, {cube})")).unwrap();
+    let err = eval::<()>(&engine, &mut world, &format!("set_parent({cube}, {lid})")).unwrap_err();
+    assert!(err.contains("`cube` can't be parented to `lid`"), "{err}");
+    let parent: i64 = eval(&engine, &mut world, &format!("get_parent({cube})")).unwrap();
+    assert_eq!(parent, -1, "the refused link is not kept");
 }
 
 #[test]
@@ -359,6 +390,30 @@ fn no_world_is_a_script_error_not_a_panic() {
         .unwrap();
 }
 
+/// #692: no declared function can panic for want of a world. Each is
+/// called at every arity it has, with a sample of each kind and nothing
+/// lent (as a script's top level was, before it ran inside a lending): an
+/// answer or a script error, never a panic.
+#[test]
+fn no_function_panics_without_a_world() {
+    let engine = ScriptEngine::new();
+    let entries = engine.api_registry().entries().to_vec();
+    let mut panicked = Vec::new();
+    for e in &entries {
+        let args: Vec<String> = e.params.iter().map(|p| sample(p.kind, 1)).collect();
+        let src = format!("{}({})", e.name, args.join(", "));
+        let rhai = engine.rhai_engine();
+        let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = rhai.eval::<Dynamic>(&src);
+        }));
+        if ran.is_err() {
+            panicked.push(src);
+        }
+    }
+    assert!(entries.len() > 300, "{} functions", entries.len());
+    assert!(panicked.is_empty(), "panicked with no world: {panicked:#?}");
+}
+
 #[test]
 fn an_extension_declares_through_the_same_builder() {
     let mut system = crate::ScriptSystem::new();
@@ -416,17 +471,6 @@ fn an_extension_declares_through_the_same_builder() {
         let _: Dynamic = system.rhai_engine_mut().eval(&src).unwrap();
     }
     assert_eq!(world.get_transform(id).unwrap().position.y, 3.0);
-}
-
-#[test]
-fn every_callback_is_listed_at_its_arity() {
-    for &(name, arity) in crate::engine::CALLBACK_ARITIES {
-        let doc = super::registry::CALLBACKS
-            .iter()
-            .find(|c| c.name == name)
-            .unwrap_or_else(|| panic!("{name} has no listing"));
-        assert_eq!(doc.params.len(), arity, "{name}");
-    }
 }
 
 /// ADR 0116 step 2 is done: the engine registers nothing outside the
@@ -509,8 +553,13 @@ fn the_last_modules_take_ints_for_numbers_and_whole_floats_for_ints() {
     )
     .unwrap();
     assert_eq!(h, 0.0);
-    let gap: bool = eval(&engine, &mut world, &format!("spline_is_gap({id}, 0)")).unwrap();
-    assert!(!gap, "no spline_data: no gap");
+    let gap: rhai::Dynamic = eval(
+        &engine,
+        &mut world,
+        &format!("spline_point_attr({id}, \"gap_after\", 0)"),
+    )
+    .unwrap();
+    assert!(gap.is_unit(), "no spline_data: no attribute");
     // A fractional float is not an int
     let err = eval::<()>(&engine, &mut world, &format!("emit_burst({id}, 2.5)")).unwrap_err();
     assert!(
@@ -660,6 +709,8 @@ fn the_last_modules_are_declared_under_their_subsystems() {
         ("particle", "play_effect", 4),
         ("style", "tween_style_param", 5),
         ("style", "set_look", 1),
+        ("style", "set_look", 2),
+        ("style", "clear_look", 1),
         ("expression", "expression", 0),
         ("state", "register_state", 2),
         ("scene", "quit_game", 0),

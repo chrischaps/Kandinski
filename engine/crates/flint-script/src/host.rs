@@ -14,12 +14,15 @@
 //!
 //! Adding a command (`crates/flint-script/CLAUDE.md` has the recipe): a
 //! variant on `ScriptCommand`, the script function that queues it (in its
-//! `api/` module), and a method here with its default and its arm in
-//! [`apply`], which the compiler insists on. Then each host that can do it
+//! `api/` module), and a method here with its default, its arm in
+//! [`apply`] and its name in [`command_name`], which the compiler insists
+//! on. Then each host that can do it
 //! overrides the method; a headless capture that can't names it on its
 //! presentation-only list (`flint_player::PRESENTATION_ONLY`).
 
-use crate::context::{CameraOverrides, LogLevel, PostProcessOverrides, ScriptCommand};
+use crate::context::{
+    CameraOverrides, LogLevel, PostProcessOverrides, ScriptCommand, SoundPlay, SoundRef,
+};
 use flint_core::quality::QualitySettings;
 use flint_core::EntityId;
 use std::collections::BTreeSet;
@@ -44,27 +47,47 @@ pub trait ScriptHost {
     }
 
     // ── Sound ──
-    fn play_sound(&mut self, name: String, volume: f64, pitch: f64) {
+    /// `handle` is the script's name for the sound, which `stop_sound` and
+    /// `set_sound_volume` give back (#699).
+    fn play_sound(&mut self, handle: u64, name: String, play: SoundPlay) {
         self.unsupported("play_sound");
     }
     /// `distances` is `(min, max)` metres and `rolloff` the curve between,
     /// `None` for the engine's defaults.
     fn play_sound_at(
         &mut self,
+        handle: u64,
         name: String,
         position: (f64, f64, f64),
-        volume: f64,
-        pitch: f64,
+        play: SoundPlay,
         distances: Option<(f32, f32)>,
         rolloff: Option<f32>,
     ) {
         self.unsupported("play_sound_at");
     }
-    fn stop_sound(&mut self, name: String) {
+    /// Stop a sound a script started, or every one by that name, fading
+    /// over `fade` seconds.
+    fn stop_sound(&mut self, sound: SoundRef, fade: f64) {
         self.unsupported("stop_sound");
+    }
+    fn set_sound_volume(&mut self, handle: u64, volume: f64, fade: f64) {
+        self.unsupported("set_sound_volume");
     }
     fn set_audio_lowpass(&mut self, cutoff_hz: f32) {
         self.unsupported("set_audio_lowpass");
+    }
+    /// A mixer bus's volume, by the bus's name (#730).
+    fn set_bus_volume(&mut self, bus: String, volume: f64) {
+        self.unsupported("set_bus_volume");
+    }
+    /// The player's own volume for a bus, by name, saved between runs
+    /// (#1217).
+    fn set_user_bus_volume(&mut self, bus: String, volume: f64) {
+        self.unsupported("set_user_bus_volume");
+    }
+    /// A mixer bus's own low-pass cutoff, Hz, by the bus's name (#1218).
+    fn set_bus_lowpass(&mut self, bus: String, hz: f64) {
+        self.unsupported("set_bus_lowpass");
     }
 
     // ── Events and the log ──
@@ -114,6 +137,16 @@ pub trait ScriptHost {
     ) {
         self.unsupported("tween_style_param");
     }
+    fn tween(
+        &mut self,
+        entity: EntityId,
+        path: String,
+        target: toml::Value,
+        seconds: f64,
+        easing: flint_core::tween::Easing,
+    ) {
+        self.unsupported("tween");
+    }
     fn clear_entity_style(&mut self, entity: EntityId) {
         self.unsupported("clear_entity_style");
     }
@@ -158,9 +191,14 @@ pub trait ScriptHost {
     fn rumble(&mut self, pad: i64, strength: f64, seconds: f64) {
         self.unsupported("rumble");
     }
-    /// `set_look(name)`, or `clear_look()` with `None`.
-    fn set_look(&mut self, name: Option<String>) {
+    /// `set_look(name[, seconds])`, or `clear_look([seconds])` with `None`;
+    /// `seconds` 0 is a cut, above it a cross-fade (#496).
+    fn set_look(&mut self, name: Option<String>, seconds: f64) {
         self.unsupported("set_look");
+    }
+    /// `prepare_look(name)` (#1121): build the look's styles ahead.
+    fn prepare_look(&mut self, name: String) {
+        self.unsupported("prepare_look");
     }
 
     // ── The frame: camera, post-processing, render settings ──
@@ -168,10 +206,7 @@ pub trait ScriptHost {
         self.unsupported("set_camera_*");
     }
     fn set_post_process(&mut self, post: PostProcessOverrides) {
-        self.unsupported("set_vignette and the post-process overrides");
-    }
-    fn set_fog_color(&mut self, color: [f32; 3]) {
-        self.unsupported("set_fog_color");
+        self.unsupported("set_post");
     }
     fn set_render_mode(&mut self, mode: Option<(u32, f32)>, params: Option<[f32; 4]>) {
         self.unsupported("set_render_mode");
@@ -239,20 +274,24 @@ pub trait ScriptHost {
 pub fn apply<H: ScriptHost + ?Sized>(host: &mut H, cmd: ScriptCommand) {
     use ScriptCommand as C;
     match cmd {
-        C::PlaySound {
-            name,
-            volume,
-            pitch,
-        } => host.play_sound(name, volume, pitch),
+        C::PlaySound { handle, name, play } => host.play_sound(handle, name, play),
         C::PlaySoundAt {
+            handle,
             name,
             position,
-            volume,
-            pitch,
+            play,
             distances,
             rolloff,
-        } => host.play_sound_at(name, position, volume, pitch, distances, rolloff),
-        C::StopSound { name } => host.stop_sound(name),
+        } => host.play_sound_at(handle, name, position, play, distances, rolloff),
+        C::StopSound { sound, fade } => host.stop_sound(sound, fade),
+        C::SetBusVolume { bus, volume } => host.set_bus_volume(bus, volume),
+        C::SetUserBusVolume { bus, volume } => host.set_user_bus_volume(bus, volume),
+        C::SetBusLowpass { bus, hz } => host.set_bus_lowpass(bus, hz),
+        C::SetSoundVolume {
+            handle,
+            volume,
+            fade,
+        } => host.set_sound_volume(handle, volume, fade),
         C::SetAudioLowpass { cutoff_hz } => host.set_audio_lowpass(cutoff_hz),
         C::FireEvent { name, data } => host.fire_event(name, data),
         C::Log { level, message } => host.log(level, message),
@@ -281,6 +320,13 @@ pub fn apply<H: ScriptHost + ?Sized>(host: &mut H, cmd: ScriptCommand) {
             seconds,
             easing,
         } => host.tween_style_param(entity, param, target, seconds, easing),
+        C::Tween {
+            entity,
+            path,
+            target,
+            seconds,
+            easing,
+        } => host.tween(entity, path, target, seconds, easing),
         C::ClearEntityStyle { entity } => host.clear_entity_style(entity),
         C::SetPostStyle { style, enabled } => host.set_post_style(style, enabled),
         C::SetPostStyleParam {
@@ -307,10 +353,10 @@ pub fn apply<H: ScriptHost + ?Sized>(host: &mut H, cmd: ScriptCommand) {
             strength,
             seconds,
         } => host.rumble(pad, strength, seconds),
-        C::SetLook { name } => host.set_look(name),
+        C::SetLook { name, seconds } => host.set_look(name, seconds),
+        C::PrepareLook { name } => host.prepare_look(name),
         C::SetCamera { camera } => host.set_camera(camera),
         C::SetPostProcess { post } => host.set_post_process(post),
-        C::SetFogColor { color } => host.set_fog_color(color),
         C::SetRenderMode { mode, params } => host.set_render_mode(mode, params),
         C::SetLodScales {
             lod_scale,
@@ -336,6 +382,70 @@ pub fn apply<H: ScriptHost + ?Sized>(host: &mut H, cmd: ScriptCommand) {
         C::UnloadChunk { chunk_id } => host.unload_chunk(chunk_id),
         C::SetVelocity2D { entity, vx, vy } => host.set_velocity_2d(entity, vx, vy),
     }
+}
+
+/// The script function `cmd` is, as its [`ScriptHost`] default names it to
+/// [`ScriptHost::unsupported`]; `None` for `log`, which every host does.
+///
+/// A table, so asking carries nothing out (#1013): a capture's refusal used
+/// to find the name by applying a copy of the command to a probe host, whose
+/// default `log` then wrote each script line a second time. A test in
+/// flint-player (`headless_host_tests::the_name_table_is_what_each_default_reports`)
+/// holds every variant's entry to what its default reports.
+pub fn command_name(cmd: &ScriptCommand) -> Option<&'static str> {
+    use ScriptCommand as C;
+    Some(match cmd {
+        C::PlaySound { .. } => "play_sound",
+        C::PlaySoundAt { .. } => "play_sound_at",
+        C::StopSound { .. } => "stop_sound",
+        C::SetSoundVolume { .. } => "set_sound_volume",
+        C::SetBusVolume { .. } => "set_bus_volume",
+        C::SetUserBusVolume { .. } => "set_user_bus_volume",
+        C::SetBusLowpass { .. } => "set_bus_lowpass",
+        C::SetAudioLowpass { .. } => "set_audio_lowpass",
+        C::FireEvent { .. } => "fire_event",
+        C::Log { .. } => return None,
+        C::EmitBurst { .. } => "emit_burst",
+        C::PlayEffect { .. } => "play_effect",
+        C::StopEffect { .. } => "stop_effect",
+        C::SetEffectParam { .. } => "set_effect_param",
+        C::SetEntityStyle { .. } => "set_entity_style",
+        C::SetStyleParam { .. } => "set_style_param",
+        C::TweenStyleParam { .. } => "tween_style_param",
+        C::Tween { .. } => "tween",
+        C::ClearEntityStyle { .. } => "clear_entity_style",
+        C::SetPostStyle { .. } => "set_post_style",
+        C::SetPostStyleParam { .. } => "set_post_style_param",
+        C::TweenPostStyleParam { .. } => "tween_post_style_param",
+        C::ResetPostStyle { .. } => "reset_post_style",
+        C::ResetStyleHistory => "reset_style_history",
+        C::SetCameraCutDetection { .. } => "set_camera_cut_detection",
+        C::SetPanels { .. } => "set_panels",
+        C::SetPanel { .. } => "set_panel",
+        C::RemovePanel { .. } => "remove_panel",
+        C::ClearPanels => "clear_panels",
+        C::Rumble { .. } => "rumble",
+        C::SetLook { .. } => "set_look",
+        C::PrepareLook { .. } => "prepare_look",
+        C::SetCamera { .. } => "set_camera_*",
+        C::SetPostProcess { .. } => "set_post",
+        C::SetRenderMode { .. } => "set_render_mode",
+        C::SetLodScales { .. } => "set_lod_scale",
+        C::SetQuality { .. } => "set_quality",
+        C::SetTimeScale { .. } => "set_time_scale",
+        C::SetTouchControls { .. } => "set_touch_controls",
+        C::SetCursorCaptured { .. } => "set_cursor_captured",
+        C::Module(command) => command.function(),
+        C::LoadScene { .. } => "load_scene",
+        C::ReloadScene => "reload_scene",
+        C::QuitGame => "quit_game",
+        C::PushState { .. } => "push_state",
+        C::PopState => "pop_state",
+        C::ReplaceState { .. } => "replace_state",
+        C::LoadChunk { .. } => "load_chunk",
+        C::UnloadChunk { .. } => "unload_chunk",
+        C::SetVelocity2D { .. } => "set_velocity_2d",
+    })
 }
 
 /// [`apply`] each of `commands`, in order.
@@ -377,7 +487,7 @@ mod tests {
         fn unsupported(&mut self, command: &'static str) {
             self.unsupported.push(command);
         }
-        fn play_sound(&mut self, name: String, _volume: f64, _pitch: f64) {
+        fn play_sound(&mut self, _handle: u64, name: String, _play: crate::SoundPlay) {
             self.sounds.push(name);
         }
     }
@@ -389,9 +499,9 @@ mod tests {
             &mut host,
             [
                 ScriptCommand::PlaySound {
+                    handle: 1,
                     name: "ding".into(),
-                    volume: 1.0,
-                    pitch: 1.0,
+                    play: crate::SoundPlay::default(),
                 },
                 ScriptCommand::QuitGame,
                 ScriptCommand::SetTimeScale { scale: 0.5 },
@@ -411,7 +521,10 @@ mod tests {
         let mut c = ScriptCallContext::new();
         c.commands.push(ScriptCommand::QuitGame);
         c.requests.camera.fov = Some(50.0);
-        c.requests.post.vignette = Some(0.3);
+        c.requests
+            .post
+            .set("vignette_intensity", &0.3.into())
+            .unwrap();
         c.requests.time_scale = Some(0.25);
         c.requests.lod_scale = Some(0.5);
         let cmds = c.take_commands();

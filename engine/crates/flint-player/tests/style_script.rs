@@ -23,13 +23,22 @@ struct Styles<'a> {
 
 impl ScriptHost for Styles<'_> {
     fn set_entity_style(&mut self, entity: EntityId, style: String) {
-        let r = self.tweens.set_entity_style(self.world, entity, &style);
+        let r = self.tweens.set_entity_style(
+            self.world,
+            &flint_render::stylize::StyleRegistry::new(),
+            entity,
+            &style,
+        );
         self.out.push(r);
     }
     fn set_style_param(&mut self, entity: EntityId, param: String, value: toml::Value) {
-        let r = self
-            .tweens
-            .set_style_param(self.world, entity, &param, value);
+        let r = self.tweens.set_style_param(
+            self.world,
+            &flint_render::stylize::StyleRegistry::new(),
+            entity,
+            &param,
+            value,
+        );
         self.out.push(r);
     }
     fn tween_style_param(
@@ -42,6 +51,7 @@ impl ScriptHost for Styles<'_> {
     ) {
         let r = self.tweens.tween(
             self.world,
+            &flint_render::stylize::StyleRegistry::new(),
             self.config,
             entity,
             &param,
@@ -52,7 +62,11 @@ impl ScriptHost for Styles<'_> {
         self.out.push(r);
     }
     fn clear_entity_style(&mut self, entity: EntityId) {
-        let r = self.tweens.clear_entity_style(self.world, entity);
+        let r = self.tweens.clear_entity_style(
+            self.world,
+            &flint_render::stylize::StyleRegistry::new(),
+            entity,
+        );
         self.out.push(r);
     }
 }
@@ -150,6 +164,7 @@ fn on_update() {
 "#;
 
 #[test]
+#[allow(clippy::disallowed_methods)] // a test asserts on the TOML exactly as written
 fn a_script_sets_animates_and_clears_a_style() {
     let mut world = FlintWorld::new();
     let barrel = world.spawn("barrel").unwrap();
@@ -198,7 +213,7 @@ fn tween_frame(
     config: &PostProcessConfig,
     dt: f64,
 ) -> (Vec<GameEvent>, Vec<String>) {
-    let step = tweens.step(world, dt);
+    let step = tweens.step(world, &flint_render::stylize::StyleRegistry::new(), dt);
     let (mut events, mut failures) = (step.events, step.failures);
     engine.call_updates(world);
     let commands = engine.drain_commands();
@@ -212,6 +227,7 @@ fn tween_frame(
     (events, failures)
 }
 
+#[allow(clippy::disallowed_methods)] // a test asserts on the TOML exactly as written
 fn number(world: &FlintWorld, id: flint_core::EntityId, field: &str) -> f64 {
     let c = world.get_component(id, "ascii_style").expect("styled");
     let v = c
@@ -260,6 +276,7 @@ fn on_update() {
 "##;
 
 #[test]
+#[allow(clippy::disallowed_methods)] // a test asserts on the TOML exactly as written
 fn a_tween_steps_on_game_time_and_says_when_it_is_done() {
     let mut world = FlintWorld::new();
     let barrel = world.spawn("barrel").unwrap();
@@ -345,13 +362,21 @@ fn a_tween_starts_from_the_scene_table_and_gives_way_to_the_script() {
     );
     // No cell of its own: the tween starts at the scene's 10
     apply(&mut tweens, &mut world, tween("cell", 20.0, 1.0));
-    tweens.step(&mut world, 0.5);
+    tweens.step(
+        &mut world,
+        &flint_render::stylize::StyleRegistry::new(),
+        0.5,
+    );
     assert_eq!(number(&world, barrel, "cell"), 15.0);
 
     // A second tween of the same setting takes over from 15
     apply(&mut tweens, &mut world, tween("cell", 5.0, 1.0));
     assert_eq!(tweens.len(), 1);
-    tweens.step(&mut world, 0.5);
+    tweens.step(
+        &mut world,
+        &flint_render::stylize::StyleRegistry::new(),
+        0.5,
+    );
     assert_eq!(number(&world, barrel, "cell"), 10.0);
 
     // A set_style_param of it stops the tween where the script put it
@@ -365,7 +390,11 @@ fn a_tween_starts_from_the_scene_table_and_gives_way_to_the_script() {
         },
     );
     assert!(!tweens.is_tweening(barrel, "cell"));
-    tweens.step(&mut world, 0.5);
+    tweens.step(
+        &mut world,
+        &flint_render::stylize::StyleRegistry::new(),
+        0.5,
+    );
     assert_eq!(number(&world, barrel, "cell"), 30.0);
 
     // Zero seconds is there at once, and done at once
@@ -514,6 +543,7 @@ fn on_update() {
 "##;
 
 #[test]
+#[allow(clippy::disallowed_methods)] // a test asserts on the TOML exactly as written
 fn a_script_reads_back_its_style_and_an_inherited_one() {
     use flint_player::SceneStyles;
     use flint_render::PostProcessConfig;
@@ -527,7 +557,10 @@ fn a_script_reads_back_its_style_and_an_inherited_one() {
     let mut engine = ScriptEngine::new();
     let mut config = PostProcessConfig::default();
     config.styles.set_param("ascii", "glow", 0.4);
-    engine.set_style_reader(Arc::new(SceneStyles::new(config)));
+    engine.set_style_reader(Arc::new(SceneStyles::new(
+        config,
+        flint_render::stylize::StyleRegistry::new(),
+    )));
     director(&mut engine, &mut world, READBACK);
     let director = world.get_id("director").unwrap();
     let story = |world: &FlintWorld, key: &str| -> toml::Value {
@@ -593,4 +626,67 @@ fn on_update() {
         style.and_then(|v| v.as_str().map(str::to_string)),
         Some(String::new())
     );
+}
+
+/// A script asking for a value past its range gets it clamped, as before,
+/// and now hears it (#492): the command is applied, with a warning naming
+/// the entity, the setting and the range. A tween's target says it once,
+/// when the tween starts.
+#[test]
+fn a_value_past_its_range_is_clamped_and_says_so() {
+    let mut world = FlintWorld::new();
+    let barrel = world.spawn("barrel").unwrap();
+    let mut tweens = StyleTweens::default();
+    let config = PostProcessConfig::default();
+    let mut send = |world: &mut FlintWorld, command| one(&mut tweens, world, &config, command);
+    send(
+        &mut world,
+        ScriptCommand::SetEntityStyle {
+            entity: barrel,
+            style: "ascii".into(),
+        },
+    );
+    let set = |param: &str, value: toml::Value| ScriptCommand::SetStyleParam {
+        entity: barrel,
+        param: param.into(),
+        value,
+    };
+    match send(&mut world, set("cell", 400_i64.into())) {
+        StyleApplied::Clamped(None, note) => assert_eq!(
+            note,
+            "set_style_param: ascii on 'barrel': cell=400 is outside its range 4..32; \
+             clamped to 32"
+        ),
+        other => panic!("a clamp expected, got {other:?}"),
+    }
+    assert_eq!(number(&world, barrel, "cell"), 32.0);
+    assert!(matches!(
+        send(&mut world, set("cell", 12_i64.into())),
+        StyleApplied::Done(None)
+    ));
+
+    let tween = ScriptCommand::TweenStyleParam {
+        entity: barrel,
+        param: "glow".into(),
+        target: 9.0.into(),
+        seconds: 1.0,
+        easing: "linear".into(),
+    };
+    match send(&mut world, tween) {
+        StyleApplied::Clamped(None, note) => {
+            assert!(
+                note.starts_with("tween_style_param: ascii on 'barrel': glow=9"),
+                "{note}"
+            )
+        }
+        other => panic!("a clamp expected, got {other:?}"),
+    }
+    // Its steps stay inside the range: no warning a frame
+    let step = tweens.step(
+        &mut world,
+        &flint_render::stylize::StyleRegistry::new(),
+        1.0,
+    );
+    assert!(step.failures.is_empty(), "{:?}", step.failures);
+    assert_eq!(number(&world, barrel, "glow"), 2.0);
 }

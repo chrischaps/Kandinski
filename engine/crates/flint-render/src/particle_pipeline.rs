@@ -6,9 +6,10 @@
 //! is grown on demand and written once per frame (ADR 0068). Instance data
 //! is the same `#[repr(C)]` type the simulation packs — no per-crate copy.
 
+use crate::gpu_counts::{CountedDevice, CountedQueue};
+use crate::TrustedShader;
 use bytemuck::{Pod, Zeroable};
 use std::sync::Arc;
-use wgpu::util::DeviceExt;
 
 pub use flint_particles::{ParticleBlendMode, ParticleInstance};
 
@@ -70,9 +71,9 @@ const INITIAL_INSTANCE_CAPACITY: u32 = 1024;
 
 impl ParticlePipeline {
     pub fn new(device: &wgpu::Device, format: wgpu::TextureFormat, sample_count: u32) -> Self {
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        let shader = device.create_trusted_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Particle Shader"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("particle_shader.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(crate::wgsl_sources::PARTICLE.into()),
         });
 
         // Group 0: ParticleUniforms (camera data)
@@ -134,24 +135,24 @@ impl ParticlePipeline {
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("Particle Pipeline Layout"),
             bind_group_layouts: &[
-                &uniform_bind_group_layout,
-                &instance_bind_group_layout,
-                &texture_bind_group_layout,
+                Some(&uniform_bind_group_layout),
+                Some(&instance_bind_group_layout),
+                Some(&texture_bind_group_layout),
             ],
-            push_constant_ranges: &[],
+            immediate_size: 0,
         });
 
         // Shared depth stencil: depth test enabled, depth write DISABLED (translucent)
         let depth_stencil = wgpu::DepthStencilState {
             format: wgpu::TextureFormat::Depth32Float,
-            depth_write_enabled: false,
-            depth_compare: wgpu::CompareFunction::Less,
+            depth_write_enabled: Some(false),
+            depth_compare: Some(wgpu::CompareFunction::Less),
             stencil: wgpu::StencilState::default(),
             bias: wgpu::DepthBiasState::default(),
         };
 
         let make = |mode: ParticleBlendMode| {
-            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            device.create_render_pipeline_counted(&wgpu::RenderPipelineDescriptor {
                 label: Some(&format!("Particle {} Pipeline", mode.as_str())),
                 layout: Some(&pipeline_layout),
                 vertex: wgpu::VertexState {
@@ -184,7 +185,7 @@ impl ParticlePipeline {
                     count: sample_count,
                     ..Default::default()
                 },
-                multiview: None,
+                multiview_mask: None,
                 cache: None,
             })
         };
@@ -216,7 +217,7 @@ impl ParticlePipeline {
         sampler: &wgpu::Sampler,
         label: &str,
     ) -> wgpu::BindGroup {
-        device.create_bind_group(&wgpu::BindGroupDescriptor {
+        device.create_bind_group_counted(&wgpu::BindGroupDescriptor {
             layout: &self.texture_bind_group_layout,
             entries: &[
                 wgpu::BindGroupEntry {
@@ -237,14 +238,15 @@ impl ParticleBuffers {
     pub fn new(device: &wgpu::Device, pipeline: &ParticlePipeline) -> Self {
         // Shared quad index buffer
         let quad_indices: [u32; 6] = [0, 1, 2, 2, 1, 3];
-        let quad_index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Particle Quad Index Buffer"),
-            contents: bytemuck::cast_slice(&quad_indices),
-            usage: wgpu::BufferUsages::INDEX,
-        });
+        let quad_index_buffer =
+            device.create_buffer_init_counted(&wgpu::util::BufferInitDescriptor {
+                label: Some("Particle Quad Index Buffer"),
+                contents: bytemuck::cast_slice(&quad_indices),
+                usage: wgpu::BufferUsages::INDEX,
+            });
 
         // Persistent uniform buffer for camera data
-        let uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        let uniform_buffer = device.create_buffer_init_counted(&wgpu::util::BufferInitDescriptor {
             label: Some("Particle Uniform Buffer"),
             contents: bytemuck::cast_slice(&[ParticleUniforms {
                 view_proj: [[0.0; 4]; 4],
@@ -256,7 +258,7 @@ impl ParticleBuffers {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
 
-        let uniform_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        let uniform_bind_group = device.create_bind_group_counted(&wgpu::BindGroupDescriptor {
             layout: &pipeline.uniform_bind_group_layout,
             entries: &[wgpu::BindGroupEntry {
                 binding: 0,
@@ -286,13 +288,13 @@ impl ParticleBuffers {
         layout: &wgpu::BindGroupLayout,
         capacity: u32,
     ) -> (wgpu::Buffer, wgpu::BindGroup) {
-        let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        let buffer = device.create_buffer_counted(&wgpu::BufferDescriptor {
             label: Some("Particle Instance Buffer"),
             size: capacity as u64 * std::mem::size_of::<ParticleInstance>() as u64,
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        let bind_group = device.create_bind_group_counted(&wgpu::BindGroupDescriptor {
             layout,
             entries: &[wgpu::BindGroupEntry {
                 binding: 0,
@@ -305,10 +307,6 @@ impl ParticleBuffers {
 
     pub fn instance_bind_group(&self) -> &wgpu::BindGroup {
         &self.instance_bind_group
-    }
-
-    pub fn instance_capacity(&self) -> u32 {
-        self.instance_capacity
     }
 
     /// Grow the shared instance buffer (next power of two) so it holds at
@@ -337,7 +335,7 @@ impl ParticleBuffers {
             return;
         }
         debug_assert!(instances.len() as u32 <= self.instance_capacity);
-        queue.write_buffer(&self.instance_buffer, 0, bytemuck::cast_slice(instances));
+        queue.write_buffer_counted(&self.instance_buffer, 0, bytemuck::cast_slice(instances));
     }
 }
 
@@ -376,6 +374,13 @@ pub fn blend_state(mode: ParticleBlendMode) -> wgpu::BlendState {
 
 /// Order draws for correct blending: order-dependent modes far-to-near
 /// (stable on the caller's deterministic order), additive last.
+///
+/// Emitters on one origin tie exactly, and the caller's order decides
+/// them: `ParticleSync` hands its instances over by `EntityId`, which is
+/// the name's rank for a scene's entities (#688). The `style-veil` golden
+/// has such a tie (`blaze` and the campfire's alpha emitters), and drew one
+/// of two images run to run while ids followed `HashMap` spawn order
+/// (#858; `crates/flint-cli/tests/particle_tie_order.rs`).
 pub fn sort_particle_draws(draws: &mut [ParticleDrawCall]) {
     draws.sort_by(|a, b| {
         let ka = a.blend.is_order_independent();

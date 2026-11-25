@@ -1,11 +1,13 @@
 //! The `animation` module: clips, blends, layers and sequences, written
 //! straight onto the entity's `animator` component, which the animation
-//! system follows next frame (ADR 0116).
+//! system follows next frame (ADR 0116), through `flint_animation::animator`
+//! (the one file that spells the animator's keys, #733).
 
 use super::builder::kind::{Entity, Int, Map, Num, Str};
 use super::builder::{CallResult, ScriptApi};
 use super::opts::read_opts;
-use flint_core::components as comp;
+use flint_animation::animator::{self, LayerEdit};
+use flint_core::tween::Easing;
 use flint_core::EntityId;
 use flint_ecs::FlintWorld;
 
@@ -15,27 +17,27 @@ pub(crate) fn register(api: &mut ScriptApi) {
     // ── Clips ──
     m.func(
         "play_clip",
-        "Start playing a named clip on the entity's animator.",
+        "Play a named clip on the entity's animator: a new clip cuts to its start (cancelling a crossfade), a stopped one resumes, a finished one-shot replays.",
     )
     .arg("id", Entity)
     .arg("clip", Str)
     .run(|call, (id, clip)| {
-        if let Some(comps) = call.world_mut()?.get_components_mut(id) {
-            comps.set_field(
-                comp::ANIMATOR,
-                "clip",
-                toml::Value::String(clip.to_string()),
-            );
-            comps.set_field(comp::ANIMATOR, "playing", toml::Value::Boolean(true));
+        if let Some(mut comps) = call.world_mut()?.get_components_mut(id) {
+            // A crossfade still in flight would otherwise finish on its
+            // target and override this clip (#732).
+            animator::write(&mut comps)
+                .clip(&clip)
+                .playing(true)
+                .no_blend();
         }
         Ok(())
     });
 
-    m.func("stop_clip", "Stop the entity's animator.")
+    m.func("stop_clip", "Pause the entity's animator: its clip holds the current frame (layers keep their own clocks).")
         .arg("id", Entity)
         .run(|call, (id,)| {
-            if let Some(comps) = call.world_mut()?.get_components_mut(id) {
-                comps.set_field(comp::ANIMATOR, "playing", toml::Value::Boolean(false));
+            if let Some(mut comps) = call.world_mut()?.get_components_mut(id) {
+                animator::write(&mut comps).playing(false);
             }
             Ok(())
         });
@@ -48,17 +50,25 @@ pub(crate) fn register(api: &mut ScriptApi) {
     .arg("clip", Str)
     .arg("duration", Num)
     .run(|call, (id, clip, duration)| {
-        if let Some(comps) = call.world_mut()?.get_components_mut(id) {
-            comps.set_field(
-                comp::ANIMATOR,
-                "blend_target",
-                toml::Value::String(clip.to_string()),
-            );
-            comps.set_field(
-                comp::ANIMATOR,
-                "blend_duration",
-                toml::Value::Float(duration),
-            );
+        if let Some(mut comps) = call.world_mut()?.get_components_mut(id) {
+            animator::write(&mut comps).blend(&clip, duration);
+        }
+        Ok(())
+    });
+
+    m.func(
+        "blend_to",
+        "Crossfade to another clip over seconds, eased: linear, smooth, ease_in, ease_out or ease_in_out (later crossfades keep it).",
+    )
+    .arg("id", Entity)
+    .arg("clip", Str)
+    .arg("duration", Num)
+    .arg("easing", Str)
+    .run(|call, (id, clip, duration, easing)| {
+        let easing =
+            Easing::from_name(&easing).ok_or_else(|| call.error(Easing::refusal(&easing)))?;
+        if let Some(mut comps) = call.world_mut()?.get_components_mut(id) {
+            animator::write(&mut comps).blend_eased(&clip, duration, easing);
         }
         Ok(())
     });
@@ -70,8 +80,8 @@ pub(crate) fn register(api: &mut ScriptApi) {
     .arg("id", Entity)
     .arg("speed", Num)
     .run(|call, (id, speed)| {
-        if let Some(comps) = call.world_mut()?.get_components_mut(id) {
-            comps.set_field(comp::ANIMATOR, "speed", toml::Value::Float(speed));
+        if let Some(mut comps) = call.world_mut()?.get_components_mut(id) {
+            animator::write(&mut comps).speed(speed);
         }
         Ok(())
     });
@@ -88,11 +98,8 @@ pub(crate) fn register(api: &mut ScriptApi) {
     .arg("clip", Str)
     .arg("weight", Num)
     .run(|call, (id, index, clip, weight)| {
-        edit_anim_layer(call.world_mut()?, id, index, |t| {
-            t.insert("clip".into(), toml::Value::String(clip.to_string()));
-            t.insert("mode".into(), toml::Value::String("additive".into()));
-            t.insert("mask".into(), toml::Value::String(String::new()));
-            flint_animation::layer_edit::set_weight(t, weight);
+        edit_anim_layer(call.world_mut()?, id, index, |layer| {
+            layer.clip(&clip).mode("additive").mask("").weight(weight);
         })
     });
 
@@ -109,11 +116,8 @@ pub(crate) fn register(api: &mut ScriptApi) {
         let o = read_opts(call.ctx(), "set_anim_layer", &map, &["mode", "mask"]);
         let mode = o.mode.unwrap_or_else(|| "additive".into());
         let mask = o.mask.unwrap_or_default();
-        edit_anim_layer(call.world_mut()?, id, index, |t| {
-            t.insert("clip".into(), toml::Value::String(clip.to_string()));
-            t.insert("mode".into(), toml::Value::String(mode));
-            t.insert("mask".into(), toml::Value::String(mask));
-            flint_animation::layer_edit::set_weight(t, weight);
+        edit_anim_layer(call.world_mut()?, id, index, |layer| {
+            layer.clip(&clip).mode(&mode).mask(&mask).weight(weight);
         })
     });
 
@@ -129,11 +133,8 @@ pub(crate) fn register(api: &mut ScriptApi) {
     .arg("mask", Str)
     .deprecated("use set_anim_layer(id, index, clip, weight, #{mode, mask})")
     .run(|call, (id, index, clip, weight, mode, mask)| {
-        edit_anim_layer(call.world_mut()?, id, index, |t| {
-            t.insert("clip".into(), toml::Value::String(clip.to_string()));
-            t.insert("mode".into(), toml::Value::String(mode.to_string()));
-            t.insert("mask".into(), toml::Value::String(mask.to_string()));
-            flint_animation::layer_edit::set_weight(t, weight);
+        edit_anim_layer(call.world_mut()?, id, index, |layer| {
+            layer.clip(&clip).mode(&mode).mask(&mask).weight(weight);
         })
     });
 
@@ -145,8 +146,8 @@ pub(crate) fn register(api: &mut ScriptApi) {
     .arg("index", Int)
     .arg("weight", Num)
     .run(|call, (id, index, weight)| {
-        edit_anim_layer(call.world_mut()?, id, index, |t| {
-            flint_animation::layer_edit::set_weight(t, weight);
+        edit_anim_layer(call.world_mut()?, id, index, |layer| {
+            layer.weight(weight);
         })
     });
 
@@ -157,9 +158,8 @@ pub(crate) fn register(api: &mut ScriptApi) {
     .arg("id", Entity)
     .arg("index", Int)
     .run(|call, (id, index)| {
-        edit_anim_layer(call.world_mut()?, id, index, |t| {
-            t.insert("clip".into(), toml::Value::String(String::new()));
-            t.insert("fade_duration".into(), toml::Value::Float(0.0));
+        edit_anim_layer(call.world_mut()?, id, index, |layer| {
+            layer.clip("").no_fade();
         })
     });
 
@@ -172,8 +172,25 @@ pub(crate) fn register(api: &mut ScriptApi) {
     .arg("weight", Num)
     .arg("duration", Num)
     .run(|call, (id, index, weight, duration)| {
-        edit_anim_layer(call.world_mut()?, id, index, |t| {
-            flint_animation::layer_edit::fade_weight(t, weight, duration);
+        edit_anim_layer(call.world_mut()?, id, index, |layer| {
+            layer.fade(weight, duration);
+        })
+    });
+
+    m.func(
+        "fade_anim_layer",
+        "Ramp a layer's weight over seconds, eased: linear, smooth, ease_in, ease_out or ease_in_out.",
+    )
+    .arg("id", Entity)
+    .arg("index", Int)
+    .arg("weight", Num)
+    .arg("duration", Num)
+    .arg("easing", Str)
+    .run(|call, (id, index, weight, duration, easing)| {
+        let easing =
+            Easing::from_name(&easing).ok_or_else(|| call.error(Easing::refusal(&easing)))?;
+        edit_anim_layer(call.world_mut()?, id, index, |layer| {
+            layer.fade_eased(weight, duration, easing);
         })
     });
 
@@ -188,13 +205,8 @@ pub(crate) fn register(api: &mut ScriptApi) {
     .arg("id", Entity)
     .arg("name", Str)
     .run(|call, (id, name)| {
-        if let Some(comps) = call.world_mut()?.get_components_mut(id) {
-            comps.set_field(
-                comp::ANIMATOR,
-                "sequence",
-                toml::Value::String(name.to_string()),
-            );
-            comps.set_field(comp::ANIMATOR, "playing", toml::Value::Boolean(true));
+        if let Some(mut comps) = call.world_mut()?.get_components_mut(id) {
+            animator::write(&mut comps).sequence(&name).playing(true);
         }
         Ok(())
     });
@@ -202,32 +214,82 @@ pub(crate) fn register(api: &mut ScriptApi) {
     m.func("stop_sequence", "Stop the animator's sequence.")
         .arg("id", Entity)
         .run(|call, (id,)| {
-            if let Some(comps) = call.world_mut()?.get_components_mut(id) {
-                comps.set_field(
-                    comp::ANIMATOR,
-                    "sequence",
-                    toml::Value::String(String::new()),
-                );
+            if let Some(mut comps) = call.world_mut()?.get_components_mut(id) {
+                animator::write(&mut comps).sequence("");
             }
             Ok(())
         });
 }
 
-/// Read-modify-write one entry of `animator.layers` via the shared
-/// `flint_animation::layer_edit` helper (legacy-field migration + slot
-/// padding live there so the sequence runner behaves identically). A
+/// Read-modify-write one entry of `animator.layers` through
+/// `flint_animation::animator::edit_layer` (legacy-field migration and slot
+/// padding live there, so the sequence runner behaves identically). A
 /// negative index does nothing.
 fn edit_anim_layer(
     world: &mut FlintWorld,
     id: EntityId,
     index: i64,
-    edit: impl FnOnce(&mut toml::map::Map<String, toml::Value>),
+    edit: impl FnOnce(&mut LayerEdit),
 ) -> CallResult<()> {
     if index < 0 {
         return Ok(());
     }
-    if let Some(comps) = world.get_components_mut(id) {
-        flint_animation::layer_edit::edit_layer_table(comps, index as usize, edit);
+    if let Some(mut comps) = world.get_components_mut(id) {
+        animator::edit_layer(&mut comps, index as usize, edit);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::engine::ScriptEngine;
+    use flint_animation::animator::Animator;
+    use flint_core::tween::Easing;
+    use flint_ecs::FlintWorld;
+
+    fn run(source: &str) -> (ScriptEngine, FlintWorld, flint_core::EntityId) {
+        let mut engine = ScriptEngine::new();
+        engine.errors.set_quiet(true);
+        let mut world = FlintWorld::new();
+        let id = world.spawn("rig").unwrap();
+        let ast = engine.compile(source).unwrap();
+        engine.add_script(id, ast, "rig.rhai".into());
+        engine.call_inits(&mut world);
+        (engine, world, id)
+    }
+
+    /// `blend_to(id, clip, seconds, easing)` (#1248) writes the crossfade
+    /// and its `blend_easing`; the three-argument form leaves the easing
+    /// as written.
+    #[test]
+    fn an_eased_blend_to_writes_its_easing_and_a_plain_one_keeps_it() {
+        let (engine, world, id) = run(
+            "fn on_init() { let me = self_entity(); blend_to(me, \"walk\", 0.5, \"ease_in_out\"); blend_to(me, \"run\", 0.25); }",
+        );
+        assert!(
+            engine.errors().all().is_empty(),
+            "{:?}",
+            engine.errors().all()
+        );
+        let animator = Animator::of(&world, id);
+        assert_eq!(animator.blend_target, "run");
+        assert_eq!(animator.blend_duration, 0.25);
+        assert_eq!(animator.blend_easing, Easing::EaseInOut);
+    }
+
+    #[test]
+    fn an_easing_that_is_none_is_a_script_error() {
+        let (engine, world, id) =
+            run("fn on_init() { blend_to(self_entity(), \"walk\", 0.5, \"wobbly\"); }");
+        let errors = engine.errors().all();
+        assert_eq!(errors.len(), 1);
+        assert!(
+            errors[0]
+                .message
+                .contains("blend_to: no easing `wobbly`; one of linear"),
+            "{}",
+            errors[0].message
+        );
+        assert_eq!(Animator::of(&world, id).blend_target, "");
+    }
 }

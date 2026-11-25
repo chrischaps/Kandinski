@@ -29,20 +29,18 @@ CLAUDE.md asks.
 | `arch-viewer/` | A browser graph of `arch-data.json`: crates by tier, their modules and public items. Run the analyzer, then serve this folder (`python -m http.server -d tools/arch-viewer`) | | a browser |
 | **Pictures for the book and the demos** | | | |
 | `living-strip/living_strip.py` | The book's strip and slit-scan pictures of a wooze look (#219) | `flint-player --frame-step` | numpy, Pillow, flint-player |
-| `darkroom_images.py` | The darkroom style's LUT strips and papers in `demo/styles/` (#413); deterministic | | numpy, Pillow |
+| `darkroom_images.py` | The darkroom style's LUT strips and papers in `flint-examples/styles/` (#413); deterministic | | numpy, Pillow |
 | `style-images/make_images.py` | The demo paper and stroke images (#390); deterministic | | numpy, Pillow |
 | `ascii_flips.py` | Counts ASCII glyph flips and A-B-A reversals (shimmer) across captured frames (#277) | reads `flint-player` captures | numpy, Pillow |
+| **Assets** | | | |
+| `assets/cap_textures.py` | Brings textures under the tree's caps (2048 texels a side, 3 MB; ADR 0122, #759): halves with `flint_pixels::mip_chain`'s own filter, colour maps to JPEG, data maps PNG, GLBs rewritten whole. `scripts/size-check.py` names it | | numpy, Pillow |
+| `assets/pack_book_images.py` | Packs the book's PNGs smaller with the same pixels (#1276): drops an opaque alpha, tries a palette, Pillow's slowest zlib, checks each against the original. `scripts/size-check.py` names it for a book PNG with alpha | | Pillow |
 | **Test fixtures** | | | |
 | `make_sphere_glb.py` | `demo/models/Sphere.glb`, a UV sphere for the ASCII edge tests (#267) | | standard library |
-| `test-models/double_sided_card.py` | `testModels/DoubleSidedCard.glb`, the glTF `doubleSided` fixture (#623) | | standard library |
+| `test-models/double_sided_card.py` | `tests/fixtures/models/DoubleSidedCard.glb`, the glTF `doubleSided` fixture (#623) | | standard library |
 | `test-models/double_sided_palm.py` | `demo/models/palm_{two,one}_sided.glb` for `demo/double_sided.scene.toml` (#623) | | standard library |
-| **The showcase film** (`showcase/CLAUDE.md`) | | | |
-| `showcase/build_scenes.py` | Writes `demo/film/*.scene.toml` from the set and each beat; `--check` for staleness | | standard library |
-| `showcase/capture.py` | Captures each beat as a PNG sequence, unattended | `flint-player` | flint-player |
-| `showcase/compare.py` | Two captures of one take, frame by frame: is it deterministic? | | numpy, Pillow |
-| `showcase/music.py` (`score.py`, `synth.py`) | The film's score: synthesizes stems, then mixes them | `flint render-suite` | numpy, scipy (matplotlib for the plot), flint |
-| `showcase/cut.py` | Cuts the takes into the master, web and reel files | | numpy, Pillow, ffmpeg |
-| `showcase/check_cut.py` | Checks the encoded files frame by frame, and their sound | | numpy, ffmpeg |
+| **The showcase film** | | | |
+| `flint-examples/film/` | Not here: the film's scenes, shot list, score (`music.py`, `score.py`, `synth.py`) and editor (`cut.py`, `check_cut.py`) are flint-examples' (#984, #1195; its `CLAUDE.md`) | `flint capture`, `flint music render` | numpy, scipy, Pillow, ffmpeg |
 | **The web player** | | | |
 | `play-site/build.py` | Assembles play.chaps.dev from `play-site/games.toml` (#103) | `flint export web` | flint, a trunk build of the player |
 | `web-touch/ipad.mjs` | Plays a game on an emulated iPad over CDP and reports FROZEN or LIVE (docs/design/web.md) | | Node 22+, Chrome |

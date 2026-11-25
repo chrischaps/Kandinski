@@ -17,7 +17,7 @@
 name = "The Flooded Garden"
 version = "1.0"
 description = "Overgrown outdoor garden with lush procgen trees and water striders"
-input_config = "showcase_game/config/input_ruins.toml"
+input_config = "config/input_ruins.toml"
 
 [post_process]
 bloom_enabled = true
@@ -57,8 +57,6 @@ gravity_scale = 0.0
 move_speed = 5.0
 jump_force = 6.0
 height = 1.8
-radius = 0.3
-camera_mode = "first_person"
 
 [entities.player.script]
 source = "footsteps.rhai"
@@ -122,8 +120,10 @@ radius = 7.0
 #  ROOM
 # ============================================================
 
+# The level's root, a transform its walls, floors and lamps hang from. Not a
+# `room`: the examples' room is a box with `bounds` that draws as an outline,
+# and its `rooms_have_bounds` constraint asks for one (#804).
 [entities.garden_main]
-archetype = "room"
 [entities.garden_main.transform]
 position = [0, 0, 0]
 

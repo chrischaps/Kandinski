@@ -3,6 +3,7 @@
 
 use super::*;
 use crate::context::InputSnapshot;
+use flint_core::callbacks::Callback;
 use flint_core::components as comp;
 use flint_ecs::FlintWorld;
 use flint_runtime::GameEvent;
@@ -12,6 +13,40 @@ use test_support::{probe_component, probe_float};
 fn test_engine_creation() {
     let engine = ScriptEngine::new();
     assert!(engine.scripts.is_empty());
+}
+
+/// The player's controls line asks which actions a scene's scripts read
+/// (#716): a string literal anywhere counts, a comment or a name doesn't
+#[test]
+fn a_string_literal_is_found_in_a_script_and_a_comment_is_not() {
+    let engine = ScriptEngine::new();
+    let ast = engine
+        .compile(
+            r#"
+            // move_backward is the player's, not this script's
+            fn on_update() {
+                if is_action_pressed("move_left") { log("left"); }
+                let near = || action_value("jump");
+            }
+            fn steer() { "steer" }
+            fn move_right() { 1 }
+            let move_backward = 1;
+            let input = #{};
+            input.read("sprint");
+            "#,
+        )
+        .unwrap();
+    for (name, found) in [
+        ("move_left", true),
+        ("jump", true),
+        ("steer", true),
+        ("sprint", true),
+        ("move_backward", false),
+        ("move_right", false),
+        ("move", false),
+    ] {
+        assert_eq!(instance::names_string(&ast, name), found, "{name}");
+    }
 }
 
 #[test]
@@ -42,12 +77,12 @@ fn test_callback_detection() {
         .unwrap();
 
     let instance = ScriptInstance::new(ast, "test.rhai".into());
-    assert!(instance.has_on_init);
-    assert!(instance.has_on_update);
-    assert!(instance.has_on_collision);
-    assert!(!instance.has_on_trigger_enter);
-    assert!(!instance.has_on_action);
-    assert!(!instance.has_on_interact);
+    assert!(instance.defines(Callback::Init));
+    assert!(instance.defines(Callback::Update));
+    assert!(instance.defines(Callback::Collision));
+    assert!(!instance.defines(Callback::TriggerEnter));
+    assert!(!instance.defines(Callback::Action));
+    assert!(!instance.defines(Callback::Interact));
 }
 
 #[test]
@@ -368,14 +403,15 @@ fn test_module_level_variables_persist() {
 }
 
 #[test]
-fn test_arity_mismatch_still_detects_function() {
-    // A script with the wrong arity should still be detected (warning, not error)
+fn test_arity_mismatch_is_left_out() {
+    // A callback at the wrong count is warned at load and never called,
+    // where it used to fail every frame (#700)
     let engine = ScriptEngine::new();
     let ast = engine
         .compile(
             r#"
         fn on_update(dt) {
-            // Wrong arity — should warn but still detect
+            // Wrong arity: warned, not called
         }
     "#,
         )
@@ -383,8 +419,8 @@ fn test_arity_mismatch_still_detects_function() {
 
     let instance = ScriptInstance::new(ast, "test_mismatch.rhai".into());
     assert!(
-        instance.has_on_update,
-        "has_on_update should be true even with wrong arity"
+        !instance.defines(Callback::Update),
+        "on_update(dt) is not the on_update the engine calls"
     );
 }
 
@@ -483,34 +519,52 @@ fn a_script_completes_transitions_only_if_it_can_call_complete_transition() {
         r#"fn on_update() { import "fades" as fades; fades::run(); }"#
     ));
 
-    // The scripts that draw the examples' fades
-    for (name, source) in [
-        (
-            "showcase_hud.rhai",
-            include_str!("../../../../examples/scripts/showcase_hud.rhai"),
-        ),
-        (
-            "zone_hud.rhai",
-            include_str!("../../../../showcase_game/scripts/zone_hud.rhai"),
-        ),
-    ] {
-        assert!(completes(source), "{name} ends its own fades");
-    }
+    // The script that draws the examples' fades, frozen in tests/fixtures/scripts (#984; the example game's
+    // zone_hud.rhai is the same shape; the engine names no game, #760)
+    assert!(
+        completes(include_str!(
+            "../../../../tests/fixtures/scripts/showcase_hud.rhai"
+        )),
+        "showcase_hud.rhai ends its own fades"
+    );
 }
 
-/// The finder sees a name split across the pieces `Debug` writes, and a
-/// hot reload that takes the call out clears the flag.
+/// #998: the shapes the walk reaches by itself. Rhai's walk skips a method
+/// call's arguments, and the optimizer folds `Fn("..")` and constant
+/// arrays into values the walk doesn't open; a longer name holding the
+/// text, which the old `Debug` search matched, is not the call.
+#[test]
+fn the_transition_walk_reaches_method_arguments_and_folded_constants() {
+    let engine = ScriptEngine::new();
+    let completes = |source: &str| {
+        let ast = engine.compile(source).unwrap();
+        ScriptInstance::new(ast, "t.rhai".into()).completes_transition
+    };
+
+    assert!(completes(
+        r#"fn on_update() { let s = "x"; s.pad(1, call("complete_transition")); }"#
+    ));
+    assert!(completes(
+        r#"fn on_update() { [1].map(|v| v.max(complete_transition())); }"#
+    ));
+    assert!(completes(
+        r#"fn on_update() { let f = Fn("complete_transition"); f.call(); }"#
+    ));
+    assert!(completes(
+        r#"fn on_update() { for n in ["a", "complete_transition"] { call(n); } }"#
+    ));
+
+    assert!(!completes(
+        r#"fn complete_transition_soon() {} fn on_update() { complete_transition_soon(); }"#
+    ));
+    assert!(!completes(
+        r#"fn on_update() { log("complete_transition()"); }"#
+    ));
+}
+
+/// A hot reload that takes the call out clears the flag.
 #[test]
 fn completes_transition_follows_a_hot_reload() {
-    use std::fmt::Write;
-    let mut find = super::instance::Finder::new(&["complete_transition", "Import("]);
-    for piece in ["name: \"comp", "lete_tr", "ansition\""] {
-        if write!(find, "{piece}").is_err() {
-            break;
-        }
-    }
-    assert!(find.found, "a needle across three pieces");
-
     let mut engine = ScriptEngine::new();
     let id = EntityId::from_raw(1);
     let fades = engine
@@ -519,6 +573,6 @@ fn completes_transition_follows_a_hot_reload() {
     engine.add_script(id, fades, "hud.rhai".into());
     assert!(engine.can_complete_transition());
     let plain = engine.compile("fn on_update() {}").unwrap();
-    engine.reload_script(id, plain);
+    engine.reload_script(&mut FlintWorld::new(), id, plain);
     assert!(!engine.can_complete_transition());
 }

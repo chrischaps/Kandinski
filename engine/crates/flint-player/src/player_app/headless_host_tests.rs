@@ -68,19 +68,39 @@ fn one_of_each(entity: EntityId) -> Vec<ScriptCommand> {
     };
     vec![
         C::PlaySound {
+            handle: 1,
             name: s("ding"),
-            volume: 1.0,
-            pitch: 1.0,
+            play: flint_script::SoundPlay::default(),
         },
         C::PlaySoundAt {
+            handle: 2,
             name: s("ding"),
             position: (0.0, 0.0, 0.0),
-            volume: 1.0,
-            pitch: 1.0,
+            play: flint_script::SoundPlay::default(),
             distances: None,
             rolloff: None,
         },
-        C::StopSound { name: s("ding") },
+        C::StopSound {
+            sound: flint_script::SoundRef::Name(s("ding")),
+            fade: 0.0,
+        },
+        C::SetSoundVolume {
+            handle: 1,
+            volume: 0.5,
+            fade: 0.0,
+        },
+        C::SetBusVolume {
+            bus: s("voice"),
+            volume: 0.5,
+        },
+        C::SetUserBusVolume {
+            bus: s("music"),
+            volume: 0.4,
+        },
+        C::SetBusLowpass {
+            bus: s("sfx"),
+            hz: 800.0,
+        },
         C::FireEvent {
             name: s("bell"),
             data: toml::Value::Boolean(true),
@@ -116,6 +136,13 @@ fn one_of_each(entity: EntityId) -> Vec<ScriptCommand> {
             target: 20.0.into(),
             seconds: 1.0,
             easing: s("linear"),
+        },
+        C::Tween {
+            entity,
+            path: s("light.intensity"),
+            target: 2.0.into(),
+            seconds: 1.0,
+            easing: flint_core::tween::Easing::Linear,
         },
         C::ClearEntityStyle { entity },
         C::SetPostStyle {
@@ -155,6 +182,10 @@ fn one_of_each(entity: EntityId) -> Vec<ScriptCommand> {
         },
         C::SetLook {
             name: Some(s("graphite")),
+            seconds: 2.0,
+        },
+        C::PrepareLook {
+            name: s("ascii_noir"),
         },
         // The living subsystem's module commands (#698), one a function
         module(
@@ -183,6 +214,7 @@ fn one_of_each(entity: EntityId) -> Vec<ScriptCommand> {
             "tune_living",
             L::Tune {
                 knobs: toml::Value::Table(toml::Table::new()),
+                seconds: 0.0,
             },
         ),
         module(
@@ -234,13 +266,16 @@ fn one_of_each(entity: EntityId) -> Vec<ScriptCommand> {
             },
         },
         C::SetPostProcess {
-            post: PostProcessOverrides {
-                vignette: Some(0.4),
-                ..Default::default()
+            post: {
+                let mut post = PostProcessOverrides::default();
+                post.set("vignette_intensity", &0.4.into()).unwrap();
+                post.set(
+                    "fog_color",
+                    &toml::Value::try_from([0.5, 0.5, 0.6]).unwrap(),
+                )
+                .unwrap();
+                post
             },
-        },
-        C::SetFogColor {
-            color: [0.5, 0.5, 0.6],
         },
         C::SetRenderMode {
             mode: Some((1, 1.0)),
@@ -345,6 +380,7 @@ fn every_command_is_applied_headless_or_presentation_only() {
         "SetEntityStyle",
         "SetStyleParam",
         "TweenStyleParam",
+        "Tween",
         "ClearEntityStyle",
         "SetPostStyle",
         "SetLook",
@@ -374,6 +410,7 @@ fn on_update() {
 "#;
 
 #[test]
+#[allow(clippy::disallowed_methods)] // a test asserts on the TOML exactly as written
 fn a_capture_styles_tweens_and_reads_as_the_player_does() {
     let (dir, scene) = scene_folder("styles", &[("styler.rhai", STYLER)]);
     let mut world = FlintWorld::new();
@@ -425,4 +462,154 @@ fn a_capture_styles_tweens_and_reads_as_the_player_does() {
     assert_eq!(style.as_deref(), Some("ascii"), "{seen:?}");
     assert!(run.skipped().is_empty(), "{:?}", run.skipped());
     assert!(run.notes().is_empty(), "{:?}", run.notes());
+}
+
+/// A script that eases a lamp's light from 2 to 10 over a second and writes
+/// down the `tween_done` it hears (#734).
+const LAMPLIGHTER: &str = r#"
+fn on_init() {
+    tween(get_entity("lamp"), "light.intensity", 10, 1.0, "linear");
+}
+
+fn on_event(name, data) {
+    if name == "tween_done" {
+        set_field(self_entity(), "seen", "done", data.path);
+    }
+}
+"#;
+
+#[test]
+#[allow(clippy::disallowed_methods)] // a test asserts on the TOML exactly as written
+fn a_capture_tweens_a_component_field_and_says_when_it_arrives() {
+    let (dir, scene) = scene_folder("field_tween", &[("lamplighter.rhai", LAMPLIGHTER)]);
+    let mut world = FlintWorld::new();
+    let lamp = world.spawn("lamp").unwrap();
+    let mut light = toml::Table::new();
+    light.insert("type".into(), "point".into());
+    light.insert("intensity".into(), 2.into());
+    world.set_component(lamp, "light", light.into()).unwrap();
+    let director = world.spawn("director").unwrap();
+    let mut script = toml::Table::new();
+    script.insert("source".into(), "lamplighter.rhai".into());
+    world
+        .set_component(director, "script", script.into())
+        .unwrap();
+    let mut seen = toml::Table::new();
+    seen.insert("done".into(), "".into());
+    world.set_component(director, "seen", seen.into()).unwrap();
+
+    let mut run = load(&scene, world);
+    let mut camera = flint_render::Camera::new();
+    let intensity =
+        |world: &FlintWorld| world.get_component(lamp, "light").unwrap()["intensity"].clone();
+    let done = |world: &FlintWorld| world.get_component(director, "seen").unwrap()["done"].clone();
+    // The first step carries on_init's command: the tween starts, unmoved
+    run.step(0.0, &mut camera, None, None);
+    assert_eq!(intensity(run.world()), toml::Value::Integer(2));
+    for expect in [4.0, 6.0, 8.0] {
+        run.step(0.25, &mut camera, None, None);
+        assert_eq!(intensity(run.world()), toml::Value::Float(expect));
+    }
+    run.step(0.25, &mut camera, None, None);
+    assert_eq!(
+        intensity(run.world()),
+        toml::Value::Integer(10),
+        "lands whole"
+    );
+    assert_eq!(done(run.world()).as_str(), Some(""), "heard next frame");
+    run.step(0.25, &mut camera, None, None);
+    let _ = std::fs::remove_dir_all(dir);
+    assert_eq!(done(run.world()).as_str(), Some("light.intensity"));
+    assert!(run.script_errors().is_empty(), "{:?}", run.script_errors());
+}
+
+/// What `run` wrote to the log, every level (#1013).
+fn logged(run: impl FnOnce()) -> String {
+    use std::sync::{Arc, Mutex};
+    #[derive(Clone, Default)]
+    struct Captured(Arc<Mutex<Vec<u8>>>);
+    impl std::io::Write for Captured {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let log = Captured::default();
+    let writer = log.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(move || writer.clone())
+        .with_max_level(tracing::Level::TRACE)
+        .with_ansi(false)
+        .finish();
+    tracing::subscriber::with_default(subscriber, run);
+    let text = String::from_utf8(log.0.lock().unwrap().clone()).unwrap();
+    text
+}
+
+/// A script's `log`, `log_warn` and `log_error` each print once in a
+/// capture, as in the player (#1013): asking a command's name used to apply
+/// it to a probe host, whose default `log` wrote the line a second time.
+#[test]
+fn a_script_log_line_is_written_once_in_a_capture() {
+    let (dir, scene) = scene_folder("log_once", &[]);
+    let mut run = load(&scene, FlintWorld::new());
+    let said = [
+        (LogLevel::Info, "said once at info"),
+        (LogLevel::Warn, "said once at warn"),
+        (LogLevel::Error, "said once at error"),
+    ];
+    let text = logged(|| {
+        run.dispatch_for_test(
+            said.iter()
+                .map(|(level, message)| ScriptCommand::Log {
+                    level: level.clone(),
+                    message: (*message).into(),
+                })
+                .collect(),
+        );
+    });
+    let _ = std::fs::remove_dir_all(dir);
+    for (_, message) in said {
+        assert_eq!(
+            text.matches(message).count(),
+            1,
+            "{message:?} should be one line of the log:\n{text}"
+        );
+    }
+}
+
+/// The name a capture's refusal looks a command up by is the name its
+/// `ScriptHost` default reports (`host::command_name`, #1013), for every
+/// variant: a table, so that asking carries nothing out.
+#[test]
+fn the_name_table_is_what_each_default_reports() {
+    /// Records what a default calls unsupported, and says nothing for
+    /// `log`, the one default that does something.
+    #[derive(Default)]
+    struct Probe(Option<&'static str>);
+    impl ScriptHost for Probe {
+        fn unsupported(&mut self, command: &'static str) {
+            self.0 = Some(command);
+        }
+        fn log(&mut self, _level: LogLevel, _message: String) {}
+    }
+    let mut world = FlintWorld::new();
+    let entity = world.spawn("barrel").unwrap();
+    let mut mismatched = Vec::new();
+    for cmd in one_of_each(entity) {
+        let mut probe = Probe::default();
+        flint_script::host::apply(&mut probe, cmd.clone());
+        let table = flint_script::host::command_name(&cmd);
+        if table != probe.0 {
+            mismatched.push(format!(
+                "{}: the table says {table:?}, the default {:?}",
+                variant(&cmd),
+                probe.0
+            ));
+        }
+    }
+    assert!(mismatched.is_empty(), "{mismatched:#?}");
 }

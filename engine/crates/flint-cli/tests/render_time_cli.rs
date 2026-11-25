@@ -45,8 +45,9 @@ position = [0.0, 1.5, 6.0]
 target = [0.0, 1.0, 0.0]
 fov = 50.0
 
-[entities.sun.directional_light]
-direction = [0.6, -0.5, -0.4]
+[entities.sun.light]
+type = "directional"
+direction = [-0.6, 0.5, 0.4]
 color = [1.0, 0.9, 0.8]
 intensity = 2.5
 
@@ -292,6 +293,101 @@ fn a_style_sweep_reports_and_animates_as_a_wooze_one_does() {
     assert_eq!(frames[0].buffer().width(), sheet_width(2, 64));
 }
 
+/// Where `cell` sits in `sheet`, pixel for pixel: its top-left corner, or
+/// `None` when no region of the sheet is that image.
+fn find_cell(sheet: &image::RgbImage, cell: &image::RgbImage) -> Option<(u32, u32)> {
+    let (w, h) = cell.dimensions();
+    (0..=sheet.height().saturating_sub(h))
+        .flat_map(|y| (0..=sheet.width().saturating_sub(w)).map(move |x| (x, y)))
+        .find(|&(x, y)| {
+            (0..h).all(|cy| {
+                (0..w).all(|cx| sheet.get_pixel(x + cx, y + cy) == cell.get_pixel(cx, cy))
+            })
+        })
+}
+
+/// #531's done-when: one command draws a labelled spread comparison whose
+/// columns are, pixel for pixel, renders of the scene with those `[living]
+/// echoes`. The scene copies sit beside the original, so they find its spec.
+#[test]
+fn an_echoes_sweep_draws_what_scenes_with_those_echoes_draw() {
+    let dir = project("echoes_sweep");
+    let spreads = ["0", "0.9", "1.8"];
+    let o = render(
+        &dir,
+        "sweep.png",
+        &[
+            "--time",
+            "1.3",
+            "--sweep",
+            "living.echoes.spread=0,0.9,1.8",
+            "--report",
+            "json",
+        ],
+    );
+    if no_gpu(&o) {
+        return;
+    }
+    ok(&o);
+    let report: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
+    assert_eq!(report["sweep"], "living.echoes.spread");
+    let sheet = image::open(dir.join("sweep.png")).unwrap().into_rgb8();
+    assert_eq!(sheet.width(), sheet_width(3, 64));
+    assert!(
+        !stderr(&o).contains("pixel-identical"),
+        "the spread showed nothing: {}",
+        stderr(&o)
+    );
+
+    let mut corners = Vec::new();
+    for (i, spread) in spreads.iter().enumerate() {
+        // The scene with the column's spread in its own [living] table
+        let scene = SCENE.replace(
+            "[camera]",
+            &format!("[living]\nechoes = {{ spread = {spread} }}\n\n[camera]"),
+        );
+        let name = format!("spread_{i}.scene.toml");
+        std::fs::write(dir.join(&name), scene).unwrap();
+        let alone = std::process::Command::new(FLINT)
+            .arg("render")
+            .arg(dir.join(&name))
+            .arg("--schemas")
+            .arg(schemas())
+            .args(["--width", "64", "--height", "48", "--time", "1.3", "-o"])
+            .arg(dir.join(format!("spread_{i}.png")))
+            .output()
+            .expect("run flint");
+        ok(&alone);
+        let cell = image::open(dir.join(format!("spread_{i}.png")))
+            .unwrap()
+            .into_rgb8();
+        let at = find_cell(&sheet, &cell)
+            .unwrap_or_else(|| panic!("spread {spread}: no cell of the sheet is its render"));
+        corners.push(at);
+    }
+    // Each in its own column, left to right, on one row
+    assert!(
+        corners
+            .windows(2)
+            .all(|p| p[0].0 < p[1].0 && p[0].1 == p[1].1),
+        "{corners:?}"
+    );
+    let first = image::open(dir.join("spread_0.png")).unwrap();
+    let last = image::open(dir.join("spread_2.png")).unwrap();
+    assert_ne!(first, last, "spread 0 and 1.8 drew the same");
+}
+
+/// An echoes sweep in a scene with nothing to echo is refused before a GPU wakes.
+#[test]
+fn an_echoes_sweep_needs_living_props() {
+    let dir = project("echoes_none");
+    let bare = "[scene]\nname = \"Bare\"\n[entities.sun.light]\ntype = \"directional\"\n";
+    std::fs::write(dir.join("grove.scene.toml"), bare).unwrap();
+    let o = render(&dir, "a.png", &["--sweep", "living.echoes.count=0,4"]);
+    assert!(!o.status.success());
+    assert!(stderr(&o).contains("no living props"), "{}", stderr(&o));
+}
+
 /// style_sheet's width for `columns` cells `cell` wide: each cell framed by a
 /// pixel a side, 16 between them, 24 at each edge.
 fn sheet_width(columns: u32, cell: u32) -> u32 {
@@ -317,6 +413,102 @@ fn a_strip_can_be_a_gif() {
     let frames = gif_frames(&out);
     assert_eq!(frames.len(), 3);
     assert_eq!(frames[0].buffer().width(), 64);
+}
+
+/// #574's done-when: a span is one labelled contact sheet in one command,
+/// and each tile is, pixel for pixel, `--time <its t>` rendered alone at the
+/// tile's size.
+#[test]
+fn a_strip_is_a_sheet_of_its_moments_each_as_rendered_alone() {
+    let dir = project("strip_sheet");
+    let ascii = ["--style", "ascii"];
+    let o = render(
+        &dir,
+        "strip.png",
+        &[
+            &["--time", "0..2", "--strip", "--every", "1", "--cols", "2"][..],
+            &ascii,
+        ]
+        .concat(),
+    );
+    if no_gpu(&o) {
+        return;
+    }
+    ok(&o);
+    let said = String::from_utf8_lossy(&o.stdout);
+    assert!(said.contains("3 tiles of 64x48"), "{said}");
+    let sheet = image::open(dir.join("strip.png")).unwrap().into_rgb8();
+    assert_eq!(sheet.width(), sheet_width(2, 64));
+
+    let mut corners = Vec::new();
+    for t in ["0", "1", "2"] {
+        let name = format!("alone_{t}.png");
+        ok(&render(&dir, &name, &[&["--time", t][..], &ascii].concat()));
+        let cell = image::open(dir.join(&name)).unwrap().into_rgb8();
+        let at = find_cell(&sheet, &cell)
+            .unwrap_or_else(|| panic!("t = {t}: no tile of the strip is its render alone"));
+        corners.push(at);
+    }
+    // 0 and 1 along the first row, 2 under 0
+    assert!(
+        corners[0].1 == corners[1].1 && corners[0].0 < corners[1].0,
+        "{corners:?}"
+    );
+    assert!(
+        corners[2].0 == corners[0].0 && corners[2].1 > corners[0].1,
+        "{corners:?}"
+    );
+    let read = |name: &str| std::fs::read(dir.join(name)).unwrap();
+    assert_ne!(
+        read("alone_0.png"),
+        read("alone_2.png"),
+        "the props never moved"
+    );
+}
+
+/// `--label off`: the tiles alone, 4 pixels apart, so a tile is cut back out
+/// by arithmetic. A list's moments make a strip as a span's do. The ASCII
+/// style keeps a history (#277) that a GIF's frames follow on from; at this
+/// size and 0.05 s apart, a capture that followed on from the one before
+/// differs from the render alone (a `--time` list's stills do, measured
+/// 2026-11-18), so this holds each tile to being drawn as a first frame.
+#[test]
+fn a_strip_without_labels_is_its_tiles_four_pixels_apart() {
+    let dir = project("strip_plain");
+    let run = |out: &str, args: &[&str]| {
+        std::process::Command::new(FLINT)
+            .arg("render")
+            .arg(dir.join("grove.scene.toml"))
+            .arg("--schemas")
+            .arg(schemas())
+            .args([
+                "--width", "320", "--height", "240", "--style", "ascii", "-o",
+            ])
+            .arg(dir.join(out))
+            .args(args)
+            .output()
+            .expect("run flint")
+    };
+    let times = ["0", "0.05", "0.1"];
+    let o = run(
+        "plain.png",
+        &["--time", &times.join(","), "--strip", "--label", "off"],
+    );
+    if no_gpu(&o) {
+        return;
+    }
+    ok(&o);
+    let sheet = image::open(dir.join("plain.png")).unwrap().into_rgb8();
+    // Three tiles are two across: the fewest that keep the sheet no taller than wide
+    assert_eq!(sheet.dimensions(), (2 * 320 + 4, 2 * 240 + 4));
+    for (i, t) in times.iter().enumerate() {
+        let name = format!("alone_{i}.png");
+        ok(&run(&name, &["--time", t]));
+        let alone = image::open(dir.join(&name)).unwrap().into_rgb8();
+        let (x, y) = ((i as u32 % 2) * 324, (i as u32 / 2) * 244);
+        let tile = image::imageops::crop_imm(&sheet, x, y, 320, 240).to_image();
+        assert!(tile == alone, "tile {i} isn't --time {t} alone");
+    }
 }
 
 /// The flags the one-renderer path took and the clocked one refused until #596.
@@ -389,6 +581,27 @@ fn a_clocked_sweep_can_be_cropped() {
     ok(&o);
     let sheet = image::open(dir.join("crop.png")).unwrap().into_rgb8();
     assert_eq!(sheet.width(), sheet_width(2, 32));
+
+    // #501: the same region in fractions of the 64x48 frame is the same
+    // sheet, locator and all
+    let o = render(
+        &dir,
+        "fraction.png",
+        &[
+            "--time",
+            "1.3",
+            "--sweep",
+            "wooze.glide=0,1",
+            "--sweep-crop",
+            "0.25,0.25,0.5,0.5",
+        ],
+    );
+    ok(&o);
+    let fraction = image::open(dir.join("fraction.png")).unwrap().into_rgb8();
+    assert!(
+        fraction == sheet,
+        "a crop in fractions draws the pixel crop's sheet"
+    );
 }
 
 /// A still of the moment is its own reference: distance 0, and in a sweep the
@@ -465,7 +678,8 @@ fn a_clocked_render_writes_its_ascii_grid() {
         &[
             "--time",
             "1.3",
-            "--ascii",
+            "--style",
+            "ascii",
             "--ascii-text",
             text.to_str().unwrap(),
         ],
@@ -485,7 +699,8 @@ fn a_clocked_render_writes_its_ascii_grid() {
             "0..1",
             "--fps",
             "2",
-            "--ascii",
+            "--style",
+            "ascii",
             "--ascii-text",
             text.to_str().unwrap(),
         ],
@@ -512,7 +727,8 @@ fn frames_on_the_clock_move_the_props_and_count_flips() {
             "0.5",
             "--orbit",
             "20",
-            "--ascii",
+            "--style",
+            "ascii",
             "--flip-json",
             flips.to_str().unwrap(),
         ],
@@ -526,6 +742,66 @@ fn frames_on_the_clock_move_the_props_and_count_flips() {
     let stats: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&flips).unwrap()).unwrap();
     assert_eq!(stats["frames"], 3, "{stats}");
+}
+
+/// `--last-frame` (#478) writes only where a sequence ends, to `-o` itself,
+/// and it is the numbered run's last frame byte for byte: on the clock (this
+/// grove's living props) and on the still path (a plain fixture scene).
+#[test]
+fn last_frame_is_the_sequences_last_frame_alone() {
+    let dir = project("last_frame");
+    let seq = [
+        "--frames",
+        "3",
+        "--frame-dt",
+        "0.5",
+        "--orbit",
+        "20",
+        "--style",
+        "ascii",
+    ];
+    let o = render(&dir, "seq.png", &seq);
+    if no_gpu(&o) {
+        return;
+    }
+    ok(&o);
+    ok(&render(
+        &dir,
+        "last.png",
+        &[&seq[..], &["--last-frame"]].concat(),
+    ));
+    let read = |name: &str| std::fs::read(dir.join(name)).unwrap();
+    assert_eq!(read("last.png"), read("seq_0002.png"), "on the clock");
+    assert!(!dir.join("last_0000.png").exists(), "a numbered frame too");
+
+    let still = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/scenes/pbr_test.scene.toml");
+    let plain = |out: &str, last: bool| {
+        let o = std::process::Command::new(FLINT)
+            .arg("render")
+            .arg(&still)
+            .args(["--width", "64", "--height", "48", "--no-grid"])
+            .args(seq)
+            .args(last.then_some("--last-frame"))
+            .arg("-o")
+            .arg(dir.join(out))
+            .output()
+            .expect("run flint");
+        ok(&o);
+    };
+    plain("plain.png", false);
+    plain("plain_last.png", true);
+    assert_eq!(read("plain_last.png"), read("plain_0002.png"), "still path");
+    assert!(!dir.join("plain_last_0000.png").exists());
+
+    // Nothing to write and only the last frame to write contradict
+    let o = render(
+        &dir,
+        "x.png",
+        &[&seq[..], &["--last-frame", "--no-images"]].concat(),
+    );
+    assert!(!o.status.success());
+    assert!(stderr(&o).contains("--no-images"), "{}", stderr(&o));
 }
 
 /// `--gpu-time` times the first cell's capture: a spread a pass (#292), and
@@ -647,6 +923,24 @@ fn what_cant_be_written_is_refused_and_says_why() {
     refused("a.png", &["--sweep", "fog.density=1"], "at least two");
     refused("a.png", &["--time", "soon"], "'soon'");
     refused("a.png", &["--frame-step", "0.1"], "--time");
+
+    // A strip (#574) is one PNG of several moments
+    refused("a.gif", &["--time", "0..4", "--strip"], ".png");
+    refused("f-%04d.png", &["--time", "0..4", "--strip"], "plain .png");
+    refused("a.png", &["--time", "3", "--strip"], "is one");
+    refused("a.png", &["--strip"], "--time");
+    refused(
+        "a.png",
+        &["--time", "1,2", "--strip", "--every", "1"],
+        "drop --every",
+    );
+    refused("a.png", &["--time", "0..900", "--strip"], "at most 100");
+    refused(
+        "a.png",
+        &["--time", "0..2", "--strip", "--sweep", "wooze.glide=0,1"],
+        "cannot be used with",
+    );
+    refused("a.png", &["--time", "0..2", "--every", "1"], "--strip");
 
     // What a clocked render can't mean (#596)
     let reference = dir.join("tiny.png");

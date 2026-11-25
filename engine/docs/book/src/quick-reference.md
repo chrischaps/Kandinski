@@ -23,15 +23,14 @@ A scannable cheat sheet for daily Flint development.
 | `flint asset generate <type>` | AI asset generation (texture, model, audio) |
 | `flint asset import <file>` | Import file into asset catalog |
 | `flint prefab view <template>` | Preview a prefab template in the viewer |
-| `flint validate-suite <manifest>` | Validate a music suite manifest (`--chart` to cross-check) |
-| `flint play-suite <manifest>` | Play a suite's stems, no judgment |
-| `flint calibrate <manifest>` | Tap-to-beat latency calibration |
-| `flint play-chart <manifest> --chart <chart>` | Play a chart with live gamepad capture (`--record`, `--window`) |
-| `flint replay-chart <manifest> --chart <chart>` | Replay a recorded or synthetic session headless |
-| `flint render-suite <manifest> -o out.wav` | Render a scripted suite session to WAV |
+| `flint music validate <manifest>` | Validate a music suite manifest (`--chart` to cross-check) |
+| `flint music play <manifest>` | Play a suite's stems, no judgment |
+| `flint music calibrate <manifest>` | Tap-to-beat latency calibration |
+| `flint music chart play <manifest> --chart <chart>` | Play a chart with live gamepad capture (`--record`, `--window`) |
+| `flint music chart replay <manifest> --chart <chart>` | Replay a recorded or synthetic session headless |
+| `flint music render <manifest> -o out.wav` | Render a scripted suite session to WAV |
 | `flint goldens <file>.goldens.toml` | Render scenes and gate them against golden PNGs (`--bless` rewrites) |
 | `flint render <scene> --style ascii:cell=12` | Preview any registered style over a scene |
-| `flint spike-rumble` | Time the gamepad rumble paths |
 
 Music commands are detailed in [Music Commands](cli-reference/music.md).
 
@@ -49,14 +48,16 @@ Music commands are detailed in [Music Commands](cli-reference/music.md).
 | Left Click | Fire |
 | R | Reload |
 | 1 / 2 | Weapon slots |
+| F1 | Show the debug keys (`--list-keys` prints them; an input config's `[debug_keys]` rebinds them) |
 | F2 | Toggle render stats overlay (with the GPU's time per phase, where the device can time) |
 | F3 | Toggle scene debug panels (ocean, day/time, camera, grass, weather… — only those the scene uses; never the F4 menu) and the game's own ([ADR 0107](https://github.com/chrischaps/Flint/blob/main/docs/adr/0107-debug-panels-from-the-game.md)) |
 | F4 | Toggle the **Rendering & Effects** menu (all render/post toggles and parameters, debug shading mode, shadows, lighting levers) |
-| F9 | Force a music-session full-fail (debug builds, session running) |
-| `` ` `` / `\` | Music Guide overlay / Manifest Map strip (debug builds, session running) |
+| F5-F8 | Living props: freeze, A/B flip, A/B split, pick (only in a scene with living props) |
+| F9 | Force a music-session full-fail (debug builds, a charted session playing) |
+| `` ` `` / `\` | Music Guide overlay / Manifest Map strip (debug builds, a charted session playing) |
 | F11 | Toggle fullscreen |
 
-The old per-effect keys (F1 debug mode, F4 shadows, F5 bloom, F6 post) are gone; everything is in the F4 menu.
+Where a key's owner isn't in the scene, or the game binds the key, the press is the game's. The old per-effect keys (F1 debug mode, F4 shadows, F5 bloom, F6 post) are gone; everything is in the F4 menu.
 | Escape | Release cursor / Exit (the game's own key when its input config binds it, see [Escape](concepts/physics-and-runtime.md#escape)) |
 
 ### Scene Viewer (`flint edit <scene.toml>`)
@@ -87,6 +88,7 @@ The old per-effect keys (F1 debug mode, F4 shadows, F5 bloom, F6 post) are gone;
 | Alt+drag | Move vertically (Y) |
 | Middle-drag | Orbit |
 | Right-drag | Pan |
+| O, `[` / `]` | Toggle auto-orbit, slower / faster |
 | Tab / Shift+Tab | Cycle control points |
 | I | Insert point |
 | Delete | Remove point |
@@ -326,18 +328,20 @@ position = [0, 0, 0]
 | `draw_world_text(x, y, z, text, size, opts)` | `()` | Text at a world point, hidden behind nearer geometry: a billboard in points, or painted on a plane (`facing`) in world units |
 | `delta_time()` | `f64` | Seconds since last frame |
 | `play_sound(name)` | --- | Play a sound effect |
-| `set_dof(strength)` / `set_dof_focus(dist, range)` | --- | Drive depth of field from a script |
-| `set_desaturation(amount)` | --- | Drain colour toward ash-grey (0–1) |
+| `set_post(key, value)` | --- | Set a `[post_process]` key until set again: `set_post("dof_strength", 0.6)`, `set_post("desaturate", 0.5)`, `set_post("fog_color", [r, g, b])`; `flint render --list-effects` lists the keys |
 | `set_camera_roll(radians)` | --- | Roll the camera about its view axis |
 | `conducted_lean()` / `conducted_coherence()` | `#{x,y}` / `f64` | Read the running music session (neutral until it runs; a charted scene only, #698) |
 | `play_clip(id, clip)` | --- | Play an animation clip |
 | `set_anim_layer(id, idx, clip, w)` | --- | Play a clip on an animation layer |
 | `set_anim_layer_weight(id, idx, w)` | --- | Set a layer's weight instantly |
-| `fade_anim_layer(id, idx, w, secs)` | --- | Ramp a layer's weight over `secs` |
+| `fade_anim_layer(id, idx, w, secs[, easing])` | --- | Ramp a layer's weight over `secs` |
+| `tween(id, "component.field", target, secs[, easing])` | --- | Ease any numeric field over game time; fires `tween_done` |
 | `play_sequence(id, name)` / `stop_sequence(id)` | --- | Drive the animator from `animations/*.sequence.toml` (cues → `on_sequence_cue`) |
 | `raycast(ox,oy,oz, dx,dy,dz, dist)` | `Map`/`()` | Cast a ray, get hit info |
 | `raycast_meshes(ox,oy,oz, dx,dy,dz, dist)` / `screen_to_mesh(x, y)` | `Map`/`()` | The same against the meshes drawn as ray targets, no physics needed: a wall in the camera's way, the roof under the cursor ([ADR 0105](https://github.com/chrischaps/Flint/blob/main/docs/adr/0105-rays-against-drawn-meshes.md)) |
 | `move_character(id, dx, dy, dz)` | `#{x,y,z,grounded}` | Collision-corrected movement |
+| `find_path(fx,fy,fz, tx,ty,tz[, opts])` | `[#{x,y,z}, ...]`/`[]` | The way over the floors the static colliders make, round walls, up ramps; opts: `radius`, `height`, `step`, `max_slope`, `cell`, `max_nodes` ([Navigation](concepts/physics-and-runtime.md#navigation)) |
+| `move_along_path(id, path, speed)` | `#{x,y,z,dir_x,dir_z,next,remaining,arrived}` | Walk an entity along a path this frame, keeping its height above it |
 | `spawn_entity(name)` | `i64` | Create a new entity |
 | `load_scene(path)` | --- | Transition to a new scene |
 | `quit_game()` | --- | End the run as closing the window does (exit code 0; on the web, back to the page's doorway) |
@@ -356,7 +360,7 @@ position = [0, 0, 0]
 | `ui_set_style_array(id, prop, [..])` | --- | Override `color` / `bg_color` / `stroke_color` / `padding` / `uv` / `shadow` |
 | `ui_token(name)` | value or `()` | Read a style token (`"accent"`, `"$accent"`, `"color.accent"`) as float / float array / string |
 | `ui_hit(id, x, y)` | `bool` | Point-in-rect against the element's resolved layout (logical points) |
-| `draw_text(x, y, text, size, #{font, color, align, stroke, spacing, layer, shadow, glow})` | --- | HUD text in a project font (`fonts/*.ttf`, family = file stem) |
+| `draw_text(x, y, text, size, #{font, color, align, stroke, spacing, layer, shadow, glow})` | --- | HUD text in a project font (`fonts/*.ttf`, family = file stem), or `font: "monospace"` for egui's fixed-pitch face |
 | `measure_text(text, size, #{font, spacing})` | `#{width,height}` | Real laid-out text size (also `measure_text(text, size)`) |
 | `draw_ring(cx, cy, r_in, r_out, start_deg, end_deg, r, g, b, a, layer)` | --- | Annular sector; degrees from 12 o'clock, clockwise (`draw_arc(cx, cy, radius, a0, a1, r, g, b, a, thickness, layer)` for a stroke) |
 | `draw_polygon(points, r, g, b, a, layer)` | --- | Convex fill from `[[x,y],...]` or flat `[x0,y0,...]`; `draw_polygon_outline(points, r, g, b, a, thickness, closed, layer)` |
@@ -380,17 +384,18 @@ flint render scene.toml -o wireframe.png --debug-mode wireframe
 flint render scene.toml -o normals.png --debug-mode normals
 flint render scene.toml -o depth.png --debug-mode depth
 
-# Post-processing control
-flint render scene.toml -o bloom.png --bloom-intensity 0.08
+# Post-processing control: --set post.<key>=<value> sets one [post_process] key
+flint render --list-effects     # every key, its kind, default and range
+flint render scene.toml -o bloom.png --set post.bloom_intensity=0.08 --set post.bloom_enabled=true
 flint render scene.toml -o raw.png --no-postprocess
-flint render scene.toml -o dof.png --dof 0.6 --dof-focus 8 --dof-range 3
-flint render scene.toml -o graded.png --grade-lift 0.03,0.02,0.015 --grade-gain 1.04,1,0.94 --film-grain 0.03
-flint render scene.toml -o drained.png --desaturate 0.85
+flint render scene.toml -o dof.png --set post.dof_strength=0.6 --set post.dof_focus_distance=8 --set post.dof_focus_range=3
+flint render scene.toml -o graded.png --set post.grade_lift=0.03,0.02,0.015 --set post.grade_gain=1.04,1,0.94 --set post.film_grain=0.03
+flint render scene.toml -o drained.png --set post.desaturate=0.85
 
 # Anti-aliasing and lighting levers (both default off; ADR 0058 / 0048)
-flint render scene.toml -o smooth.png --msaa 4 --fxaa
+flint render scene.toml -o smooth.png --msaa 4 --set post.fxaa=true
 flint render scene.toml -o clay.png --oren-nayar 0.7 --sheen-strength 0.15 --sheen-color 1,0.9,0.8
 
 # Cheaper SSAO for quick iteration
-flint render scene.toml -o fast.png --ssao-samples 16
+flint render scene.toml -o fast.png --set post.ssao_samples=16
 ```

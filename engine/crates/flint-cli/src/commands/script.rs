@@ -7,7 +7,7 @@
 //! flint script api --json           # one JSON document, for agents and the book
 //! flint script api --book           # write the book's generated reference and tables
 //! flint script api --check-book     # exit 1 if they're stale or a chapter calls a ghost (CI)
-//! flint script check examples/      # every script of a folder: file:line:col and a hint
+//! flint script check flint-examples/      # every script of a folder: file:line:col and a hint
 //! flint script check level.scene.toml --json
 //! flint script check . --api game-api.json --allow game_only_fn
 //! ```
@@ -48,10 +48,6 @@ pub struct CheckArgs {
     #[arg(default_value = ".")]
     pub path: PathBuf,
 
-    /// Print one JSON document instead of text, in `flint check`'s shape
-    #[arg(long)]
-    pub json: bool,
-
     /// Schema directories (repeatable), for loading the scenes whose
     /// scripts are checked. Without it: the project's, as `flint check`
     #[arg(long, action = clap::ArgAction::Append)]
@@ -63,10 +59,6 @@ pub struct CheckArgs {
 
 #[derive(clap::Args)]
 pub struct ApiArgs {
-    /// Print one JSON document instead of text
-    #[arg(long)]
-    pub json: bool,
-
     /// Only functions (and callbacks) whose name or module contains this,
     /// ignoring case
     #[arg(long, value_name = "TEXT")]
@@ -77,13 +69,13 @@ pub struct ApiArgs {
     /// chapters, then report calls in the chapters that name no function.
     /// DIR is the book (the folder holding `src/`); default `docs/book`
     #[arg(long, value_name = "DIR", num_args = 0..=1, default_missing_value = "docs/book",
-          conflicts_with_all = ["json", "filter", "check_book"])]
+          conflicts_with_all = ["filter", "check_book"])]
     pub book: Option<PathBuf>,
 
     /// As --book, but write nothing: exit 1 when a generated page or region
     /// is stale or a chapter calls a function that isn't there (CI)
     #[arg(long, value_name = "DIR", num_args = 0..=1, default_missing_value = "docs/book",
-          conflicts_with_all = ["json", "filter"])]
+          conflicts_with_all = ["filter"])]
     pub check_book: Option<PathBuf>,
 }
 
@@ -97,31 +89,25 @@ pub fn run(cmd: ScriptCommands) -> Result<()> {
 /// `flint script check`.
 fn check(args: &CheckArgs) -> Result<()> {
     let report = check_report(args)?;
-    let text = if args.json {
-        let mut text = serde_json::to_string_pretty(&check_json(&report))?;
-        text.push('\n');
-        text
-    } else {
-        check_text(&report)
-    };
-    use std::io::Write;
-    match std::io::stdout().lock().write_all(text.as_bytes()) {
-        Err(e) if e.kind() != std::io::ErrorKind::BrokenPipe => return Err(e.into()),
-        _ => {}
-    }
-    if report.has_errors() {
-        std::process::exit(1);
-    }
-    Ok(())
+    crate::output::emit(
+        &crate::output::Answer::new(check_text(&report), check_json(&report))
+            .failed_if(report.has_errors()),
+    )
 }
 
 /// What `flint script check` finds, without printing it.
 pub fn check_report(args: &CheckArgs) -> Result<crate::check::Report> {
     use crate::check::{self, Checks, Subject};
-    let api = args.script.api()?;
+    let mut api = args.script.api()?;
     let path = &args.path;
     let is_script = path.extension().is_some_and(|e| e == "rhai");
     if is_script && path.is_file() {
+        // The script's project's `[packages]` (#1334), as its schemas say
+        if let Ok(dirs) = flint_core::project::schema_dirs(Some(path), &args.schemas) {
+            if let Some(in_use) = dirs.packages {
+                api.with_packages(in_use);
+            }
+        }
         let file = flint_script::check::ScriptFile::found(path.clone());
         let (diagnostics, scripts) = check::scripts::check(&api, vec![file]);
         return Ok(check::Report {
@@ -217,15 +203,34 @@ fn api(args: &ApiArgs) -> Result<()> {
         return book_cmd(dir, false);
     }
     let listing = flint_player::script_system().api_listing();
+    // The project's `[packages]` (#1334): a left-out package's modules
+    // are not the game's API
+    let in_use = super::package::project_in_use()?;
+    let (listing, left_out) = without_left_out(listing, in_use.as_ref());
     let filter = args.filter.as_deref().map(str::to_lowercase);
     let listing = filtered(listing, filter.as_deref());
-    let text = if args.json {
-        serde_json::to_string_pretty(&to_json(&listing))?
-            + "
-"
-    } else {
-        to_text(&listing)
-    };
+    if crate::output::json() {
+        let mut doc = to_json(&listing);
+        doc["left_out"] = json!(left_out
+            .iter()
+            .map(|(package, modules)| json!({ "package": package, "modules": modules }))
+            .collect::<Vec<_>>());
+        crate::output::document(&doc);
+        return Ok(());
+    }
+    let mut text = to_text(&listing);
+    if !left_out.is_empty() {
+        let named: Vec<String> = left_out
+            .iter()
+            .map(|(package, modules)| format!("{} (package `{package}`)", modules.join(", ")))
+            .collect();
+        text.push_str(&format!(
+            "
+Not listed, as flint.toml's [packages] leaves their packages out: {}
+",
+            named.join("; ")
+        ));
+    }
     // `flint script api | head` closes the pipe early: not an error
     use std::io::Write;
     match std::io::stdout().lock().write_all(text.as_bytes()) {
@@ -262,7 +267,7 @@ fn book_cmd(dir: &Path, check: bool) -> Result<()> {
         if check {
             eprintln!("stale: {}", shown(path));
         } else {
-            println!("wrote {}", shown(path));
+            crate::output::say!("wrote {}", shown(path));
         }
     }
     for g in &outcome.ghosts {
@@ -289,19 +294,62 @@ fn book_cmd(dir: &Path, check: bool) -> Result<()> {
             shown(&dir.join(book::ALLOW))
         );
     }
+    crate::output::when_json(|| {
+        json!({
+            "book": shown(dir),
+            "check": check,
+            "stale": outcome.stale.iter().map(|p| shown(p)).collect::<Vec<_>>(),
+            "ghosts": outcome.ghosts.iter().map(|g| json!({
+                "file": shown(&dir.join("src").join(&g.file)),
+                "line": g.line,
+                "name": g.name,
+                "problem": g.problem,
+            })).collect::<Vec<_>>(),
+            "valid": !stale && outcome.ghosts.is_empty(),
+        })
+    });
     if stale || !outcome.ghosts.is_empty() {
-        std::process::exit(1);
+        return Err(crate::output::failed());
     }
     if check {
-        println!(
+        crate::output::say!(
             "the book matches the script API ({} functions, {} callbacks)",
             listing.declared.len(),
             listing.callbacks.len()
         );
     } else if outcome.stale.is_empty() {
-        println!("the book's script API text was already up to date");
+        crate::output::say!("the book's script API text was already up to date");
     }
     Ok(())
+}
+
+/// The listing without the script modules of the packages `in_use` leaves
+/// out, and those packages with the modules each had in the listing.
+fn without_left_out(
+    mut listing: ApiListing,
+    in_use: Option<&flint_core::package::InUse>,
+) -> (ApiListing, Vec<(String, Vec<String>)>) {
+    let Some(in_use) = in_use else {
+        return (listing, Vec::new());
+    };
+    let owner = |module: &str| {
+        in_use
+            .left_out_owner(flint_core::package::Kind::ScriptModule, module)
+            .map(|p| p.name.clone())
+    };
+    let mut left_out: Vec<(String, Vec<String>)> = Vec::new();
+    for e in &listing.declared {
+        if let Some(package) = owner(e.module) {
+            match left_out.iter_mut().find(|(p, _)| *p == package) {
+                Some((_, modules)) if modules.iter().any(|m| m == e.module) => {}
+                Some((_, modules)) => modules.push(e.module.to_string()),
+                None => left_out.push((package, vec![e.module.to_string()])),
+            }
+        }
+    }
+    listing.declared.retain(|e| owner(e.module).is_none());
+    listing.gates.retain(|g| owner(g.module).is_none());
+    (listing, left_out)
 }
 
 /// The listing with only what matches `filter` (lowercase).

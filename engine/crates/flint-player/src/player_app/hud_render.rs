@@ -6,6 +6,10 @@ use flint_script::context::{DrawCommand, DrawItem};
 use flint_script::draw2d::{ring_indices, ring_points, ring_steps};
 use std::collections::{HashMap, HashSet};
 
+/// A script's unmultiplied sRGBA colour as egui premultiplies it: in display
+/// values (egui 0.31 on), so a translucent colour blends as written (a 50%
+/// white over black is 128). Script `draw_*` colours, text halos, world text
+/// and HUD sprites all take it, as Flint's own egui UI does (#958).
 pub(super) fn to_color32(c: &[f32; 4]) -> egui::Color32 {
     egui::Color32::from_rgba_unmultiplied(
         (c[0] * 255.0) as u8,
@@ -59,7 +63,7 @@ pub(super) fn render_draw_commands(
     // instead, in the same layer order among themselves.
     let base_painter = ctx.layer_painter(egui::LayerId::background());
     let over_painter = ctx.layer_painter(over_ui_layer());
-    let screen = ctx.screen_rect();
+    let screen = ctx.content_rect();
 
     for item in &sorted {
         let layer_painter = if item.over_ui {
@@ -110,7 +114,7 @@ pub(super) fn render_draw_commands(
                 // Galleys bake their section colour, so shadow / stroke /
                 // main each get their own (the galley cache makes repeats
                 // cheap). Position comes from the main galley's size.
-                let galley = ctx.fonts(|f| {
+                let galley = ctx.fonts_mut(|f| {
                     f.layout_job(text_layout_job(
                         text,
                         font_id.clone(),
@@ -123,7 +127,7 @@ pub(super) fn render_draw_commands(
 
                 if let Some((shadow_color, dx, dy)) = shadow {
                     let sc = to_color32(shadow_color);
-                    let shadow_galley = ctx.fonts(|f| {
+                    let shadow_galley = ctx.fonts_mut(|f| {
                         f.layout_job(text_layout_job(text, font_id.clone(), sc, *letter_spacing))
                     });
                     painter.galley(egui::Pos2::new(pos.x + dx, pos.y + dy), shadow_galley, sc);
@@ -143,7 +147,7 @@ pub(super) fn render_draw_commands(
                 } else if let Some((stroke_color, stroke_width)) = stroke {
                     // A thin stroke (outline): the text at 8 compass offsets
                     let sc = to_color32(stroke_color);
-                    let stroke_galley = ctx.fonts(|f| {
+                    let stroke_galley = ctx.fonts_mut(|f| {
                         f.layout_job(text_layout_job(text, font_id.clone(), sc, *letter_spacing))
                     });
                     for (dx, dy) in stamp_offsets(*stroke_width) {
@@ -184,10 +188,13 @@ pub(super) fn render_draw_commands(
             } => {
                 let rect =
                     egui::Rect::from_min_size(egui::Pos2::new(*x, *y), egui::Vec2::new(*w, *h));
+                // Outside the rect, where egui 0.30 drew it: a script's box
+                // keeps its size whatever the thickness (#989)
                 painter.rect_stroke(
                     rect,
                     *rounding,
                     egui::Stroke::new(*thickness, to_color32(color)),
+                    egui::StrokeKind::Outside,
                 );
             }
 
@@ -203,11 +210,13 @@ pub(super) fn render_draw_commands(
                 let rect =
                     egui::Rect::from_min_size(egui::Pos2::new(*x, *y), egui::Vec2::new(*w, *h));
                 // Script order is tl, tr, br, bl; egui names them by compass.
-                let r = egui::Rounding {
-                    nw: rounding[0],
-                    ne: rounding[1],
-                    se: rounding[2],
-                    sw: rounding[3],
+                // Whole points from 0 to 255 since egui 0.31 (#945)
+                let px = |r: f32| r.clamp(0.0, 255.0).round() as u8;
+                let r = egui::CornerRadius {
+                    nw: px(rounding[0]),
+                    ne: px(rounding[1]),
+                    se: px(rounding[2]),
+                    sw: px(rounding[3]),
                 };
                 painter.rect_filled(rect, r, to_color32(color));
             }
@@ -222,8 +231,8 @@ pub(super) fn render_draw_commands(
                 vertical,
                 ..
             } => {
-                // epaint `Vertex.color` is premultiplied sRGBA;
-                // `from_rgba_unmultiplied` (via to_color32) premultiplies.
+                // epaint `Vertex.color` is premultiplied sRGBA; to_color32
+                // premultiplies.
                 let ca = to_color32(color_a);
                 let cb = to_color32(color_b);
                 let (x0, y0, x1, y1) = (*x, *y, *x + *w, *y + *h);
@@ -359,6 +368,7 @@ pub(super) fn render_draw_commands(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use flint_debug_ui::run_headless_frame;
     use flint_script::context::DrawCommand;
 
     const MARK: [f32; 4] = [1.0, 0.0, 1.0, 1.0];
@@ -390,7 +400,8 @@ mod tests {
             ..Default::default()
         };
         let items = [dot(over_ui)];
-        let out = ctx.run(input, |ctx| {
+        let out = run_headless_frame(&ctx, input, |ui| {
+            let ctx = &ui.ctx().clone();
             render_draw_commands(
                 ctx,
                 &items,
@@ -399,7 +410,7 @@ mod tests {
                 &mut HashSet::new(),
                 &mut TextHalos::default(),
             );
-            egui::TopBottomPanel::top("header").show(ctx, |ui| ui.label("header"));
+            egui::Panel::top("header").show(ui, |ui| ui.label("header"));
             egui::Window::new("panel")
                 .fixed_pos([60.0, 0.0])
                 .show(ctx, |ui| ui.label("window"));
@@ -423,5 +434,94 @@ mod tests {
     fn over_ui_items_draw_over_panels_and_windows() {
         let (at, len) = dot_index(true);
         assert_eq!(at, len - 1, "painted after the header and the window");
+    }
+
+    /// The vertices egui tessellates for one `RectOutline` drawn through the
+    /// HUD path, with feathering off so each lies on a stroke edge.
+    fn outline_vertices(rect: egui::Rect, thickness: f32, rounding: f32) -> Vec<egui::Pos2> {
+        let ctx = egui::Context::default();
+        ctx.tessellation_options_mut(|o| o.feathering = false);
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(640.0, 360.0),
+            )),
+            ..Default::default()
+        };
+        let items = [DrawItem {
+            cmd: DrawCommand::RectOutline {
+                x: rect.min.x,
+                y: rect.min.y,
+                w: rect.width(),
+                h: rect.height(),
+                color: MARK,
+                thickness,
+                rounding,
+                layer: 0,
+            },
+            clip: None,
+            over_ui: false,
+        }];
+        let out = run_headless_frame(&ctx, input, |ui| {
+            render_draw_commands(
+                &ui.ctx().clone(),
+                &items,
+                &HashMap::new(),
+                &HashSet::new(),
+                &mut HashSet::new(),
+                &mut TextHalos::default(),
+            );
+        });
+        let mark = to_color32(&MARK);
+        ctx.tessellate(out.shapes, 1.0)
+            .into_iter()
+            .filter_map(|p| match p.primitive {
+                egui::epaint::Primitive::Mesh(m) => Some(m),
+                _ => None,
+            })
+            .flat_map(|m| m.vertices)
+            .filter(|v| v.color == mark)
+            .map(|v| v.pos)
+            .collect()
+    }
+
+    /// A script's outline is drawn outside its rect, as egui 0.30 drew it:
+    /// the box keeps its size, and the stroke reaches one thickness out.
+    /// egui 0.31 made the side a `StrokeKind`; the port passed `Middle`,
+    /// which drew half of every stroke inside (#989). A later egui bump
+    /// that moves the stroke fails here.
+    #[test]
+    fn a_rect_outline_strokes_outside_its_rect() {
+        let rect = egui::Rect::from_min_size(egui::pos2(100.0, 60.0), egui::vec2(200.0, 120.0));
+        for thickness in [1.0, 4.0, 8.0] {
+            let vertices = outline_vertices(rect, thickness, 0.0);
+            assert!(!vertices.is_empty(), "the outline is painted");
+            let inside = rect.shrink(0.01);
+            let stray: Vec<_> = vertices.iter().filter(|p| inside.contains(**p)).collect();
+            assert!(
+                stray.is_empty(),
+                "{thickness} px: stroke vertices inside the rect: {stray:?}"
+            );
+            let reach = egui::Rect::from_points(&vertices);
+            let want = rect.expand(thickness);
+            assert!(
+                (reach.min - want.min).length() < 0.01 && (reach.max - want.max).length() < 0.01,
+                "{thickness} px: the stroke covers {reach:?}, egui 0.30 covered {want:?}"
+            );
+        }
+    }
+
+    /// A rounded outline reaches one thickness out too. (Its inner edge
+    /// follows the rounded corners, which cut into the rect's bounding box,
+    /// so only the reach is checked.)
+    #[test]
+    fn a_rounded_rect_outline_reaches_one_thickness_out() {
+        let rect = egui::Rect::from_min_size(egui::pos2(100.0, 60.0), egui::vec2(200.0, 120.0));
+        let reach = egui::Rect::from_points(&outline_vertices(rect, 6.0, 12.0));
+        let want = rect.expand(6.0);
+        assert!(
+            (reach.min - want.min).length() < 0.01 && (reach.max - want.max).length() < 0.01,
+            "the rounded stroke covers {reach:?}, egui 0.30 covered {want:?}"
+        );
     }
 }

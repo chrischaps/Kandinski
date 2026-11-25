@@ -9,21 +9,19 @@
 //! Everything it needed from outside this file was its name in
 //! `register_styles!`.
 
+use crate::gpu_counts::CountedQueue;
 use super::kit;
 use super::{
-    StyleDescriptor, StyleDevice, StyleFrame, StyleHint, StyleInput, StyleParam, StylePass,
+    StyleDescriptor, StyleDevice, StyleFrame, StyleInput, StyleParam, StylePass,
     StyleStage,
 };
 use bytemuck::{Pod, Zeroable};
 
 pub(super) static STYLE: StyleDescriptor =
     StyleDescriptor::new("invert", "Invert", StyleStage::Display, create)
-        .params(&[StyleParam::new("strength", 1.0, 0.0..=1.0)])
-        .hints(&[StyleHint::new(
-            "strength",
-            "Strength",
-            "How far toward the negative: 0 = none, 1 = full",
-        )]);
+        .params(&[StyleParam::new("strength", 1.0, 0.0..=1.0)
+            .label("Strength")
+            .help("How far toward the negative: 0 = none, 1 = full")]);
 
 fn create(d: &StyleDevice) -> Box<dyn StylePass> {
     let device = d.device;
@@ -33,7 +31,7 @@ fn create(d: &StyleDevice) -> Box<dyn StylePass> {
         pipeline: kit::fullscreen_pipeline(
             device,
             "Invert Pipeline",
-            &kit::shader(device, "Invert Shader", kit::wgsl!("invert.wgsl")),
+            &kit::shader(device, "Invert Shader", kit::wgsl!("prelude_core.wgsl", "invert.wgsl")),
             &[&uniform_bgl, &input_bgl],
             d.format,
         ),
@@ -53,7 +51,7 @@ struct InvertUniforms {
 }
 
 struct Invert {
-    pipeline: wgpu::RenderPipeline,
+    pipeline: std::sync::Arc<wgpu::RenderPipeline>,
     uniforms: wgpu::Buffer,
     uniform_bgl: wgpu::BindGroupLayout,
     input_bgl: wgpu::BindGroupLayout,
@@ -74,7 +72,7 @@ impl StylePass for Invert {
         };
         frame
             .queue
-            .write_buffer(&self.uniforms, 0, bytemuck::cast_slice(&[uniforms]));
+            .write_buffer_counted(&self.uniforms, 0, bytemuck::cast_slice(&[uniforms]));
         kit::fullscreen_pass(
             encoder,
             "Invert Pass",

@@ -9,13 +9,19 @@
 //! suite on a kira manager with every stem sample-locked to one clock tick;
 //! [`render_offline`] renders the same session to samples, deterministically.
 //!
-//! This is the general layer. A rhythm game's contract (the fixed six-bus
-//! layout, beatmap charts, judgment, coherence, the degradation ladder,
-//! reintegration seams, replay and haptics) is `flint-rhythm`, which is
-//! built on this crate and adds its own rules to a manifest's validation.
+//! This is the general layer. A rhythm game's contract (its fixed bus
+//! layout, beatmap charts, judgment, coherence, the degradation ladder, the
+//! return after a full fail, replay and haptics) is `flint-rhythm`, which is
+//! built on this crate, reads its own tables from a manifest
+//! ([`manifest::SuiteManifest::tables`]) and adds its own rules to a
+//! manifest's validation.
 
+/// The mixer seam a suite plays on (#1216), from flint-audio: kira here,
+/// or the browser's worklet.
+pub use flint_audio::clocked;
 pub mod analysis;
 pub mod clock_bridge;
+pub mod components;
 pub mod conductor;
 /// TOML plumbing shared with the rhythm layer's formats. Not a stable API.
 #[doc(hidden)]

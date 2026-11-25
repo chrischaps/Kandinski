@@ -4,6 +4,7 @@
 
 use anyhow::{bail, Context, Result};
 use clap::{Args, Subcommand, ValueEnum};
+use flint_core::project::shown;
 use flint_render::stylize::{catalog, custom, StyleStage};
 use std::path::{Path, PathBuf};
 
@@ -72,11 +73,9 @@ pub struct PreludeArgs {
 
 #[derive(Args)]
 pub struct ListArgs {
-    /// A scene (or the folder holding it) whose styles/ to include
+    /// A scene (or the folder holding it) whose styles/ to include (the
+    /// global --json prints the list as JSON)
     pub scene: Option<PathBuf>,
-    /// Print the list as JSON
-    #[arg(long)]
-    pub json: bool,
 }
 
 pub fn run(cmd: StyleCommands) -> Result<()> {
@@ -117,27 +116,33 @@ fn new(args: NewArgs) -> Result<()> {
     if !args.force {
         for path in [&toml_path, &wgsl_path] {
             if path.exists() {
-                bail!(
-                    "{} is already there (--force overwrites it)",
-                    path.display()
-                );
+                bail!("{} is already there (--force overwrites it)", shown(path));
             }
         }
     }
-    std::fs::create_dir_all(&args.dir)
-        .with_context(|| format!("creating {}", args.dir.display()))?;
+    std::fs::create_dir_all(&args.dir).with_context(|| format!("creating {}", shown(&args.dir)))?;
     std::fs::write(&toml_path, &files.toml)
-        .with_context(|| format!("writing {}", toml_path.display()))?;
+        .with_context(|| format!("writing {}", shown(&toml_path)))?;
     std::fs::write(&wgsl_path, &files.wgsl)
-        .with_context(|| format!("writing {}", wgsl_path.display()))?;
-    println!("wrote {}", toml_path.display());
-    println!("wrote {}", wgsl_path.display());
+        .with_context(|| format!("writing {}", shown(&wgsl_path)))?;
     // What it is now: the template checks, so this is the first green light
     custom::check_file(&toml_path).map_err(anyhow::Error::msg)?;
-    println!("ok: {name} checks. Next:");
-    println!("  flint style check {}", toml_path.display());
-    println!("  flint render <scene> --style {name}:amount=1");
-    Ok(())
+    let next = [
+        format!("flint style check {}", shown(&toml_path)),
+        format!("flint render <scene> --style {name}:amount=1"),
+    ];
+    let written = [shown(&toml_path), shown(&wgsl_path)];
+    let text = format!(
+        "wrote {}\nwrote {}\nok: {name} checks. Next:\n  {}\n  {}",
+        shown(&toml_path),
+        shown(&wgsl_path),
+        next[0],
+        next[1]
+    );
+    crate::output::emit(&crate::output::Answer::new(
+        text,
+        serde_json::json!({ "name": name, "written": written, "next": next }),
+    ))
 }
 
 /// The `.shader.toml` files `paths` names: files as given, folders' own
@@ -147,7 +152,7 @@ fn style_files(paths: &[PathBuf]) -> Result<Vec<PathBuf>> {
     for path in paths {
         if path.is_dir() {
             let mut found: Vec<PathBuf> = std::fs::read_dir(path)
-                .with_context(|| format!("reading {}", path.display()))?
+                .with_context(|| format!("reading {}", shown(path)))?
                 .filter_map(|e| e.ok().map(|e| e.path()))
                 .filter(|p| {
                     p.file_name()
@@ -156,7 +161,7 @@ fn style_files(paths: &[PathBuf]) -> Result<Vec<PathBuf>> {
                 })
                 .collect();
             if found.is_empty() {
-                bail!("{}: no *{} files", path.display(), custom::SUFFIX);
+                bail!("{}: no *{} files", shown(path), custom::SUFFIX);
             }
             found.sort();
             files.extend(found);
@@ -170,25 +175,58 @@ fn style_files(paths: &[PathBuf]) -> Result<Vec<PathBuf>> {
 fn check(args: CheckArgs) -> Result<()> {
     let files = style_files(&args.paths)?;
     let mut failed = 0;
+    let mut checked = Vec::new();
     for file in &files {
-        match custom::check_file(file) {
+        checked.push(match custom::check_file(file) {
             Ok(report) => {
                 for warning in &report.warnings {
                     eprintln!("{warning}");
                 }
-                println!("ok: {}", file.display());
+                crate::output::say!("ok: {}", shown(file));
+                checked_json(file, Ok(&report))
             }
             Err(e) => {
                 eprintln!("error: {e}");
                 failed += 1;
+                checked_json(file, Err(&e))
             }
-        }
+        });
     }
+    crate::output::when_json(
+        || serde_json::json!({ "valid": failed == 0, "failed": failed, "styles": checked }),
+    );
     if failed > 0 {
         eprintln!("{failed} of {} styles failed", files.len());
-        std::process::exit(1);
+        return Err(crate::output::failed());
     }
     Ok(())
+}
+
+/// One style's entry in `flint style check --json` (#567): what the check
+/// counted when it compiles, each error in parts when it doesn't (the
+/// text as `error` too, as a host shows it).
+fn checked_json(file: &Path, result: Result<&custom::Report, &String>) -> serde_json::Value {
+    match result {
+        Ok(report) => serde_json::json!({
+            "file": shown(file),
+            "ok": true,
+            "loops": report.loops,
+            "bounded_loops": report.bounded,
+            "texture_reads": report.texture_reads,
+            "warnings": report.warnings,
+            "errors": [],
+        }),
+        Err(e) => serde_json::json!({
+            "file": shown(file),
+            "ok": false,
+            "loops": null,
+            "bounded_loops": null,
+            "texture_reads": null,
+            "warnings": [],
+            "errors": custom::error_parts(e, &shown(file)),
+            "error": e,
+        }),
+    }
 }
 
 fn prelude(args: PreludeArgs) -> Result<()> {
@@ -203,18 +241,28 @@ fn prelude(args: PreludeArgs) -> Result<()> {
                 let names: Vec<&str> = source.passes.iter().map(|p| p.name.as_str()).collect();
                 anyhow::anyhow!(
                     "{}: no pass \"{name}\" (its passes: {})",
-                    args.file.display(),
+                    shown(&args.file),
                     names.join(", ")
                 )
             })?,
     };
-    if args.composed {
+    let text = if args.composed {
         let path = &source.passes[pass].wgsl_path;
         let user =
-            std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-        print!("{}", custom::compose_pass(&source, pass, &user).text);
+            std::fs::read_to_string(path).with_context(|| format!("reading {}", shown(path)))?;
+        custom::compose_pass(&source, pass, &user).text
     } else {
-        print!("{}", custom::prelude_pass(&source, pass));
+        custom::prelude_pass(&source, pass)
+    };
+    if crate::output::json() {
+        crate::output::document(&serde_json::json!({
+            "file": shown(&args.file),
+            "pass": source.passes[pass].name,
+            "composed": args.composed,
+            "wgsl": text,
+        }));
+    } else {
+        print!("{text}");
     }
     Ok(())
 }
@@ -232,18 +280,18 @@ fn list(args: ListArgs) -> Result<()> {
     // The styles and choices a scene there sees, by its project's one
     // asset search (ADR 0114); with no scene, the working directory's
     let assets = flint_core::project::AssetScope::for_dir(scene_dir.unwrap_or(Path::new(".")));
+    let mut styles = flint_render::stylize::StyleRegistry::new();
     if scene_dir.is_some() {
-        for message in custom::load_for(&assets) {
+        for message in styles.load_for(&assets) {
             eprintln!("warning: {message}");
         }
     }
-    if args.json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&catalog::catalog_in(&assets))?
-        );
+    if crate::output::json() {
+        crate::output::document(&serde_json::to_value(catalog::catalog_in(
+            &styles, &assets,
+        ))?);
     } else {
-        print!("{}", catalog::catalog_text_in(&assets));
+        print!("{}", catalog::catalog_text_in(&styles, &assets));
     }
     Ok(())
 }

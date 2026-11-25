@@ -6,25 +6,42 @@ Panels are dev surface. They compile only when the player's `debug-hud` cargo fe
 
 ## Keys
 
-| Key | What it toggles | Host |
-|-----|-----------------|------|
-| `F3` | Every scene-component panel the current scene created (ocean, day/time, weather, grass, camera, reality, visitor, dead calm, particles, styles, Living Props), and every panel a game added | player |
-| `F4` | The **Rendering & Effects** panel, on its own so it never flips out of phase with F3 | player and scene viewer |
-| `` ` `` (backquote) | **Music Guide**, only while a [music session](../concepts/music-sessions.md) runs | player |
-| `\` (backslash) | **Manifest Map** timeline strip, same condition | player |
-| `F5` | Freeze or unfreeze a scene's [living props](#living-props-f3), as the panel's **Freeze** | player |
-| `F6` | Living Props [A/B](#comparing-two-presets-ab): show the other preset, starting a comparison if none is running | player |
-| `F7` | Living Props A/B: split the view, A left and B right, or put it back | player |
-| `F8` | Living Props: [pick the tree](#picking-a-tree-in-the-world) at the view centre, as a click would with the cursor free. `Shift+F8` picks the next tree by name, for a click that missed | player |
-| `Escape` | Lets go of a picked tree first. Otherwise it releases the mouse so panels can be clicked; clicking the world recaptures it | player |
+The debug keys are a table (#717): each belongs to an owner (the player, or a scene subsystem), has an action name an input config's [`[debug_keys]`](../concepts/physics-and-runtime.md#debug-keys) can move, unbind or turn off, and acts only where its owner is. **F1** shows the table over the running game; `flint play <scene> --list-keys [--json]` prints it.
 
-Opening any panel releases the cursor; closing the last one recaptures it if the scene has a player entity. When a key has nothing to toggle (no panels in the scene, no music session, no renderer) the player says so instead: a short note at the top of the window for about two seconds, and the same line in the console (`[debug] F3: no debug panels in this scene`).
+![The F1 card in the Living Props bench, with an input config that moves stats to F10, unbinds the freeze and binds backquote to the game's console](../images/debug-keys-f1.png)
 
-The old per-effect function keys (F1 debug-mode cycle, F4 shadows, F5 to F10 per-effect toggles, F12 kuwahara) are gone. Everything they flipped now lives in the Rendering & Effects panel, along with the non-binary parameters those keys could never expose ([ADR 0053](https://github.com/chrischaps/Flint/blob/main/docs/adr/0053-one-rendering-and-effects-menu-on-f4.md), consolidated render debug menu). F5 to F7 came back for Living Props, and only do anything in a scene that has some.
+| Key | Action | What it does | Owner, and where it acts |
+|-----|--------|--------------|--------------------------|
+| `F1` | `keys` | This table, over the game | player, always |
+| `F2` | `stats` | The **stats overlay**: the [frame-time graph](profiling.md#the-frame-time-graph) and its hitch counters over the rendering stats; a second press shows the graph alone in a corner, a third closes it | player, always (and the scene viewer: its F2 has the graph and hitch counters above its rendering stats, with bars split into `update`, `render`, `egui` and `elsewhere`; no compact form) |
+| `Shift+F2` | `capture_frame` | Capture the next frame for the frame debugger: a `.flintframe` folder in `captures/` ([Capturing from the running player](profiling.md#capturing-from-the-running-player)); the note at the top names it | player, always (desktop) |
+| `Shift+F3` | `save_trace` | Save the last seconds of the engine's scopes as a trace in `traces/` ([Recording a trace](profiling.md#recording-a-trace)); the first press starts the recorder when no flag did | player, always, in a build with the recorder (desktop) |
+| `F3` | `panels` | Every scene-component panel the current scene created (ocean, grass, camera, particles, styles, Living Props), a [panel for each component whose schema asks for one](#a-panel-from-a-schema), and every panel a game added | player, always |
+| `F4` | `render_panel` | The **Rendering & Effects** panel, on its own so it never flips out of phase with F3 | player, always (and the scene viewer) |
+| `F11` | `fullscreen` | Fullscreen, or back to the window | player, always |
+| `F5` | `living_freeze` | Freeze or unfreeze a scene's [living props](#living-props-f3), as the panel's **Freeze** | living, in a scene with living props or wooze |
+| `F6` | `living_flip` | Living Props [A/B](#comparing-two-presets-ab): show the other preset, starting a comparison if none is running | living, same |
+| `F7` | `living_split` | Living Props A/B: split the view, A left and B right, or put it back | living, same |
+| `F8` | `living_pick` | Living Props: [pick the tree](#picking-a-tree-in-the-world) at the view centre, as a click would with the cursor free | living, same |
+| `Shift+F8` | `living_pick_next` | Pick the next tree by name, for a click that missed | living, same |
+| `` ` `` (backquote) | `music_guide` | **Music Guide** | music, while a [music session](../concepts/music-sessions.md) with a chart plays |
+| `\` (backslash) | `manifest_map` | **Manifest Map** timeline strip | music, same |
+| `F9` | `music_force_fail` | Force the full rewind, seam and reassembly | music, same |
+
+`Escape` is not in the table: it lets go of a picked tree first, otherwise releases the mouse so panels can be clicked (clicking the world recaptures it), and is the game's when it binds it ([Escape](../concepts/physics-and-runtime.md#escape)).
+
+Where its owner isn't, a key is the game's like any other: in a scene with no living props, F5 reaches the game. So does any debug key the game's input config binds, and a press the table does take never reaches the game. Opening any panel releases the cursor; closing the last one recaptures it if the scene has a player entity. When a key has nothing to toggle (no panels in the scene, no renderer, a music session that has ended) the player says so instead: a short note at the top of the window for about two seconds, and the same line in the console (`[debug] F3: no debug panels in this scene`).
+
+The old per-effect function keys (F1 debug-mode cycle, F4 shadows, F5 to F10 per-effect toggles, F12 kuwahara) are gone. Everything they flipped now lives in the Rendering & Effects panel, along with the non-binary parameters those keys could never expose ([ADR 0053](https://github.com/chrischaps/Flint/blob/main/docs/adr/0053-one-rendering-and-effects-menu-on-f4.md), consolidated render debug menu). F5 to F7 came back for Living Props, and F1 for the table of keys.
+
+The editors `flint edit` opens have the same F1 (#1170): the card lists the
+host's F1 and the editor's own keys ([the `edit` command](../cli-reference/overview.md#one-host-the-same-flags)).
+
+A scene subsystem declares its keys in its file (`DEBUG_KEYS` in `crates/flint-player/src/player_app/subsystems/`) and acts on them in `Subsystem::on_debug_key`; the table and F1 pick it up with no other edit.
 
 ## Layout
 
-Side panels are fold-open headers distributed across up to three columns. Column assignment is a greedy lightest-bin pass over a per-panel weight so the tall panels do not all land in one column: Rendering & Effects weighs 60, Ocean Debug 46, Living Props 40, Styles 24, Grass Debug 22, Reality 20, Weather 15, Particles 14, Day / Time 10, and anything else, including every game-supplied panel, 6. The assignment is deterministic and never produces an empty column.
+Side panels are fold-open headers distributed across up to three columns. Column assignment is a greedy lightest-bin pass over each panel's `weight()`, about how many rows tall it is, so the tall panels do not all land in one column: Rendering & Effects weighs 60, Ocean Debug 46, Living Props 40, Styles 24, Grass Debug 22, Particles 14, a schema's panel one for each row it draws, and anything else, including every panel a game's extension adds, 6. The assignment is deterministic and never produces an empty column.
 
 A panel can instead ask for the `Bottom` layout, a full-width strip. The Manifest Map uses it; timeline-shaped panels should.
 
@@ -39,21 +56,62 @@ Scene-component panels are created **only when their driving component is presen
 | Panel | Component | What it tunes |
 |-------|-----------|---------------|
 | Ocean Debug | `ocean` | Wave spectrum, colours, foam, contact foam, cel band edges, clarity and turbidity, grid, CPU/GPU parity probe |
-| Day / Time | `time_of_day` | Clock readout, 0 to 24 h scrub, preset hours, natural-advance toggle, day counter, day length, sun path tilt |
-| Weather | `weather` | Weather state, with one-shot triggers |
 | Camera | `camera_tuning` | Vertical FOV (the same component is applied even without the panel) |
 | Grass Debug | `terrain` with `grass.enabled`, or a `grass_ground` | Every field of the [grass](../concepts/terrain.md#grass) block, the [woozy grass](../concepts/procgen.md#woozy-grass) clock and comb included |
-| Reality | `reality` | Read-only status of a script-scheduled "reality tear" (active render mode, mix, time to next) plus trigger and end-now buttons |
-| Visitor | `raft_visitor` | Visitor state |
-| Dead Calm | `dead_calm` | Dead-calm state |
+| (its schema's title) | any component one of whose fields says `panel = ...` in its schema | Its status line, trigger buttons and tune fields. [Below](#a-panel-from-a-schema) |
 | Rendering & Effects | always, when a renderer exists | See below |
 | Particles | `particle_emitter` or `particle_effect` | Alive counts per effect instance, play / stop / burst, the global particle budget, and a draw toggle that keeps simulating while hiding the result |
 | Styles | a `[post_process.styles]` table, or a `style_mask` entity | The [style editor](../concepts/stylize-passes.md) F4 has, plus the scene's styled entities, each with its style and that style's mask-view hue |
 | Living Props | `living_prop` | Every knob of a grove live, the warped clock as a curve, freeze and single-step, a pose overlay, picking a tree in the world to tune its species, and presets saved as TOML. [Below](#living-props-f3) |
 | Music Guide | active music session | Upcoming input windows and per-channel targets |
 | Manifest Map | active music session | Suite structure, playhead, this run's history |
+| Expression | an expression feed (`--expression-timeline`, `--expression-listen`) | Nothing to tune: what scripts hear. The latest `expression()` state as a table, its source and how long ago it arrived (game time), the last 12 states newest first with what changed in each, the timeline's playhead and next event, and the socket's connections and dropped lines. [Scripting](../concepts/scripting.md#expression-api) |
 
-`time_of_day`, `weather`, `reality`, `raft_visitor` and `dead_calm` are game-side component conventions; the engine ships the panel, the game ships the schema.
+Before #744 the engine also shipped five panels for one game's components (Float's day/time, weather, reality tears, visitor and dead calm). They are schema lines in that game now, and any game's controller gets the same with no Rust.
+
+## A Panel From a Schema
+
+A script-driven controller usually wants the same three things on a debug panel: a status line saying what it is doing, a button or two to make it do something now, and a few dials. Say so beside its fields, in the component's schema, and every entity carrying the component gets an F3 panel:
+
+```toml
+[component.harbour_lantern.panel]
+title = "Lantern"                          # optional; the default is "Harbour lantern"
+
+[component.harbour_lantern.fields]
+phase = { type = "f32", default = 0.0, panel = { role = "status", labels = ["Dark", "Kindling", "Lit", "Guttering"] } }
+night = { type = "f32", default = 0.0, panel = { role = "status", format = "night {:.0}" } }
+trigger_light = { type = "f32", default = -1.0, panel = { role = "trigger", label = "Light now" } }
+burn_duration_s = { type = "f32", default = 150.0, min = 1.0, panel = "tune" }
+```
+
+A field's `panel` is a role, or a table with a `role` and the keys below. The panel's rows are in the order the fields are written.
+
+| Role | On the panel |
+|------|--------------|
+| `status` | Read only: a part of the one status line at the top, the parts joined by `·` |
+| `trigger` | A button that writes `press` into the component once, for the script to act on and clear: `true` for a `bool` field, `1` for a number. With `labels`, a button per name, each writing its index |
+| `tune` | An editor: a checkbox for a `bool`, a choice for an `enum` or for a number with `labels`, a text box for a string, a drag value (or a slider) for a number. A tune field with a `format` is on the status line too |
+
+| Key | For | Means |
+|-----|-----|-------|
+| `label` | any | What the row is called (default: the field's name, so `burn_duration_s` reads "Burn duration s"). The field's `description` shows on hover |
+| `labels` | a number | Names for its values 0, 1, 2...: what the status line says, the choices a tune row offers, a trigger's buttons. An empty name is no button |
+| `format` | status | How the value reads: `{}` is the value (its label's name if it has labels), `{:.N}` the number to N places, `{:clock}` hours as `HH:MM` |
+| `scale` | status | The status line shows the value times this (`100` for a percentage) |
+| `unset` | a number | The value that means "not set" (`-1`: the script decides). The status line leaves it out; a tune row is a checkbox that writes it when cleared |
+| `from` | tune with `unset` | The field whose live value the row starts from when checked (the weather's state, for a forced state) |
+| `min`, `max` | tune | The editor's range, when it isn't the field's own `min` and `max`. A field with an `unset` outside its range keeps the range here, so validation doesn't refuse the `-1` |
+| `step` | tune | A drag value's speed |
+| `slider` | tune | A slider instead of a drag value; needs both ends |
+| `presets` | tune | Buttons under the editor that jump to a value: `[["Dawn", 6.0], ["Noon", 12.5]]` |
+| `commit` | tune | `false` keeps a field the script owns (a day counter) out of Commit to File and Reset |
+| `press` | trigger | What the button writes, when not `true` or `1` |
+
+`[component.<name>.panel]` holds only `title`, and is optional: a component is on a panel as soon as one field says so. A mistake (a role that is none, a key a field's panel doesn't hold, a `format` with no placeholder) is a `bad-panel` warning from `flint validate` and `flint check` naming the file and the field; that row is left off, and the rest of the schema loads as it did. An engine from before #744 ignores a field's `panel` key, so a game can write its panel lines before it updates its engine (the `[component.<name>.panel]` table it would refuse).
+
+`flint schema <component>` shows what the panel holds without opening F3: a `Panel "<title>":` line under the header naming each role's fields, and `--format json` the whole of it as `panel` ([Schemas as data](../concepts/schemas.md#schemas-as-data)).
+
+The panel is a live view of the component. Each frame it writes what you changed and reads the component back, so a field the script moves (the time of day while it advances) is what the slider shows, and a trigger is one write that the script clears. Reset puts back the tune fields the scene loaded with, and Commit to File writes them into the scene file. When several entities carry the component, each gets a panel, titled with its name.
 
 ### Rendering & Effects (F4)
 
@@ -89,11 +147,13 @@ At the top is the warped clock, drawn as what it is: one step's worth of hold, t
 
 | Section | Knobs |
 |---------|-------|
-| Clock | `step`, `glide`, `drift` (the field's `amplitude`), `jitter`, `stagger` |
+| Clock | `step`, `glide`, `drift` (the field's `amplitude`), `jitter`, `jitter rate` (how fast the boil ticks, times each spec's `jitter.step`; [Leaf jitter](../concepts/procgen.md#leaf-jitter)), `row rate` (how fast a form's words drift along their lines, times each spec's `row_pace`; [Drifting rows](../concepts/procgen.md#drifting-rows)), `stagger` |
 | Shading boil | On or off, `paint`, `ink`, and on ones, twos or threes. Paint needs Kuwahara on and ink needs contour on, both in F4, and the panel says so |
 | Echoes | `count`, `spread` and `alpha`, with `count = 0` in reach to compare the grove without them |
 | Variance | `amount`, `steady` and `keep size`. **Unheld** sets 1, 0 and off: each pose exactly as it grew |
 | Silhouette | `softness`: the body's outline feathers at rest, 0 a hard edge; the cards keep theirs ([Softness](../concepts/procgen.md#softness)) |
+
+Hover a knob for a line on what it does; a `mixed` one says why it's mixed instead.
 
 **What a knob does right away.** Nothing here pops except stagger, which can't change without moving a part to its new place on the clock.
 
@@ -182,8 +242,8 @@ From a script: [`compare_living`](../concepts/scripting.md#living-props-api) and
 
 Every panel follows one ownership model:
 
-1. While the panel is **clean** the host refreshes it from live engine state every frame. What you see is the truth about the current value, including values a script is driving.
-2. When you **edit** a field the panel becomes dirty. The host applies the panel's state back to the engine, routing expensive work by per-group change flags (a post-config upload is cheap; a shadow-pass rebuild or a debug-mode pipeline swap is not), then clears the dirty flag.
+1. While the panel is **clean** its `sync` refreshes it from live engine state every frame. What you see is the truth about the current value, including values a script is driving.
+2. When you **edit** a field the panel becomes dirty. Its `sync` applies the panel's state back to the engine, routing expensive work by per-group change flags (a post-config upload is cheap; a shadow-pass rebuild or a debug-mode pipeline swap is not), then clears the dirty flag.
 3. Fields a script stamps each frame are visibly **reclaimed** on the next frame. The panel does not pretend to own a value it does not own.
 
 For the render panel the player adds **Freeze script post overrides**: while frozen, script and ladder stamps on the post fields are skipped so panel edits stick. It is a tuning aid, not a way to override a game.
@@ -226,6 +286,8 @@ pub trait DebugPanel {
     fn is_open(&self) -> bool;
     fn toggle(&mut self);
     fn layout(&self) -> PanelLayout { PanelLayout::SideRight }
+    fn sync(&mut self, ctx: &mut PanelCtx) {} // apply edits, read state back
+    fn weight(&self) -> u32 { 6 }           // rows tall, for the columns
     fn is_dirty(&self) -> bool;             // unapplied edits?
     fn clear_dirty(&mut self);
     fn as_any(&self) -> &dyn std::any::Any;
@@ -233,7 +295,7 @@ pub trait DebugPanel {
 }
 ```
 
-The player holds `Vec<Box<dyn DebugPanel>>` and renders them generically. Construction follows one pattern: look for the first entity carrying the driving component, build a config from that component, and push the panel with the scene path and entity name so Commit to File knows where to write. The host then downcasts through `as_any_mut` when it needs the concrete config to apply. Unknown panel names take the default column weight; nothing else needs registering.
+The player holds `Vec<Box<dyn DebugPanel>>` and renders them generically. Construction follows one pattern: look for the first entity carrying the driving component, build a config from that component, and push the panel with the scene path and entity name so Commit to File knows where to write. Each frame, before the panels draw, the player hands every panel one `PanelCtx` (the world, the renderer and its device, the camera, the particles, and a `PanelHost` for what a panel tells the player: F4's freeze switch and look, a style it committed, whether particles draw), and each panel's `sync` applies its own edits. The player never asks a panel its name to know what to do with it (#744). Nothing needs registering.
 
 The game's panels go through this trait too, on a small panel the player holds for each name, whose contents it draws by calling the extension.
 

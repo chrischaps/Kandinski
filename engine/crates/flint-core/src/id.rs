@@ -2,25 +2,25 @@
 
 use serde::{Deserialize, Serialize};
 use std::fmt;
-use std::sync::atomic::{AtomicU64, Ordering};
-
-/// Global counter for generating unique IDs
-static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
 /// A stable entity identifier that persists across save/load cycles.
 ///
 /// Unlike internal ECS entity IDs which may be recycled or change,
 /// `EntityId` provides a stable reference for scene files and queries.
+///
+/// Ids are handed out by a world, never minted on their own (#688): each
+/// `FlintWorld` counts from 1 (or from past the world before it, so a scene
+/// transition never reuses an id something may still hold), and a scene
+/// spawns its entities in name order, so the same scene always gives the
+/// same names the same ids. There was a process-wide counter, which made
+/// ids depend on whatever had been spawned before; it is gone, and with it
+/// `EntityId::new()`. An id no world gave out (a test's "nobody") is
+/// [`EntityId::from_raw`].
 #[derive(Clone, Copy, Hash, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct EntityId(pub u64);
 
 impl EntityId {
-    /// Create a new unique EntityId
-    pub fn new() -> Self {
-        Self(NEXT_ID.fetch_add(1, Ordering::Relaxed))
-    }
-
     /// Create an EntityId from a raw value (for deserialization/testing)
     pub fn from_raw(id: u64) -> Self {
         Self(id)
@@ -29,34 +29,6 @@ impl EntityId {
     /// Get the raw u64 value
     pub fn raw(&self) -> u64 {
         self.0
-    }
-
-    /// Reset the ID counter (for testing only)
-    #[cfg(test)]
-    pub fn reset_counter() {
-        NEXT_ID.store(1, Ordering::Relaxed);
-    }
-
-    /// Set the counter to at least the given value (for loading scenes)
-    pub fn ensure_counter_above(value: u64) {
-        let mut current = NEXT_ID.load(Ordering::Relaxed);
-        while current <= value {
-            match NEXT_ID.compare_exchange_weak(
-                current,
-                value + 1,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => break,
-                Err(c) => current = c,
-            }
-        }
-    }
-}
-
-impl Default for EntityId {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -77,25 +49,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_id_generation() {
-        EntityId::reset_counter();
-        let id1 = EntityId::new();
-        let id2 = EntityId::new();
-        assert_ne!(id1, id2);
-        assert!(id2.0 > id1.0);
-    }
-
-    #[test]
     fn test_from_raw() {
         let id = EntityId::from_raw(42);
         assert_eq!(id.raw(), 42);
     }
 
     #[test]
-    fn test_ensure_counter_above() {
-        EntityId::reset_counter();
-        EntityId::ensure_counter_above(100);
-        let id = EntityId::new();
-        assert!(id.0 > 100);
+    fn ids_order_by_value() {
+        assert!(EntityId::from_raw(2) < EntityId::from_raw(10));
     }
 }

@@ -7,8 +7,12 @@
 //! spline editor mode for interactive track editing.
 
 pub mod app;
+pub mod edits;
+mod field_clocks;
+pub mod host;
 pub mod panels;
 pub mod picking;
 pub mod projection;
 pub mod spline_editor;
 pub mod undo;
+pub mod watch;

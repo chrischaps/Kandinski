@@ -10,8 +10,6 @@ flint edit levels/tavern.scene.toml --watch --schemas schemas
 
 The `--watch` flag enables hot-reload: edit the scene TOML file, and the viewer re-parses and re-renders automatically. The entire file is re-parsed on each change (not incremental), which keeps the implementation simple and avoids synchronization issues.
 
-`flint serve` still works as a hidden alias for the same viewer.
-
 ## Camera Controls
 
 The viewer uses an orbit camera that rotates around a focus point. If the scene has a `[camera]` block, the orbit starts from that authored framing.
@@ -30,6 +28,8 @@ The viewer uses an orbit camera that rotates around a focus point. If the scene 
 | Escape | Quit / cancel gizmo drag |
 
 Any manual orbit input cancels auto-orbit. Start in turntable mode with `--auto-orbit`.
+
+This is the same orbit camera every `flint edit` editor uses, with the same speeds: a model or terrain turns under the mouse just as a scene does. Dragging down tilts the view to look from higher up, and the view cube in the corner turns the same way when you drag it. Click one of its axes and the camera eases round to that side, orthographic; orbit again and it is perspective once more. A press on a gizmo handle moves the entity and never the camera, and a click selects only if the mouse stayed put: a drag to orbit selects nothing.
 
 ## The Selection Outline
 
@@ -57,12 +57,34 @@ The gizmo uses constraint-plane dragging: for single-axis movement, it automatic
 | Input | Action |
 |-------|--------|
 | W / E / R | Gizmo mode: translate / rotate / scale (entity selected) |
-| Ctrl+S | Save scene to disk: only the fields you edited are written, the rest of the file stays as it is; with nothing edited the file isn't touched |
-| Ctrl+Z | Undo position change |
-| Ctrl+Shift+Z | Redo position change |
+| Ctrl+S | Save scene to disk: only the fields that differ from the file are written, the rest of the file stays as it is; with nothing changed the file isn't touched |
+| Ctrl+Z | Undo the last edit |
+| Ctrl+Shift+Z / Ctrl+Y | Redo it |
 | Escape | Cancel current gizmo drag |
 
-All position changes are tracked in an undo/redo stack. Saving writes the modified positions back to the scene TOML file.
+Every edit, from the gizmo or the inspector, is on an undo/redo stack. The title's `*` and the status bar's **Modified** say the scene differs from its file: an undo after a save marks it again (the next save writes the value it put back), and undoing back to what the file says clears it.
+
+The history outlives a reload. When the file changes on disk (an agent editing it while you work), the viewer reloads it and keeps each undo step whose field still holds what the step left there, finding its entity by name. Undo then puts back your last edit over the agent's file. A field the agent changed itself ends that field's history, so an undo never throws the agent's value away; the terminal says how many steps went.
+
+An entity a prefab instance makes isn't written in the scene file, so its edits go into the instance's overrides, `[prefabs.<instance>.overrides.<entity>.<component>]`, which the loader merges over the template. An edit that can't be written anywhere (an entity the file doesn't have and no instance makes) is named in red in the status bar and keeps the scene marked; the save doesn't say "Saved!".
+
+### What you changed
+
+Each save appends one JSON line per field it wrote to `.flint/viewer-edits.jsonl` under the project root, so an agent can read what was tweaked without diffing the file:
+
+```json
+{"component":"transform","entity":"props_barrel","field":"position","new":[-2.0,0.48,3.0],"old":[1.3,0.48,5.6],"saved_at":1794808511,"scene":"scenes/props.scene.toml","table":"prefabs.props.overrides.barrel.transform"}
+```
+
+`old` is the value the file had (`null`: the entity didn't have the field), `new` the one written, `table` where it went, and `saved_at` the save's time in Unix seconds; one save's lines share it. `flint init` puts the file in the project's `.gitignore`.
+
+F4's **Commit to scene** is in the list too, a line for each `[post_process]` key it wrote, with `entity` `null`:
+
+```json
+{"component":"post_process","entity":null,"field":"cell","new":12,"old":8,"saved_at":1794808530,"scene":"scenes/props.scene.toml","table":"post_process.styles.ascii"}
+```
+
+A key the commit took out (back at its default) has `new` `null`.
 
 ## The Inspector Panel
 
@@ -81,7 +103,7 @@ The viewer renders scenes with the same PBR pipeline used by the player:
 - glTF mesh rendering with material support
 - The scene's `[post_process]` block, applied on load
 - Live particles: `particle_emitter` and `particle_effect` entities simulate in the viewer, so inspector edits show immediately
-- Render stats overlay (**F2**)
+- Render stats overlay (**F2**), with the [frame-time graph](../guides/profiling.md#the-frame-time-graph) above it
 - Normal arrows (**F3**)
 - The Rendering & Effects menu (**F4**)
 - Fullscreen toggle (**F11**)

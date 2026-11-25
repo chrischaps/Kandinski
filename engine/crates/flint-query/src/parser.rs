@@ -93,7 +93,7 @@ pub fn parse_query(input: &str) -> Result<Query, QueryError> {
                 Rule::where_clause => {
                     for clause_inner in inner.into_inner() {
                         if clause_inner.as_rule() == Rule::condition {
-                            condition = Some(parse_condition(clause_inner)?);
+                            condition = Some(condition_from(clause_inner)?);
                         }
                     }
                 }
@@ -108,7 +108,52 @@ pub fn parse_query(input: &str) -> Result<Query, QueryError> {
     })
 }
 
-fn parse_condition(pair: pest::iterators::Pair<Rule>) -> Result<Condition, QueryError> {
+/// One condition alone (`door.open == true`), the form after `where`, for
+/// asking it of one entity ([`crate::entity_matches`]; #714).
+pub fn parse_condition(input: &str) -> Result<Condition, QueryError> {
+    let pairs = QueryParser::parse(Rule::condition_only, input)
+        .map_err(|e| QueryError::ParseError(e.to_string()))?;
+    for pair in pairs {
+        for inner in pair.into_inner() {
+            if inner.as_rule() == Rule::condition {
+                return condition_from(inner);
+            }
+        }
+    }
+    Err(QueryError::ParseError(format!("no condition in `{input}`")))
+}
+
+impl std::fmt::Display for Operator {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Operator::Equal => "==",
+            Operator::NotEqual => "!=",
+            Operator::Contains => "contains",
+            Operator::GreaterThan => ">",
+            Operator::LessThan => "<",
+            Operator::GreaterThanOrEqual => ">=",
+            Operator::LessThanOrEqual => "<=",
+        })
+    }
+}
+
+impl std::fmt::Display for QueryValue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            QueryValue::String(s) => write!(f, "'{s}'"),
+            QueryValue::Number(n) => write!(f, "{n}"),
+            QueryValue::Boolean(b) => write!(f, "{b}"),
+        }
+    }
+}
+
+impl std::fmt::Display for Condition {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} {} {}", self.field, self.operator, self.value)
+    }
+}
+
+fn condition_from(pair: pest::iterators::Pair<Rule>) -> Result<Condition, QueryError> {
     let mut field = String::new();
     let mut operator = Operator::Equal;
     let mut value = QueryValue::String(String::new());
@@ -238,5 +283,31 @@ mod tests {
         let cond = query.condition.unwrap();
         assert_eq!(cond.operator, Operator::GreaterThan);
         assert_eq!(cond.value.as_f64(), Some(50.0));
+    }
+
+    /// A field steps into an array by an axis or by `[n]` (#1185); the
+    /// field keeps its spelling, so a report quotes it as written.
+    #[test]
+    fn a_field_steps_into_an_array_by_index() {
+        for field in [
+            "transform.position[2]",
+            "path.points[3].x",
+            "grid.cells[0][1]",
+            "transform.position.z",
+        ] {
+            let cond = parse_condition(&format!("{field} > 5")).unwrap();
+            assert_eq!(cond.field, field);
+        }
+        for bad in [
+            "transform.position[] > 5",
+            "transform.position[-1] > 5",
+            "transform.position[x] > 5",
+            "transform.position[1.5] > 5",
+            "transform.position.2 > 5",
+            "transform.position [2] > 5",
+            "[0].x > 5",
+        ] {
+            assert!(parse_condition(bad).is_err(), "{bad:?} parsed");
+        }
     }
 }

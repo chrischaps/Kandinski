@@ -57,7 +57,7 @@ The Gradle build runs two tasks:
 2. **`copyGameAssets`** --- Copies your game's assets into the APK:
    - Scene files (`*.scene.toml`, `*.sprite.toml`, `*.anim.toml`)
    - Directories: `schemas/`, `scripts/`, `sprites/`, `textures/`, `models/`, `audio/`, `animations/`
-   - Engine schemas are copied separately into `engine/schemas/`
+   - Engine schemas are copied separately into `engine/schemas/`, and each package's manifest and `schemas/` into `engine/packages/`, so the packages' schemas come with the engine's as on desktop
    - Generates `asset_manifest.txt` listing every bundled file path
 
 ### Asset Manifest
@@ -71,7 +71,7 @@ When the APK launches:
 1. **`android_main()`** initializes Android logging (visible in `logcat`)
 2. **Asset extraction** copies all bundled files from the APK to internal storage so that `std::fs` code works unchanged --- no virtual filesystem needed
 3. **Version marker** (`.asset_version`) prevents redundant extraction on subsequent launches
-4. **Schema loading** loads engine schemas then game schemas (same merge order as desktop)
+4. **Schema loading** goes through the same resolver as desktop: the `[project] schemas` list in your packed `flint.toml` (paths from the game root, so `["engine/schemas", "engine/schemas/examples", "schemas"]` works, since Gradle copies the engine's whole `schemas/` tree to `engine/schemas`). With no list it loads `engine/schemas` then `schemas`. Logcat prints the list it loaded and where it came from; a listed directory the APK doesn't hold is an error line naming it, and the game starts on the two packed ones
 5. **Scene discovery** finds the first `*.scene.toml` file in the extracted assets
 6. **Player event loop** starts the game using the same `PlayerApp` as desktop, with Android surface integration
 

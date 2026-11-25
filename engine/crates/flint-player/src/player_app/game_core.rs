@@ -63,14 +63,30 @@ pub struct GameCore {
     /// policy name (`subsystem::state_machine`, #727).
     pub(crate) state_machine: GameStateMachine,
     pub(crate) store: PersistentStore,
+    /// The styles the scene is drawn with (#742): the built-ins, the
+    /// game's (`PlayerExtension::styles`, #419) and the user styles the
+    /// scene can see. The core's own, so a headless run has them too; the
+    /// renderer is handed a copy at each scene's bind and after a reload.
+    pub styles: flint_render::stylize::StyleRegistry,
     /// Entity style tweens (#370), stepped with game time.
     pub(crate) style_tweens: super::style_commands::StyleTweens,
+    /// Scripts' `tween`s of component fields (#734), stepped with them.
+    pub(crate) field_tweens: flint_script::FieldTweens,
     /// The renderer's config generation the scripts' style reader was
     /// last made from (#372).
     pub(crate) style_reader_generation: Option<u64>,
-    /// The procgen resolver, which holds the scene's living props.
+    /// The procgen resolver: the scene's specs and generators, and the
+    /// frame budget its queue lends the living props.
     #[cfg(feature = "procgen")]
     pub(crate) procgen_resolver: ProcGenResolver,
+    /// The triangles of procgen and runtime meshes, for the `mesh` and
+    /// `convex` colliders that name them (#1222; `collider_meshes.rs`)
+    pub(crate) collider_sources: super::collider_meshes::ColliderSources,
+    /// The scene's living props (flint-living, #1024), beside the resolver
+    /// that makes their poses: added at load, before the living subsystem
+    /// exists, and kept across scenes for their pose cache.
+    #[cfg(feature = "living")]
+    pub(crate) living_props: flint_living::LivingProps,
     /// What scripts asked of the frame (#697): the camera, post-processing,
     /// distance levers, cursor and touch, held from the command that asked
     /// to the step of the frame that applies each.
@@ -78,9 +94,16 @@ pub struct GameCore {
     /// Script commands no part of this scene takes that have been warned
     /// about, once a run each (`set_wooze` in a scene with no field).
     pub(crate) commands_warned: std::collections::HashSet<&'static str>,
+    /// The fixed physics steps that ran last frame (the frame history,
+    /// #1076); a step a paused state skipped isn't one.
+    pub(crate) fixed_steps: u32,
     /// The script modules the game's extensions declared (#754): enabled
     /// for the whole run, beside the subsystems'.
     pub(crate) extension_modules: Vec<&'static str>,
+    /// Every named event of the run with its game time (`fire_event` and
+    /// the engine's own), for an input script's `expect event` / `wait
+    /// event` (#714). `None`, and nothing kept, unless the run has checks.
+    pub event_log: Option<Vec<(f64, String)>>,
 }
 
 impl GameCore {
@@ -99,13 +122,20 @@ impl GameCore {
             script: crate::script_system(),
             state_machine: super::subsystem::state_machine(),
             store: PersistentStore::new(),
+            styles: Default::default(),
             style_tweens: Default::default(),
+            field_tweens: Default::default(),
             style_reader_generation: None,
             #[cfg(feature = "procgen")]
             procgen_resolver: ProcGenResolver::new(),
+            collider_sources: Default::default(),
+            #[cfg(feature = "living")]
+            living_props: Default::default(),
             script_requests: Default::default(),
             commands_warned: Default::default(),
+            fixed_steps: 0,
             extension_modules: Vec::new(),
+            event_log: None,
         }
     }
 }
@@ -229,6 +259,11 @@ pub(crate) trait FrameHost {
     /// HUD's draw lists, world lines and world text) is the host's.
     fn script_ui_drawn(&mut self) {}
 
+    /// The scripts are done with the frame's world: the models of the
+    /// entities spawned since the last frame (a script's `spawn_entity`)
+    /// load, before animation and the renderer's sync see them (#1107).
+    fn late_models(&mut self) {}
+
     /// The frame's sound, before animation moves on: its triggers from the
     /// game events, and the sources' update.
     fn sound(&mut self, _policy: &StateConfig, _events: &[GameEvent]) {}
@@ -300,6 +335,13 @@ pub(crate) fn step<H: FrameHost + ?Sized>(host: &mut H) {
     let steps_physics = !host.capture();
     let moved = {
         let (core, lent) = host.lend();
+        // Triangles that came since the last frame (a procgen model the
+        // queue finished, a mesh an extension uploaded), for the bodies
+        // whose `mesh` or `convex` collider names them (#1222)
+        if steps_physics {
+            core.collider_sources
+                .refresh(&core.world, &mut core.physics, lent.renderer.as_deref());
+        }
         core.tick_fixed_physics(
             config,
             has_fps_player && steps_physics,
@@ -354,12 +396,14 @@ pub(crate) fn step<H: FrameHost + ?Sized>(host: &mut H) {
     // draw), then what it asked, then what it drew
     {
         let core = host.core();
+        flint_core::scope!("call_draw_uis");
         core.script.call_draw_uis(&mut core.world);
     }
     dispatch(host);
     host.script_ui_drawn();
     host.phase_done(Phase::ScriptUi);
     run_stage(host, Stage::ScriptUi, Some(config));
+    host.late_models();
 
     // Sound triggers, animations + sprite-end callbacks, bone matrices,
     // bone probes, IK, particles
@@ -398,6 +442,7 @@ pub(crate) fn run_stage<H: FrameHost + ?Sized>(
     policy: Option<&StateConfig>,
 ) {
     if !host.core().subsystems.is_empty() {
+        flint_core::scope!("subsystems", stage.label());
         let (core, lent) = host.lend();
         core.with_subsystems(lent, policy, |subsystems, ctx| {
             subsystems.update(stage, ctx)
@@ -427,6 +472,8 @@ impl GameCore {
             gpu: lent.gpu,
             #[cfg(feature = "procgen")]
             resolver: &mut self.procgen_resolver,
+            #[cfg(feature = "living")]
+            living: &mut self.living_props,
             project: &self.project,
             scene_path: &self.scene_path,
             scene_file_writable: lent.scene_file_writable,
@@ -448,7 +495,15 @@ impl GameCore {
     /// released. Always collected: input is processed while paused, so
     /// pause/unpause keybinds work.
     fn collect_game_events(&mut self, input: &InputState) -> Vec<GameEvent> {
+        flint_core::scope!("collect_game_events");
         let mut game_events = self.events.drain();
+        if let Some(log) = &mut self.event_log {
+            for event in &game_events {
+                if let GameEvent::Custom { name, .. } = event {
+                    log.push((self.clock.total_time, name.clone()));
+                }
+            }
+        }
         for action in input.actions_just_pressed() {
             game_events.push(GameEvent::ActionPressed(action));
         }
@@ -460,8 +515,8 @@ impl GameCore {
 
     /// Hand scripts' style reads (#372) the settings the renderer draws
     /// with, copied only when they've changed since the last hand-over.
-    #[profiling::function]
     fn publish_style_reader(&mut self, renderer: Option<&SceneRenderer>) {
+        flint_core::scope!("publish_style_reader");
         let Some(renderer) = renderer else {
             return;
         };
@@ -470,7 +525,7 @@ impl GameCore {
             self.style_reader_generation = Some(generation);
             let config = renderer.effective_post_process_config().clone();
             self.script.set_style_reader(std::sync::Arc::new(
-                super::style_commands::SceneStyles::new(config),
+                super::style_commands::SceneStyles::new(config, renderer.styles().clone()),
             ));
         }
     }
@@ -479,6 +534,7 @@ impl GameCore {
     /// input and events, the clock), then `on_update` unless the game state
     /// pauses scripts.
     fn run_scripts(&mut self, config: &StateConfig, events: &[GameEvent], lent: Lent<'_>) {
+        flint_core::scope!("run_scripts");
         self.publish_style_reader(lent.renderer.as_deref());
         let camera = &*lent.camera;
         self.script
@@ -502,7 +558,6 @@ impl GameCore {
     /// consuming steps to avoid a spiral), then the first-person camera.
     /// Returns where the listener goes, when the sound runs and a
     /// first-person player moved the camera.
-    #[profiling::function]
     fn tick_fixed_physics(
         &mut self,
         config: &StateConfig,
@@ -511,11 +566,19 @@ impl GameCore {
         input: &InputState,
         camera: &mut Camera,
     ) -> Option<Listener> {
+        flint_core::scope!("tick_fixed_physics");
         self.physics.begin_frame(self.clock.pending_fixed_ratio());
+        self.fixed_steps = 0;
+        // Look and the jump press once a frame, however many steps run
+        // below: none on most frames above 60 Hz, two at 30 (#728)
+        if has_fps_player && config.runs(PHYSICS) {
+            self.physics.character_frame_input(input, &self.world);
+        }
         while self.clock.should_fixed_update() {
             let dt = self.clock.fixed_timestep;
 
             if steps && config.runs(PHYSICS) {
+                self.fixed_steps += 1;
                 if has_fps_player {
                     self.physics.update_character(input, &mut self.world, dt);
                 }
@@ -548,18 +611,23 @@ impl GameCore {
         })
     }
 
-    /// Move the style tweens on by this frame's game time (#370), while
-    /// scripts run.
+    /// Move the style tweens (#370) and the field tweens (#734) on by this
+    /// frame's game time, while scripts run.
     fn step_style_tweens(&mut self) {
         if self.state_machine.active_config().runs(SCRIPTS) {
-            let step = self
-                .style_tweens
-                .step(&mut self.world, self.clock.delta_time);
+            flint_core::scope!("step_style_tweens");
+            let dt = self.clock.delta_time;
+            let step = self.style_tweens.step(&mut self.world, &self.styles, dt);
             for event in step.events {
                 self.events.push(event);
             }
             for message in step.failures {
                 tracing::warn!(target: "script", "{message}");
+            }
+            if !self.field_tweens.is_empty() {
+                for event in self.field_tweens.step(&mut self.world, dt) {
+                    self.events.push(event);
+                }
             }
         }
     }
@@ -578,9 +646,9 @@ impl GameCore {
             return;
         }
         let mut config = renderer.post_process_config().clone();
-        let (step, moved) = self
-            .style_tweens
-            .step_post(&mut config, self.clock.delta_time);
+        let (step, moved) =
+            self.style_tweens
+                .step_post(&mut config, &self.styles, self.clock.delta_time);
         if moved {
             renderer.set_post_process_config(config);
         }
@@ -611,8 +679,8 @@ impl GameCore {
 
     /// Animations, then the sprite animations' ends and sequence cues to
     /// the scripts (skipped while the game state pauses animation).
-    #[profiling::function]
     fn animate(&mut self, config: &StateConfig) {
+        flint_core::scope!("animate");
         if !config.runs(ANIMATION) {
             return;
         }
@@ -631,7 +699,10 @@ impl GameCore {
         let cues = self.animation.drain_sequence_cues();
         if !cues.is_empty() {
             for cue in &cues {
-                println!(
+                // Each cue is the script's to say (`on_sequence_cue`);
+                // `RUST_LOG=script=debug` lists them (#716)
+                tracing::debug!(
+                    target: "script",
                     "[sequence] {:?} '{}' cue '{}' at {:.2}s",
                     cue.entity_id, cue.sequence, cue.cue, cue.time
                 );
@@ -642,10 +713,14 @@ impl GameCore {
 
     /// Bone probes, IK, then the particles.
     fn after_animation(&mut self, config: &StateConfig) {
+        flint_core::scope!("after_animation");
         // Publish bone_probe joints: model-local joint positions written
         // into the component right after the pose computation, so scripts
         // read this frame's pose (e.g. seat_camera following the eye).
-        super::headless_animation::publish_bone_probes(&self.animation, &mut self.world);
+        {
+            flint_core::scope!("publish_bone_probes");
+            super::headless_animation::publish_bone_probes(&self.animation, &mut self.world);
+        }
 
         // Two-bone IK (ADR 0070): pin chain tips to their targets now that
         // scripts, physics and animation have all posed the world; the
@@ -665,15 +740,24 @@ impl GameCore {
     /// renderer, when there is one. Living props move on after it, at
     /// `Stage::Procgen`, in whatever it left of the budget.
     #[cfg(feature = "procgen")]
-    #[profiling::function]
     pub(crate) fn tick_procgen(&mut self, lent: Lent<'_>) {
+        flint_core::scope!("tick_procgen");
+        use flint_core::frame_notes::{self, NoteKind};
+        // Whether the queue made anything is known only after: timed by
+        // hand, noted (#1077) when it did
+        let began = frame_notes::listening().then(web_time::Instant::now);
+        // A load's procgen stage too (#1092), forgotten when nothing came
+        let span =
+            flint_core::load_report::span(flint_core::load_report::Stage::Procgen, String::new);
         let completed = self
             .procgen_resolver
             .process_frame(lent.camera.position_array());
         let failures = self.procgen_resolver.take_failures();
         if completed.is_empty() && failures.is_empty() {
+            span.discard();
             return;
         }
+        let detail = began.map(|_| procgen_note(&completed, failures.len()));
         if let (Some(renderer), Some((device, queue))) = (lent.renderer, lent.gpu) {
             // Catalog names never reach the queue, so the file fallback
             // needs only the scene's own search paths.
@@ -681,16 +765,42 @@ impl GameCore {
                 self.project.clone(),
                 &self.scene_path,
             );
-            let mut sink = super::procgen_assets::GpuSink {
+            let mut gpu = super::procgen_assets::GpuSink {
                 renderer,
                 device,
                 queue,
                 config: &config,
             };
+            // Each mesh's triangles kept for the colliders naming it (#1222)
+            let mut sink = super::collider_meshes::Recording {
+                sink: &mut gpu,
+                sources: &mut self.collider_sources,
+            };
             super::procgen_assets::apply_completed(&completed, &mut sink);
             super::procgen_assets::apply_failures(&failures, &mut sink);
         }
+        if let (Some(began), Some(detail)) = (began, detail) {
+            let ms = began.elapsed().as_secs_f32() * 1000.0;
+            frame_notes::note(NoteKind::Procgen, || detail, Some(ms));
+        }
     }
+}
+
+/// `2 generated: oak_tree, stone_wall; 1 failed`, for a frame note.
+#[cfg(feature = "procgen")]
+fn procgen_note(completed: &[flint_procgen::CompletedAsset], failed: usize) -> String {
+    let mut line = String::new();
+    if !completed.is_empty() {
+        let names: Vec<&str> = completed.iter().map(|c| c.spec_name.as_str()).collect();
+        line = format!("{} generated: {}", completed.len(), names.join(", "));
+    }
+    if failed > 0 {
+        if !line.is_empty() {
+            line.push_str("; ");
+        }
+        line.push_str(&format!("{failed} failed"));
+    }
+    line
 }
 
 /// Carry out what the scripts have asked since the last drain (#697), in
@@ -714,6 +824,7 @@ pub(crate) fn dispatch_commands<H: FrameHost + ?Sized>(
     host: &mut H,
     mut commands: Vec<ScriptCommand>,
 ) {
+    flint_core::scope!("dispatch_commands", commands.len());
     commands.retain(|command| !host.refuses(command));
     if !host.core().subsystems.is_empty() && !commands.is_empty() {
         let (core, lent) = host.lend();
@@ -752,9 +863,14 @@ pub(crate) fn for_the_host(command: &ScriptCommand) -> bool {
         C::PlaySound { .. }
         | C::PlaySoundAt { .. }
         | C::StopSound { .. }
+        | C::SetSoundVolume { .. }
+        | C::SetBusVolume { .. }
+        | C::SetUserBusVolume { .. }
+        | C::SetBusLowpass { .. }
         | C::Rumble { .. }
         | C::SetCameraCutDetection { .. }
         | C::SetLook { .. }
+        | C::PrepareLook { .. }
         | C::SetQuality { .. }
         | C::ResetPostStyle { .. }
         | C::LoadScene { .. }
@@ -773,6 +889,13 @@ fn style_applied(core: &mut GameCore, applied: StyleApplied) {
         StyleApplied::Done(Some(event)) => core.events.push(event),
         StyleApplied::Done(None) => {}
         StyleApplied::Failed(message) => tracing::warn!(target: "script", "{message}"),
+        // Applied, past its range (#492)
+        StyleApplied::Clamped(event, message) => {
+            tracing::warn!(target: "script", "{message}");
+            if let Some(event) = event {
+                core.events.push(event);
+            }
+        }
     }
 }
 
@@ -782,14 +905,17 @@ fn style_applied(core: &mut GameCore, applied: StyleApplied) {
 fn edit_post_styles(
     core: &mut GameCore,
     renderer: Option<&mut SceneRenderer>,
-    edit: impl FnOnce(&mut flint_render::PostProcessConfig) -> StyleApplied,
+    edit: impl FnOnce(
+        &mut flint_render::PostProcessConfig,
+        &flint_render::stylize::StyleRegistry,
+    ) -> StyleApplied,
 ) {
     let Some(renderer) = renderer else {
         return;
     };
     let mut config = renderer.post_process_config().clone();
-    let applied = edit(&mut config);
-    if let StyleApplied::Done(_) = applied {
+    let applied = edit(&mut config, &core.styles);
+    if applied.applied() {
         renderer.set_post_process_config(config);
     }
     style_applied(core, applied);
@@ -805,8 +931,8 @@ pub(crate) fn reset_post_style(
 ) {
     // The scene's values win over a tween's (#406)
     core.style_tweens.stop_post(style, None);
-    edit_post_styles(core, renderer, |config| {
-        super::style_commands::reset_post_style(config, authored, style)
+    edit_post_styles(core, renderer, |config, styles| {
+        super::style_commands::reset_post_style(config, styles, authored, style)
     });
 }
 
@@ -851,7 +977,10 @@ impl CoreCommands<'_> {
     /// Without a renderer there is no frame to style.
     fn edit_post_styles(
         &mut self,
-        edit: impl FnOnce(&mut flint_render::PostProcessConfig) -> StyleApplied,
+        edit: impl FnOnce(
+            &mut flint_render::PostProcessConfig,
+            &flint_render::stylize::StyleRegistry,
+        ) -> StyleApplied,
     ) {
         edit_post_styles(self.core, self.renderer.as_deref_mut(), edit);
     }
@@ -874,7 +1003,7 @@ impl CoreCommands<'_> {
         if self.quiet {
             tracing::info!("{line}");
         } else {
-            println!("{line}");
+            tracing::info!(target: "script", "{line}");
         }
     }
 }
@@ -929,17 +1058,17 @@ impl ScriptHost for CoreCommands<'_> {
 
     fn set_entity_style(&mut self, entity: EntityId, style: String) {
         let core = &mut *self.core;
-        let applied = core
-            .style_tweens
-            .set_entity_style(&mut core.world, entity, &style);
+        let applied =
+            core.style_tweens
+                .set_entity_style(&mut core.world, &core.styles, entity, &style);
         self.style_applied(applied);
     }
 
     fn set_style_param(&mut self, entity: EntityId, param: String, value: toml::Value) {
         let core = &mut *self.core;
-        let applied = core
-            .style_tweens
-            .set_style_param(&mut core.world, entity, &param, value);
+        let applied =
+            core.style_tweens
+                .set_style_param(&mut core.world, &core.styles, entity, &param, value);
         self.style_applied(applied);
     }
 
@@ -965,6 +1094,7 @@ impl ScriptHost for CoreCommands<'_> {
             let core = &mut *self.core;
             core.style_tweens.tween(
                 &mut core.world,
+                &core.styles,
                 config,
                 entity,
                 &param,
@@ -976,25 +1106,44 @@ impl ScriptHost for CoreCommands<'_> {
         self.style_applied(applied);
     }
 
+    fn tween(
+        &mut self,
+        entity: EntityId,
+        path: String,
+        target: toml::Value,
+        seconds: f64,
+        easing: flint_core::tween::Easing,
+    ) {
+        let core = &mut *self.core;
+        let started =
+            (core.field_tweens).start(&mut core.world, entity, &path, &target, seconds, easing);
+        match started {
+            Ok(Some(done)) => core.events.push(done),
+            Ok(None) => {}
+            // The world changed between the call, which checked, and now
+            Err(message) => tracing::warn!(target: "script", "{message}"),
+        }
+    }
+
     fn clear_entity_style(&mut self, entity: EntityId) {
         let core = &mut *self.core;
         let applied = core
             .style_tweens
-            .clear_entity_style(&mut core.world, entity);
+            .clear_entity_style(&mut core.world, &core.styles, entity);
         self.style_applied(applied);
     }
 
     fn set_post_style(&mut self, style: String, enabled: bool) {
-        self.edit_post_styles(|config| {
-            super::style_commands::set_post_style(config, &style, enabled)
+        self.edit_post_styles(|config, styles| {
+            super::style_commands::set_post_style(config, styles, &style, enabled)
         });
     }
 
     fn set_post_style_param(&mut self, style: String, param: String, value: toml::Value) {
         // The script took over from a tween of it (#406)
         self.core.style_tweens.stop_post(&style, Some(&param));
-        self.edit_post_styles(|config| {
-            super::style_commands::set_post_style_param(config, &style, &param, value)
+        self.edit_post_styles(|config, styles| {
+            super::style_commands::set_post_style_param(config, styles, &style, &param, value)
         });
     }
 
@@ -1012,8 +1161,16 @@ impl ScriptHost for CoreCommands<'_> {
             return;
         };
         let mut config = renderer.post_process_config().clone();
-        let applied = tweens.tween_post(&mut config, &style, &param, target, seconds, &easing);
-        if let StyleApplied::Done(_) = applied {
+        let applied = tweens.tween_post(
+            &mut config,
+            &core.styles,
+            &style,
+            &param,
+            target,
+            seconds,
+            &easing,
+        );
+        if applied.applied() {
             renderer.set_post_process_config(config);
         }
         style_applied(core, applied);
@@ -1059,10 +1216,6 @@ impl ScriptHost for CoreCommands<'_> {
 
     fn set_post_process(&mut self, post: PostProcessOverrides) {
         self.core.script_requests.post.merge(post);
-    }
-
-    fn set_fog_color(&mut self, color: [f32; 3]) {
-        self.core.script_requests.fog_color = Some(color);
     }
 
     fn set_render_mode(&mut self, mode: Option<(u32, f32)>, params: Option<[f32; 4]>) {

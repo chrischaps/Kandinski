@@ -1,0 +1,27 @@
+# Kandinski (AFTERGLOW): a neon road against the clock, on the Flint engine.
+#
+# This file marks the project root. Every flint command, the viewer and the
+# player read it, from any folder of the project, so none of them needs a
+# --schemas flag.
+
+[project]
+# Saves are keyed on it: config/input.toml's game_id, so saves stay put.
+id = "kandinski"
+# Schema directories in override order: the game's come last and win.
+schemas = ["engine/schemas", "schemas"]
+# What `flint play` opens when no scene is named.
+scene = "scenes/kandinski.scene.toml"
+# The game's input layer, over the engine's built-in bindings.
+input = "config/input.toml"
+
+# The engine's packages the game uses (ADR 0136). The kernel and the
+# standard packages (procgen, debug-hud) are in unless set to false; a
+# feature package is in only when it is listed here, as `living = "*"`
+# (living props), `music`, `rhythm` or `ai`. `flint build` builds a player
+# and a CLI with these and nothing else; `flint package used --write`
+# lists what the game uses.
+[packages]
+# Nothing here makes a model or texture from a *.procgen.toml spec, so
+# procgen is left out (`flint package used` finds none), and with it
+# flint-procgen and flint-wooze. The F3/F4 panels (debug-hud) stay.
+procgen = false

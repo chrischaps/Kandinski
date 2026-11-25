@@ -1,21 +1,26 @@
 //! Asset management commands
 
+#[cfg(feature = "ai")]
+use crate::output::progress;
+use crate::output::{self, say};
 use anyhow::Result;
 use clap::Subcommand;
 use flint_asset::{
     AssetCatalog, AssetMeta, AssetResolver, AssetType, ContentStore, Project, ProjectStore,
     ResolutionStrategy,
 };
+#[cfg(feature = "ai")]
 use flint_asset_gen::provider::{
     AssetKind, AudioParams, GenerateRequest, ModelParams, TextureParams,
 };
-use flint_asset_gen::{
-    register_generated_asset_in, write_asset_sidecar_with_root, FlintConfig, JobStore, StyleGuide,
-};
-use flint_core::components as comp;
+#[cfg(feature = "ai")]
+use flint_asset_gen::{register_generated_asset_in, Calls, FlintConfig, JobStore, StyleGuide};
 use flint_import::import_gltf;
+use serde_json::json;
 use std::collections::HashMap;
 use std::path::Path;
+#[cfg(feature = "ai")]
+use std::sync::Arc;
 
 #[derive(Subcommand)]
 pub enum AssetCommands {
@@ -70,6 +75,18 @@ pub enum AssetCommands {
         /// Output directory for generated assets or task files
         #[arg(long)]
         output_dir: Option<String>,
+
+        /// Refuse any paid call that could take this run's spend past USD;
+        /// checked before each call is sent
+        #[arg(long, value_name = "USD", value_parser = super::common_args::parse_usd)]
+        max_cost: Option<f64>,
+
+        /// Schema directory, repeatable; the list of every `asset` field
+        /// read comes from these. Without it: the project's flint.toml
+        /// `schemas`, else schemas/ in the working directory, beside the
+        /// scene and one level up
+        #[arg(long)]
+        schemas: Vec<String>,
     },
 
     /// Generate an asset using AI
@@ -116,6 +133,11 @@ pub enum AssetCommands {
         /// Audio duration in seconds
         #[arg(long)]
         duration: Option<f64>,
+
+        /// Refuse any paid call that could take this run's spend past USD;
+        /// checked before each call is sent
+        #[arg(long, value_name = "USD", value_parser = super::common_args::parse_usd)]
+        max_cost: Option<f64>,
     },
 
     /// Validate a generated asset against style constraints
@@ -159,6 +181,19 @@ pub enum AssetCommands {
         /// Output directory
         #[arg(long)]
         output: Option<String>,
+
+        /// Refuse any paid call that could take this run's spend past USD;
+        /// checked before each call is sent
+        #[arg(long, value_name = "USD", value_parser = super::common_args::parse_usd)]
+        max_cost: Option<f64>,
+    },
+
+    /// What AI calls have cost, from the project's ledger
+    /// (.flint/ai_costs.jsonl): assets, procgen specs and looks together
+    Costs {
+        /// Only calls on or after this date (YYYY-MM-DD)
+        #[arg(long, value_name = "DATE")]
+        since: Option<String>,
     },
 
     /// Show which file the engine would load for an asset name, and
@@ -173,16 +208,13 @@ pub enum AssetCommands {
         name: String,
 
         /// The scene that names it; without one, a scene in the working
-        /// directory is assumed
+        /// directory is assumed (the global --json answers as one document)
         #[arg(long)]
         scene: Option<String>,
-
-        /// One JSON document on stdout
-        #[arg(long)]
-        json: bool,
     },
 
-    /// Manage generation jobs
+    /// Generations that take minutes (Meshy's models): each is a job from
+    /// the moment the provider accepts it
     #[command(subcommand)]
     Job(JobCommands),
 }
@@ -197,9 +229,50 @@ pub enum JobCommands {
 
     /// List all generation jobs
     List,
+
+    /// Finish a job a generate didn't see through (the process stopped, or
+    /// the wait timed out): wait for it, download it and register the
+    /// asset. Nothing new is paid for
+    Resume {
+        /// Job ID
+        id: String,
+
+        /// Output directory (defaults to <project>/.flint/generated)
+        #[arg(long)]
+        output: Option<String>,
+    },
 }
 
+#[cfg(not(feature = "ai"))]
+impl AssetCommands {
+    /// The words of a subcommand that is the ai package's
+    /// (`packages/ai/package.toml`): the provider calls, their jobs, ledger
+    /// and style checks, and `resolve`'s batch strategies (#1333).
+    pub fn ai_words(&self) -> Option<String> {
+        Some(match self {
+            AssetCommands::Generate { .. } => "flint asset generate".into(),
+            AssetCommands::Validate { .. } => "flint asset validate".into(),
+            AssetCommands::Manifest { .. } => "flint asset manifest".into(),
+            AssetCommands::Regenerate { .. } => "flint asset regenerate".into(),
+            AssetCommands::Costs { .. } => "flint asset costs".into(),
+            AssetCommands::Job(_) => "flint asset job".into(),
+            AssetCommands::Resolve { strategy, .. } if BATCH_STRATEGIES.contains(&&**strategy) => {
+                format!("flint asset resolve --strategy {strategy}")
+            }
+            _ => return None,
+        })
+    }
+}
+
+/// `resolve`'s strategies that hand a missing asset to a provider or a
+/// person, through flint-asset-gen's batch.
+const BATCH_STRATEGIES: &[&str] = &["ai_generate", "human_task", "ai_then_human"];
+
 pub fn run(cmd: AssetCommands) -> Result<()> {
+    #[cfg(not(feature = "ai"))]
+    if let Some(words) = cmd.ai_words() {
+        return Err(super::absent::missing(words, "ai"));
+    }
     match cmd {
         AssetCommands::Import { path, name, tags } => run_import(&path, name, tags),
         AssetCommands::List {
@@ -213,7 +286,17 @@ pub fn run(cmd: AssetCommands) -> Result<()> {
             strategy,
             style,
             output_dir,
-        } => run_resolve(&scene, &strategy, style.as_deref(), output_dir.as_deref()),
+            max_cost,
+            schemas,
+        } => run_resolve(
+            &scene,
+            &strategy,
+            style.as_deref(),
+            output_dir.as_deref(),
+            max_cost,
+            &schemas,
+        ),
+        #[cfg(feature = "ai")]
         AssetCommands::Generate {
             asset_type,
             description,
@@ -226,43 +309,56 @@ pub fn run(cmd: AssetCommands) -> Result<()> {
             tags,
             output,
             duration,
-        } => run_generate(
-            &asset_type,
-            &description,
+            max_cost,
+        } => run_generate(Generate {
+            asset_type: &asset_type,
+            description: &description,
             name,
             provider,
-            style,
+            style_name: style,
             width,
             height,
             seed,
             tags,
-            output,
+            output_dir: output,
             duration,
-        ),
+            max_cost,
+            operation: "generate",
+        }),
+        #[cfg(feature = "ai")]
         AssetCommands::Validate { path, style } => run_validate(&path, style.as_deref()),
+        #[cfg(feature = "ai")]
         AssetCommands::Manifest { output, assets_dir } => {
             run_manifest(&output, assets_dir.as_deref())
         }
+        #[cfg(feature = "ai")]
         AssetCommands::Regenerate {
             name,
             seed,
             provider,
             style,
             output,
-        } => run_regenerate(&name, seed, provider, style, output),
-        AssetCommands::Where {
-            kind,
-            name,
-            scene,
-            json,
-        } => super::asset_where::run(kind, &name, scene.as_deref(), json),
+            max_cost,
+        } => run_regenerate(&name, seed, provider, style, output, max_cost),
+        #[cfg(feature = "ai")]
+        AssetCommands::Costs { since } => {
+            super::ai_costs::cost_report(&super::ai_costs::ledger(), since.as_deref())
+        }
+        AssetCommands::Where { kind, name, scene } => {
+            super::asset_where::run(kind, &name, scene.as_deref(), output::json())
+        }
+        #[cfg(feature = "ai")]
         AssetCommands::Job(job_cmd) => run_job(job_cmd),
+        #[cfg(not(feature = "ai"))]
+        _ => unreachable!("ai_words refused the ai package's subcommands"),
     }
 }
 
-fn run_generate(
-    asset_type: &str,
-    description: &str,
+/// What `flint asset generate` (and `regenerate`) asks for.
+#[cfg(feature = "ai")]
+struct Generate<'a> {
+    asset_type: &'a str,
+    description: &'a str,
     name: Option<String>,
     provider: Option<String>,
     style_name: Option<String>,
@@ -272,7 +368,36 @@ fn run_generate(
     tags: Option<String>,
     output_dir: Option<String>,
     duration: Option<f64>,
-) -> Result<()> {
+    max_cost: Option<f64>,
+    /// The ledger's `operation`.
+    operation: &'static str,
+}
+
+/// What a project's provider calls go through: its ledger and prices, the
+/// run's ceiling, and its job store.
+#[cfg(feature = "ai")]
+fn project_calls(project: &Project, max_cost: Option<f64>) -> Result<Calls> {
+    let meter = super::ai_costs::meter_at(&project.root, "asset-gen", max_cost)?;
+    Ok(Calls::new(Arc::new(meter)).with_jobs(JobStore::new(project.jobs_dir())))
+}
+
+#[cfg(feature = "ai")]
+fn run_generate(g: Generate<'_>) -> Result<()> {
+    let Generate {
+        asset_type,
+        description,
+        name,
+        provider,
+        style_name,
+        width,
+        height,
+        seed,
+        tags,
+        output_dir,
+        duration,
+        max_cost,
+        operation,
+    } = g;
     let kind = match asset_type {
         "texture" => AssetKind::Texture,
         "model" => AssetKind::Model,
@@ -355,16 +480,21 @@ fn run_generate(
         tags: tag_list,
     };
 
-    // Create provider
-    let gen_provider = flint_asset_gen::providers::create_provider(provider_name, &config)?;
+    // Create provider, its calls metered into the project's ledger
+    let project = Project::current()?;
+    let calls = project_calls(&project, max_cost)?;
+    calls.meter.set_context(&asset_name, operation);
+    let gen_provider = flint_asset_gen::providers::create_provider(provider_name, &config, &calls)?;
 
-    println!(
+    progress!(
         "Generating {} '{}' via {}...",
-        kind, asset_name, provider_name
+        kind,
+        asset_name,
+        provider_name
     );
 
     if let Some(ref s) = style {
-        println!(
+        progress!(
             "  Style: {} (prompt enriched with palette + constraints)",
             s.name
         );
@@ -372,29 +502,49 @@ fn run_generate(
 
     // Show the prompt that will be used
     let prompt = gen_provider.build_prompt(&request, style.as_ref());
-    println!("  Prompt: {}", prompt);
+    progress!("  Prompt: {}", prompt);
+    let estimate = calls
+        .meter
+        .price_call(provider_name, gen_provider.billed_units(&request))
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    if estimate > 0.0 {
+        progress!("  Cost: up to {}", flint_ai_core::cost::usd(estimate));
+    }
 
     // Generate
-    let project = Project::current()?;
     let out_dir = match output_dir.as_deref() {
         Some(d) => std::path::PathBuf::from(d),
         None => project.generated_dir(),
     };
 
-    let result = gen_provider.generate(&request, style.as_ref(), &out_dir)?;
+    let result = match gen_provider.generate(&request, style.as_ref(), &out_dir) {
+        Ok(r) => r,
+        Err(e) => {
+            if calls.meter.calls() > 0 {
+                progress!("  {}", super::ai_costs::spent_line(&calls.meter));
+            }
+            return Err(e.into());
+        }
+    };
 
-    println!("  Downloaded: {}", result.output_path);
+    say!("  Downloaded: {}", result.output_path);
+    if let Some(job) = result.metadata.get("job_id") {
+        say!("  Job: {job}");
+    }
+    say!("  {}", super::ai_costs::spent_line(&calls.meter));
 
     // Post-generation validation for models
+    let mut checks = None;
     if kind == AssetKind::Model {
-        println!("  Validating...");
+        progress!("  Validating...");
         match flint_asset_gen::validate::validate_model(
             Path::new(&result.output_path),
             style.as_ref(),
         ) {
             Ok(report) => {
+                checks = Some(report.checks.clone());
                 for check in &report.checks {
-                    println!(
+                    say!(
                         "    [{:>5}] {}: {}",
                         check.status.to_string(),
                         check.name,
@@ -410,17 +560,34 @@ fn run_generate(
 
     // Store in content-addressed storage and register sidecar metadata
     let registered = register_generated_asset_in(&project, &request, &result)?;
-    println!(
+    say!(
         "  Stored: {} in {}",
         registered.hash,
         Project::display(&project.store_dir())
     );
-    println!("  Sidecar: {}", registered.sidecar_path.display());
+    say!("  Sidecar: {}", registered.sidecar_path.display());
 
-    println!("  Done in {:.1}s", result.duration_secs);
+    say!("  Done in {:.1}s", result.duration_secs);
+    output::when_json(|| {
+        json!({
+            "name": asset_name,
+            "kind": kind.to_string(),
+            "provider": provider_name,
+            "style": style.as_ref().map(|s| s.name.clone()),
+            "prompt": prompt,
+            "output": result.output_path,
+            "hash": registered.hash.to_string(),
+            "sidecar": registered.sidecar_path.display().to_string().replace('\\', "/"),
+            "seconds": result.duration_secs,
+            "checks": checks,
+            "cost_usd": calls.meter.spent(),
+            "job": result.metadata.get("job_id"),
+        })
+    });
     Ok(())
 }
 
+#[cfg(feature = "ai")]
 fn run_manifest(output: &str, assets_dir: Option<&str>) -> Result<()> {
     let assets_dir = match assets_dir {
         Some(d) => std::path::PathBuf::from(d),
@@ -434,26 +601,32 @@ fn run_manifest(output: &str, assets_dir: Option<&str>) -> Result<()> {
         .save(output_path)
         .map_err(|e| anyhow::anyhow!("{}", e))?;
 
-    println!(
+    say!(
         "Build manifest: {} entries -> {}",
         manifest.entries.len(),
         output
     );
     for entry in &manifest.entries {
-        println!(
+        say!(
             "  {} ({}) via {} [{}]",
-            entry.name, entry.asset_type, entry.provider, entry.content_hash
+            entry.name,
+            entry.asset_type,
+            entry.provider,
+            entry.content_hash
         );
     }
+    output::when_json(|| json!({ "output": output, "entries": manifest.entries }));
     Ok(())
 }
 
+#[cfg(feature = "ai")]
 fn run_regenerate(
     name: &str,
     seed: Option<u64>,
     provider_override: Option<String>,
     style_name: Option<String>,
     output_dir: Option<String>,
+    max_cost: Option<f64>,
 ) -> Result<()> {
     // Look up the existing asset in catalog for its metadata
     let catalog = AssetCatalog::load_from_directory(Project::current()?.catalog_dir())?;
@@ -485,34 +658,39 @@ fn run_regenerate(
 
     let provider_name = provider_override.as_deref().unwrap_or(&original_provider);
 
-    println!(
+    progress!(
         "Regenerating '{}' ({}) via {}...",
-        name, kind, provider_name
+        name,
+        kind,
+        provider_name
     );
     if !original_prompt.is_empty() {
-        println!("  Original prompt: {}", original_prompt);
+        progress!("  Original prompt: {}", original_prompt);
     }
 
     // Use the same description/prompt, with optional new seed
-    run_generate(
-        match kind {
+    run_generate(Generate {
+        asset_type: match kind {
             AssetKind::Texture => "texture",
             AssetKind::Model => "model",
             AssetKind::Audio => "audio",
         },
-        &original_prompt,
-        Some(name.to_string()),
-        Some(provider_name.to_string()),
+        description: &original_prompt,
+        name: Some(name.to_string()),
+        provider: Some(provider_name.to_string()),
         style_name,
-        1024,
-        1024,
+        width: 1024,
+        height: 1024,
         seed,
-        None,
+        tags: None,
         output_dir,
-        None,
-    )
+        duration: None,
+        max_cost,
+        operation: "regenerate",
+    })
 }
 
+#[cfg(feature = "ai")]
 fn run_job(cmd: JobCommands) -> Result<()> {
     let store = JobStore::default_store()?;
 
@@ -520,43 +698,128 @@ fn run_job(cmd: JobCommands) -> Result<()> {
         JobCommands::Status { id } => {
             let job = store.load(&id).map_err(|e| anyhow::anyhow!("{}", e))?;
 
-            println!("Job: {}", job.id);
-            println!("  Provider: {}", job.provider);
-            println!("  Asset: {}", job.asset_name);
-            println!("  Status: {:?}", job.status);
-            println!("  Progress: {}%", job.progress);
-            println!("  Submitted: {}", job.submitted_at);
+            say!("Job: {}", job.id);
+            say!("  Provider: {}", job.provider);
+            say!("  Asset: {}", job.asset_name);
+            say!("  Status: {:?}", job.status);
+            say!("  Progress: {}%", job.progress);
+            if let Some(ref task) = job.remote_id {
+                say!("  Task: {}", task);
+            }
+            if let Some(ref refine) = job.refine_id {
+                say!("  Refine: {} (of the task above)", refine);
+            }
+            say!("  Submitted: {}", job.submitted_at);
             if let Some(ref prompt) = job.prompt {
-                println!("  Prompt: {}", prompt);
+                say!("  Prompt: {}", prompt);
             }
             if let Some(ref err) = job.error {
-                println!("  Error: {}", err);
+                say!("  Error: {}", err);
             }
             if let Some(ref path) = job.output_path {
-                println!("  Output: {}", path);
+                say!("  Output: {}", path);
             }
+            output::when_json(|| serde_json::to_value(&job).unwrap_or_default());
             Ok(())
         }
         JobCommands::List => {
             let jobs = store.list().map_err(|e| anyhow::anyhow!("{}", e))?;
 
+            output::when_json(|| json!({ "jobs": jobs }));
             if jobs.is_empty() {
-                println!("No generation jobs found.");
+                say!("No generation jobs found.");
                 return Ok(());
             }
 
-            println!("{} job(s):\n", jobs.len());
+            say!("{} job(s):\n", jobs.len());
             for job in &jobs {
-                println!(
-                    "  {} ({}) {} {:?} {}%",
-                    job.id, job.provider, job.asset_name, job.status, job.progress
+                say!(
+                    "  {} ({}) {} {:?} {}%{}  {}",
+                    job.id,
+                    job.provider,
+                    job.asset_name,
+                    job.status,
+                    job.progress,
+                    job.estimated_usd
+                        .map(|c| format!(" {}", flint_ai_core::cost::usd(c)))
+                        .unwrap_or_default(),
+                    job.submitted_at
                 );
             }
             Ok(())
         }
+        JobCommands::Resume { id, output } => run_job_resume(&store, &id, output.as_deref()),
     }
 }
 
+#[cfg(feature = "ai")]
+fn run_job_resume(store: &JobStore, id: &str, output: Option<&str>) -> Result<()> {
+    let job = store.load(id).map_err(|e| anyhow::anyhow!("{}", e))?;
+    if job.status == flint_asset_gen::JobStatus::Complete {
+        if let Some(path) = job.output_path.as_deref().filter(|p| Path::new(p).exists()) {
+            say!("Job {} is already complete: {}", job.id, path);
+            output::when_json(|| serde_json::to_value(&job).unwrap_or_default());
+            return Ok(());
+        }
+    }
+    let project = Project::current()?;
+    let config = FlintConfig::load().unwrap_or_else(|_| FlintConfig {
+        providers: HashMap::new(),
+        generation: Default::default(),
+    });
+    let calls = project_calls(&project, None)?.with_jobs(store.clone());
+    // A resume may pay for a stage the run didn't reach (Meshy's refine of a
+    // paid preview, #1187): its ledger line names the asset.
+    calls.meter.set_context(&job.asset_name, "resume");
+    let provider = flint_asset_gen::providers::create_provider(&job.provider, &config, &calls)?;
+    let out_dir = match output {
+        Some(d) => std::path::PathBuf::from(d),
+        None => project.generated_dir(),
+    };
+    progress!(
+        "Resuming {} job {} for '{}' ({:?}, {}%)...",
+        job.provider,
+        job.id,
+        job.asset_name,
+        job.status,
+        job.progress
+    );
+    let resumed = provider.resume(&job, &out_dir);
+    if calls.meter.calls() > 0 {
+        progress!("  {}", super::ai_costs::spent_line(&calls.meter));
+    }
+    let result = resumed?;
+    let kind = provider
+        .supported_kinds()
+        .first()
+        .copied()
+        .unwrap_or(AssetKind::Model);
+    let request = GenerateRequest {
+        name: job.asset_name.clone(),
+        description: job.prompt.clone().unwrap_or_default(),
+        kind,
+        texture_params: None,
+        model_params: (kind == AssetKind::Model).then(ModelParams::default),
+        audio_params: None,
+        tags: vec![],
+    };
+    let registered = register_generated_asset_in(&project, &request, &result)?;
+    say!("  Downloaded: {}", result.output_path);
+    say!("  Stored: {}", registered.hash);
+    say!("  Sidecar: {}", registered.sidecar_path.display());
+    let job = store.load(id).unwrap_or(job);
+    output::when_json(|| {
+        json!({
+            "job": job,
+            "output": result.output_path,
+            "hash": registered.hash.to_string(),
+            "sidecar": registered.sidecar_path.display().to_string().replace('\\', "/"),
+        })
+    });
+    Ok(())
+}
+
+#[cfg(feature = "ai")]
 fn run_validate(path: &str, style_name: Option<&str>) -> Result<()> {
     let asset_path = Path::new(path);
     if !asset_path.exists() {
@@ -571,13 +834,20 @@ fn run_validate(path: &str, style_name: Option<&str>) -> Result<()> {
     let report = flint_asset_gen::validate::validate_model(asset_path, style.as_ref())
         .map_err(|e| anyhow::anyhow!("{}", e))?;
 
-    report.print_summary();
-
-    if !report.passed {
-        std::process::exit(1);
-    }
-
-    Ok(())
+    output::emit(
+        &output::Answer::new(
+            report.summary_text(),
+            json!({
+                "path": report.path,
+                "passed": report.passed,
+                "meshes": report.mesh_count,
+                "materials": report.material_count,
+                "triangles": report.total_triangles,
+                "checks": report.checks,
+            }),
+        )
+        .failed_if(!report.passed),
+    )
 }
 
 fn run_import(path: &str, name: Option<String>, tags: Option<String>) -> Result<()> {
@@ -596,7 +866,7 @@ fn run_import(path: &str, name: Option<String>, tags: Option<String>) -> Result<
     let mut meta = match ext.as_str() {
         "glb" | "gltf" => {
             let result = import_gltf(path)?;
-            println!(
+            say!(
                 "Imported: {} mesh(es), {} texture(s), {} material(s)",
                 result.meshes.len(),
                 result.textures.len(),
@@ -639,23 +909,55 @@ fn run_import(path: &str, name: Option<String>, tags: Option<String>) -> Result<
     store.store(source_path)?;
 
     // Write sidecar .asset.toml into the project's catalog
-    let sidecar_path = write_asset_sidecar_with_root(&meta, &project.catalog_dir())?;
+    let sidecar_path = write_sidecar(&meta, &project.catalog_dir())?;
 
-    println!("Asset '{}' registered.", meta.name);
-    println!("  Hash: {}", meta.hash);
-    println!("  Type: {:?}", meta.asset_type);
-    println!("  Stored in: {}", Project::display(&project.store_dir()));
-    println!("  Sidecar: {}", sidecar_path.display());
-
+    say!("Asset '{}' registered.", meta.name);
+    say!("  Hash: {}", meta.hash);
+    say!("  Type: {:?}", meta.asset_type);
+    say!("  Stored in: {}", Project::display(&project.store_dir()));
+    say!("  Sidecar: {}", sidecar_path.display());
+    output::when_json(|| {
+        json!({
+            "name": meta.name,
+            "type": format!("{:?}", meta.asset_type).to_lowercase(),
+            "hash": meta.hash,
+            "tags": meta.tags,
+            "sidecar": sidecar_path.display().to_string().replace('\\', "/"),
+        })
+    });
     Ok(())
+}
+
+/// An asset's sidecar, `<catalog>/<kind folder>/<name>.asset.toml`: the
+/// file flint-asset-gen's `write_asset_sidecar_with_root` writes for a
+/// generated one, written here so `asset import` is the kernel's and needs
+/// no ai package (#1333). `tests::an_imports_sidecar_is_the_one_asset_gen_writes`
+/// holds the two to the same bytes.
+fn write_sidecar(meta: &AssetMeta, catalog: &Path) -> Result<std::path::PathBuf> {
+    #[derive(serde::Serialize)]
+    struct Sidecar<'a> {
+        asset: &'a AssetMeta,
+    }
+    let folder = match meta.asset_type {
+        AssetType::Mesh => "meshes",
+        AssetType::Texture => "textures",
+        AssetType::Material => "materials",
+        AssetType::Audio => "audio",
+        AssetType::Script => "scripts",
+    };
+    let dir = catalog.join(folder);
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join(format!("{}.asset.toml", meta.name));
+    std::fs::write(&path, toml::to_string_pretty(&Sidecar { asset: meta })?)?;
+    Ok(path)
 }
 
 fn run_list(type_filter: Option<String>, tag_filter: Option<String>, format: &str) -> Result<()> {
     let catalog_dir = Project::current()?.catalog_dir();
     let catalog = AssetCatalog::load_from_directory(&catalog_dir)?;
 
-    if catalog.is_empty() {
-        println!("No assets found in {}", Project::display(&catalog_dir));
+    if catalog.is_empty() && !output::json() {
+        say!("No assets found in {}", Project::display(&catalog_dir));
         return Ok(());
     }
 
@@ -673,7 +975,7 @@ fn run_list(type_filter: Option<String>, tag_filter: Option<String>, format: &st
             .collect()
     };
 
-    if format == "json" {
+    if output::format_or_json(format) == "json" {
         let items: Vec<serde_json::Value> = assets
             .iter()
             .map(|a| {
@@ -685,11 +987,11 @@ fn run_list(type_filter: Option<String>, tag_filter: Option<String>, format: &st
                 })
             })
             .collect();
-        println!("{}", serde_json::to_string_pretty(&items)?);
+        output::document(&serde_json::Value::Array(items));
     } else {
-        println!("{} asset(s):\n", assets.len());
+        say!("{} asset(s):\n", assets.len());
         for asset in &assets {
-            println!(
+            say!(
                 "  {} ({:?}) [{}]",
                 asset.name,
                 asset.asset_type,
@@ -706,22 +1008,33 @@ fn run_info(name: &str) -> Result<()> {
 
     match catalog.get(name) {
         Some(meta) => {
-            println!("Asset: {}", meta.name);
-            println!("  Type: {:?}", meta.asset_type);
-            println!("  Hash: {}", meta.hash);
+            output::when_json(|| {
+                json!({
+                    "name": meta.name,
+                    "type": format!("{:?}", meta.asset_type).to_lowercase(),
+                    "hash": meta.hash,
+                    "source": meta.source_path,
+                    "format": meta.format,
+                    "tags": meta.tags,
+                    "properties": serde_json::to_value(&meta.properties).unwrap_or_default(),
+                })
+            });
+            say!("Asset: {}", meta.name);
+            say!("  Type: {:?}", meta.asset_type);
+            say!("  Hash: {}", meta.hash);
             if let Some(ref source) = meta.source_path {
-                println!("  Source: {}", source);
+                say!("  Source: {}", source);
             }
             if let Some(ref fmt) = meta.format {
-                println!("  Format: {}", fmt);
+                say!("  Format: {}", fmt);
             }
             if !meta.tags.is_empty() {
-                println!("  Tags: {}", meta.tags.join(", "));
+                say!("  Tags: {}", meta.tags.join(", "));
             }
             if !meta.properties.is_empty() {
-                println!("  Properties:");
+                say!("  Properties:");
                 for (key, value) in &meta.properties {
-                    println!("    {}: {}", key, value);
+                    say!("    {}: {}", key, value);
                 }
             }
         }
@@ -738,16 +1051,38 @@ fn run_resolve(
     strategy_str: &str,
     style_name: Option<&str>,
     output_dir: Option<&str>,
+    max_cost: Option<f64>,
+    schemas: &[String],
 ) -> Result<()> {
     // Check for batch strategies (ai_generate, human_task, ai_then_human)
-    let batch_strategy = match strategy_str {
-        "ai_generate" => Some(flint_asset_gen::batch::BatchStrategy::AiGenerate),
-        "human_task" => Some(flint_asset_gen::batch::BatchStrategy::HumanTask),
-        "ai_then_human" => Some(flint_asset_gen::batch::BatchStrategy::AiThenHuman),
-        _ => None,
+    let batch = BATCH_STRATEGIES.contains(&strategy_str);
+    let strategy = match strategy_str {
+        "strict" => Some(ResolutionStrategy::Strict),
+        "placeholder" => Some(ResolutionStrategy::Placeholder),
+        _ if batch => None,
+        _ => anyhow::bail!(
+            "Unknown strategy: {} (use 'strict', 'placeholder', 'ai_generate', 'human_task', 'ai_then_human')",
+            strategy_str
+        ),
     };
 
-    if let Some(batch_strat) = batch_strategy {
+    // The scene's project's catalog, not the working directory's (#179),
+    // and every `asset` field its schemas declare (#968).
+    let project = Project::for_path(Path::new(scene_path))?;
+    let catalog = AssetCatalog::load_from_directory(project.catalog_dir())?;
+    let references = scene_asset_references(scene_path, schemas, &project, &catalog)?;
+    let found = references.iter().filter(|r| r.found.is_some()).count();
+    for reference in &references {
+        say!("{}", reference.line());
+    }
+
+    #[cfg(feature = "ai")]
+    if batch {
+        let batch_strat = match strategy_str {
+            "ai_generate" => flint_asset_gen::batch::BatchStrategy::AiGenerate,
+            "human_task" => flint_asset_gen::batch::BatchStrategy::HumanTask,
+            _ => flint_asset_gen::batch::BatchStrategy::AiThenHuman,
+        };
         let config = FlintConfig::load().unwrap_or_else(|_| FlintConfig {
             providers: HashMap::new(),
             generation: Default::default(),
@@ -758,136 +1093,244 @@ fn run_resolve(
             None => None,
         };
 
-        let generated = Project::for_path(Path::new(scene_path))?
-            .generated_dir()
-            .display()
-            .to_string();
+        let generated = project.generated_dir().display().to_string();
         let out = output_dir.unwrap_or(&generated);
+        // One meter for the whole scene: the scene's project's ledger and
+        // prices, and the run's ceiling.
+        let calls = project_calls(&project, max_cost)?;
 
-        flint_asset_gen::batch::resolve_scene(
-            scene_path,
+        // What a provider makes is a model, a texture or a sound; a missing
+        // script or heightmap is reported, and left unresolved
+        let mut needs = flint_asset_gen::batch::SceneNeeds::default();
+        let mut no_provider = Vec::new();
+        for reference in references.iter().filter(|r| r.found.is_none()) {
+            match generated_kind(&reference.kinds) {
+                Some(kind) => needs.missing.push(flint_asset_gen::batch::MissingAsset {
+                    entity_name: reference.place(),
+                    field: reference.field(),
+                    asset_name: reference.name.clone(),
+                    kind,
+                }),
+                None => no_provider.push(reference),
+            }
+        }
+        needs.total = found + needs.missing.len();
+        for reference in &no_provider {
+            say!(
+                "  No provider makes {} {}: left missing",
+                kinds_label(&reference.kinds),
+                reference.field_of()
+            );
+        }
+
+        let result = flint_asset_gen::batch::resolve_missing(
+            &project,
+            &needs,
             batch_strat,
             style.as_ref(),
             &config,
             out,
+            &calls,
         )
         .map_err(|e| anyhow::anyhow!("{}", e))?;
+        progress!("{}", super::ai_costs::spent_line(&calls.meter));
 
+        output::when_json(|| {
+            json!({
+                "scene": scene_path,
+                "strategy": strategy_str,
+                "references": references.len(),
+                "found": result.already_found,
+                "generated": result.generated,
+                "tasks_created": result.tasks_created,
+                "failed": result.failed,
+                "over_budget": result.over_budget,
+                "no_provider": no_provider.iter().map(|r| r.json()).collect::<Vec<_>>(),
+                "cost_usd": result.spent_usd,
+                "max_cost": max_cost,
+            })
+        });
+        // A reference neither generated nor handed to a person is a failure
+        let unresolved =
+            result.total_refs - result.already_found - result.generated - result.tasks_created;
+        if result.failed > 0 || unresolved > 0 || !no_provider.is_empty() {
+            return Err(output::failed());
+        }
         return Ok(());
     }
 
-    // Existing catalog-based resolution
-    let strategy = match strategy_str {
-        "strict" => ResolutionStrategy::Strict,
-        "placeholder" => ResolutionStrategy::Placeholder,
-        _ => anyhow::bail!(
-            "Unknown strategy: {} (use 'strict', 'placeholder', 'ai_generate', 'human_task', 'ai_then_human')",
-            strategy_str
-        ),
-    };
+    // Without the ai package `run` refused a batch strategy before here
+    #[cfg(not(feature = "ai"))]
+    let _ = (style_name, output_dir, max_cost);
+    let strategy = strategy.expect("a catalog strategy");
+    let missing: Vec<&SceneAssetReference> =
+        references.iter().filter(|r| r.found.is_none()).collect();
+    say!("\nResolution: {} found, {} missing", found, missing.len());
+    let failed = !missing.is_empty() && strategy == ResolutionStrategy::Strict;
+    output::when_json(|| {
+        json!({
+            "scene": scene_path,
+            "strategy": strategy_str,
+            "found": found,
+            "missing": missing.iter().map(|r| r.json()).collect::<Vec<_>>(),
+            "references": references.iter().map(|r| r.json()).collect::<Vec<_>>(),
+            "valid": !failed,
+        })
+    });
 
-    // The scene's project's catalog, not the working directory's (#179).
-    let catalog =
-        AssetCatalog::load_from_directory(Project::for_path(Path::new(scene_path))?.catalog_dir())?;
-    let resolver = AssetResolver::new(strategy);
-
-    // Load and scan scene for asset references
-    let content = std::fs::read_to_string(scene_path)?;
-    let scene: toml::Value = toml::from_str(&content)?;
-
-    let mut found = 0usize;
-    let mut missing = 0usize;
-
-    for reference in collect_scene_asset_references(&scene) {
-        let asset_ref = flint_asset::AssetRef::ByName(reference.name.clone());
-        let result = resolver.resolve(&asset_ref, &catalog);
-        if result.is_found() {
-            found += 1;
-        } else {
-            missing += 1;
-            println!(
-                "  Missing: {}.{} -> \"{}\"",
-                reference.entity, reference.field, reference.name
-            );
-        }
+    if failed {
+        return Err(output::failed());
     }
-
-    println!("\nResolution: {} found, {} missing", found, missing);
-
-    if missing > 0 && strategy == ResolutionStrategy::Strict {
-        std::process::exit(1);
-    }
-
     Ok(())
 }
 
+/// One asset a scene names, and where it was found (#968).
 #[derive(Debug, Clone)]
 struct SceneAssetReference {
-    entity: String,
-    field: String,
+    /// The entity it is written on, or `None` for a scene table.
+    entity: Option<String>,
+    /// The component, or the scene table.
+    table: String,
+    /// The field's path inside it.
+    path: String,
     name: String,
+    kinds: Vec<flint_core::project::AssetKind>,
+    /// `catalog`, or the file the engine loads; `None` when nothing holds it.
+    found: Option<String>,
+    /// Why nothing holds it: every path tried, or that an `asset_def`
+    /// declares it and it is not made yet.
+    why_missing: Option<String>,
 }
 
-fn collect_scene_asset_references(scene: &toml::Value) -> Vec<SceneAssetReference> {
-    let mut refs = Vec::new();
+impl SceneAssetReference {
+    /// `model.asset`, or `environment.skybox` for a scene table.
+    fn field(&self) -> String {
+        format!("{}.{}", self.table, self.path)
+    }
 
-    let Some(entities) = scene.get("entities").and_then(|e| e.as_table()) else {
-        return refs;
-    };
-
-    for (entity_name, entity_data) in entities {
-        let Some(table) = entity_data.as_table() else {
-            continue;
-        };
-
-        // Legacy top-level references
-        for field in ["mesh", "texture", "material", "audio", "script"] {
-            push_ref_if_string(table, entity_name, field, field, &mut refs);
-        }
-
-        // Current component references
-        if let Some(model) = table.get(comp::MODEL).and_then(|v| v.as_table()) {
-            push_ref_if_string(model, entity_name, "asset", "model.asset", &mut refs);
-        }
-
-        if let Some(material) = table.get(comp::MATERIAL).and_then(|v| v.as_table()) {
-            push_ref_if_string(
-                material,
-                entity_name,
-                "texture",
-                "material.texture",
-                &mut refs,
-            );
-        }
-
-        if let Some(sprite) = table.get(comp::SPRITE).and_then(|v| v.as_table()) {
-            push_ref_if_string(sprite, entity_name, "texture", "sprite.texture", &mut refs);
-        }
-
-        if let Some(audio) = table.get(comp::AUDIO_SOURCE).and_then(|v| v.as_table()) {
-            push_ref_if_string(audio, entity_name, "file", "audio_source.file", &mut refs);
+    /// The entity, or `[environment]` for a scene table.
+    #[cfg(feature = "ai")]
+    fn place(&self) -> String {
+        match &self.entity {
+            Some(entity) => entity.clone(),
+            None => format!("[{}]", self.table),
         }
     }
 
-    refs
-}
-
-fn push_ref_if_string(
-    table: &toml::map::Map<String, toml::Value>,
-    entity_name: &str,
-    key: &str,
-    field_name: &str,
-    refs: &mut Vec<SceneAssetReference>,
-) {
-    if let Some(name) = table.get(key).and_then(|v| v.as_str()) {
-        if !name.is_empty() {
-            refs.push(SceneAssetReference {
-                entity: entity_name.to_string(),
-                field: field_name.to_string(),
-                name: name.to_string(),
-            });
+    /// `crate.model.asset`, or `[environment].skybox`.
+    fn field_of(&self) -> String {
+        match &self.entity {
+            Some(entity) => format!("{entity}.{}", self.field()),
+            None => format!("[{}].{}", self.table, self.path),
         }
     }
+
+    fn line(&self) -> String {
+        match (&self.found, &self.why_missing) {
+            (Some(found), _) => format!(
+                "  Found: {} -> \"{}\" ({found})",
+                self.field_of(),
+                self.name
+            ),
+            (None, why) => format!(
+                "  Missing: {} -> \"{}\"{}",
+                self.field_of(),
+                self.name,
+                why.as_deref()
+                    .map(|why| format!(" ({why})"))
+                    .unwrap_or_default()
+            ),
+        }
+    }
+
+    fn json(&self) -> serde_json::Value {
+        json!({
+            "entity": self.entity,
+            "table": self.table,
+            "field": self.field(),
+            "name": self.name,
+            "kinds": self.kinds.iter().map(|k| k.label()).collect::<Vec<_>>(),
+            "found": self.found,
+            "missing": self.why_missing,
+        })
+    }
+}
+
+/// Every asset the scene at `scene_path` names, from its schemas (#968):
+/// each field the loaded schemas type `asset`, through arrays and tables,
+/// in every entity (prefabs expanded) and scene table, as
+/// [`flint_scene::asset_references`] walks them. Each is found in the
+/// project's asset catalog by name, else as the engine finds it (a file,
+/// or a model or texture in the catalog and store).
+fn scene_asset_references(
+    scene_path: &str,
+    schemas: &[String],
+    project: &Project,
+    catalog: &AssetCatalog,
+) -> Result<Vec<SceneAssetReference>> {
+    let (registry, _) = super::common_args::load_schemas(Some(scene_path), schemas)?;
+    // With no schema nothing is known to name an asset, and a report of
+    // nothing found would read as a scene with nothing to make
+    if registry.component_names().is_empty() {
+        anyhow::bail!(
+            "no component schemas were found for {scene_path}, so no field is known to name \
+             an asset; pass --schemas <dir> (the engine's is `schemas/`, a game's \
+             `engine/schemas`) or list them in flint.toml's [project] schemas"
+        );
+    }
+    let resolver = AssetResolver::new(ResolutionStrategy::Strict);
+    let walked = flint_scene::asset_references(Path::new(scene_path), &registry, project)
+        .map_err(|e| anyhow::anyhow!("{}", e))?;
+    Ok(walked
+        .into_iter()
+        .map(|r| {
+            let catalogued = resolver
+                .resolve(&flint_asset::AssetRef::ByName(r.name.clone()), catalog)
+                .is_found();
+            let (found, why_missing) = match r.located {
+                _ if catalogued => (Some("catalog".to_string()), None),
+                flint_scene::Located::File(path) => (Some(flint_core::project::shown(&path)), None),
+                flint_scene::Located::Catalog => (Some("catalog".to_string()), None),
+                flint_scene::Located::Declared => (
+                    None,
+                    Some("an asset_def declares it; not made yet".to_string()),
+                ),
+                flint_scene::Located::Missing { tried } => (None, Some(tried)),
+            };
+            SceneAssetReference {
+                entity: r.entity,
+                table: r.table,
+                path: r.field,
+                name: r.name,
+                kinds: r.kinds,
+                found,
+                why_missing,
+            }
+        })
+        .collect())
+}
+
+/// What a provider can make for a field of `kinds`: a model, a texture or
+/// a sound, the first the field takes.
+#[cfg(feature = "ai")]
+fn generated_kind(
+    kinds: &[flint_core::project::AssetKind],
+) -> Option<flint_asset_gen::provider::AssetKind> {
+    use flint_asset_gen::provider::AssetKind as Made;
+    use flint_core::project::AssetKind as Kind;
+    kinds.iter().find_map(|kind| match kind {
+        Kind::Models => Some(Made::Model),
+        Kind::Textures | Kind::ParticleTextures | Kind::Sprites => Some(Made::Texture),
+        Kind::Audio => Some(Made::Audio),
+        _ => None,
+    })
+}
+
+/// `files`, or `models or specs`.
+#[cfg(feature = "ai")]
+fn kinds_label(kinds: &[flint_core::project::AssetKind]) -> String {
+    let labels: Vec<&str> = kinds.iter().map(|k| k.label()).collect();
+    labels.join(" or ")
 }
 
 fn guess_asset_type(ext: &str) -> AssetType {

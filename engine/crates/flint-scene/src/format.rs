@@ -1,7 +1,8 @@
 //! Scene file format definitions
 
+use flint_core::toml_util::edit_distance;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 /// Root structure of a scene TOML file: `[scene]`, the scene-level tables,
 /// `[prefabs.*]` and `[entities.*]`.
@@ -28,8 +29,12 @@ pub struct SceneFile {
     /// extension's own.
     #[serde(flatten)]
     pub tables: toml::Table,
-    pub prefabs: HashMap<String, PrefabInstance>,
-    pub entities: HashMap<String, EntityDef>,
+    /// By name, as `entities` is
+    pub prefabs: BTreeMap<String, PrefabInstance>,
+    /// By name (#688): the loader spawns in this order, so a scene's ids
+    /// are the same every load, and a saved file lists entities the same
+    /// way every time
+    pub entities: BTreeMap<String, EntityDef>,
     /// The typed tables ([`SceneFile::TYPED_TABLES`]) as the file wrote
     /// them, before their defaults were filled in: what
     /// [`diagnose`](crate::diagnose) checks against their `[table.*]`
@@ -88,7 +93,7 @@ impl<'de> Deserialize<'de> for SceneFile {
 pub struct PrefabFile {
     pub prefab: PrefabMetadata,
     #[serde(default)]
-    pub entities: HashMap<String, EntityDef>,
+    pub entities: BTreeMap<String, EntityDef>,
 }
 
 /// Metadata for a prefab template
@@ -105,279 +110,153 @@ pub struct PrefabInstance {
     pub template: String,
     pub prefix: String,
     #[serde(default)]
-    pub overrides: HashMap<String, HashMap<String, toml::Value>>,
+    pub overrides: BTreeMap<String, BTreeMap<String, toml::Value>>,
 }
 
-/// Post-processing settings for the scene
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PostProcessDef {
-    #[serde(default = "default_true")]
-    pub bloom_enabled: bool,
-    #[serde(default = "default_bloom_intensity")]
-    pub bloom_intensity: f32,
-    #[serde(default = "default_bloom_threshold")]
-    pub bloom_threshold: f32,
-    #[serde(default)]
-    pub vignette_enabled: bool,
-    #[serde(default = "default_vignette_intensity")]
-    pub vignette_intensity: f32,
-    #[serde(default = "default_vignette_smoothness")]
-    pub vignette_smoothness: f32,
-    #[serde(default = "default_exposure")]
-    pub exposure: f32,
-    #[serde(default = "default_true")]
-    pub ssao_enabled: bool,
-    #[serde(default = "default_ssao_radius")]
-    pub ssao_radius: f32,
-    #[serde(default = "default_ssao_intensity")]
-    pub ssao_intensity: f32,
-    /// SSAO hemisphere samples per pixel, 1-64 (default 64 = full quality).
-    /// The heaviest per-pixel cost in the post stack; 16 is usually
-    /// indistinguishable on soft/matte scenes and ~4x cheaper.
-    #[serde(default = "default_ssao_samples")]
-    pub ssao_samples: u32,
-    #[serde(default)]
-    pub fog_enabled: bool,
-    #[serde(default = "default_fog_color")]
-    pub fog_color: [f32; 3],
-    #[serde(default = "default_fog_density")]
-    pub fog_density: f32,
-    #[serde(default = "default_fog_start")]
-    pub fog_start: f32,
-    #[serde(default = "default_fog_end")]
-    pub fog_end: f32,
-    #[serde(default)]
-    pub fog_height_enabled: bool,
-    #[serde(default = "default_fog_height_falloff")]
-    pub fog_height_falloff: f32,
-    #[serde(default)]
-    pub fog_height_origin: f32,
-    /// Height fog's density at `fog_height_origin` (ADR 0101); 0 adds none.
-    #[serde(default)]
-    pub fog_height_density: f32,
-    /// Aerial tint (ADR 0101): far things take this colour, up to
-    /// `fog_tint_strength` (0 = off), over `fog_tint_start..fog_tint_end` m.
-    #[serde(default = "default_fog_tint_color")]
-    pub fog_tint_color: [f32; 3],
-    #[serde(default)]
-    pub fog_tint_strength: f32,
-    #[serde(default = "default_fog_tint_start")]
-    pub fog_tint_start: f32,
-    #[serde(default = "default_fog_tint_end")]
-    pub fog_tint_end: f32,
-    #[serde(default)]
-    pub dither_enabled: bool,
-    #[serde(default = "default_dither_intensity")]
-    pub dither_intensity: f32,
-    #[serde(default)]
-    pub volumetric_enabled: bool,
-    #[serde(default = "default_volumetric_samples")]
-    pub volumetric_samples: u32,
-    #[serde(default = "default_volumetric_density")]
-    pub volumetric_density: f32,
-    #[serde(default = "default_volumetric_max_distance")]
-    pub volumetric_max_distance: f32,
-    #[serde(default = "default_volumetric_decay")]
-    pub volumetric_decay: f32,
-    #[serde(default)]
-    pub chromatic_aberration: f32,
-    #[serde(default)]
-    pub radial_blur: f32,
-    #[serde(default)]
-    pub desaturate: f32,
-    #[serde(default)]
-    pub dof_strength: f32,
-    #[serde(default = "default_dof_focus_distance")]
-    pub dof_focus_distance: f32,
-    #[serde(default = "default_dof_focus_range")]
-    pub dof_focus_range: f32,
+/// The macro [`flint_schema::post_effects!`] calls to make
+/// [`PostProcessDef`]: one field a built-in effect's key (#741), then the
+/// fields that are no effect's, passed through.
+macro_rules! post_process_def {
+    (
+        {
+            $(
+                $(#[$xmeta:meta])*
+                pub $xfield:ident : $xtype:ty
+            ),* $(,)?
+        }
+        $(
+            $effect:ident $elabel:literal $ehelp:literal {
+                $(
+                    $key:ident : $kind:ident = $default:expr,
+                    $([$min:literal, $max:literal])? $widget:ident $(($speed:literal))?;
+                    $label:literal, $help:literal
+                )*
+            }
+        )*
+    ) => {
+        /// Post-processing settings for the scene: a scene's `[post_process]`.
+        ///
+        /// The built-in effects' keys (`bloom_intensity`, `fog_color`, ...)
+        /// are fields made from their descriptors
+        /// ([`flint_schema::post_effects`], #741), each defaulting to its
+        /// descriptor's default; the rest (styles, the look, the old style
+        /// keys) are this crate's.
+        #[derive(Debug, Clone, Serialize, Deserialize)]
+        #[serde(default)]
+        pub struct PostProcessDef {
+            $($(
+                #[doc = $help]
+                pub $key: flint_schema::post_type!($kind),
+            )*)*
+            $(
+                $(#[$xmeta])*
+                pub $xfield: $xtype,
+            )*
+        }
+
+        impl Default for PostProcessDef {
+            fn default() -> Self {
+                Self {
+                    $($( $key: $default, )*)*
+                    $( $xfield: Default::default(), )*
+                }
+            }
+        }
+
+        impl PostProcessDef {
+            /// The built-in effect key `key`'s field, to read or set by
+            /// name. `None` for a key that is no effect's.
+            pub fn param_mut(&mut self, key: &str) -> Option<flint_schema::post_effects::PostParamMut<'_>> {
+                match key {
+                    $($( stringify!($key) => Some(flint_schema::post_param_mut!($kind, &mut self.$key)), )*)*
+                    _ => None,
+                }
+            }
+
+            /// The built-in effect key `key`'s value. `None` for a key that
+            /// is no effect's.
+            pub fn param(&self, key: &str) -> Option<flint_schema::post_effects::PostValue> {
+                match key {
+                    $($( stringify!($key) => Some(flint_schema::post_value!($kind, self.$key)), )*)*
+                    _ => None,
+                }
+            }
+        }
+    };
+}
+
+flint_schema::post_effects!(post_process_def {
     /// The old spellings of `[post_process.styles.kuwahara]` (#298), kept
     /// so scenes written before the style table still load. Read them
     /// through [`style_tables`](Self::style_tables), which folds them in;
     /// a key the table also sets is the table's.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub kuwahara_enabled: Option<bool>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub kuwahara_radius: Option<u32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub kuwahara_sharpness: Option<f32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub kuwahara_hardness: Option<f32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub kuwahara_anisotropy: Option<f32>,
-    /// The shared geometry edges' thresholds (#301), which every style that
-    /// reads them sees: the relative view-distance step that is a
-    /// silhouette, and the normal change (Sobel) that is a crease.
-    #[serde(default = "default_edge_depth")]
-    pub edge_depth: f32,
-    #[serde(default = "default_edge_normal")]
-    pub edge_normal: f32,
     /// Stylize passes by name (#262): `[post_process.styles.invert]` with
     /// `enabled` (default true) and the style's numeric parameters. The
     /// renderer checks names and parameters against its registry.
-    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub styles: std::collections::BTreeMap<String, toml::Table>,
     /// The old spellings of the shading boil's and the contour's settings
     /// (#214), which are `[post_process.styles.kuwahara] boil` and
     /// `[post_process.styles.contour]` since #599. Kept so older scenes
     /// still load, and read through [`style_tables`](Self::style_tables)
     /// like the `kuwahara_*` keys above.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub kuwahara_boil: Option<f32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub contour_enabled: Option<bool>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub contour_width: Option<f32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub contour_threshold: Option<f32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub contour_strength: Option<f32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub contour_luma: Option<f32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub contour_color: Option<[f32; 3]>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub contour_fade: Option<f32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub contour_boil: Option<f32>,
-    /// Film frames each drawing of the shading boil is held: 1, 2 or 3 ("on
-    /// twos"). A beat of the field's `step` is six film frames. Shared by
-    /// both styles' boils.
-    #[serde(default = "default_boil_on")]
-    pub boil_on: u32,
-    /// Motion on twos for the whole frame (#405): every entity that names no
-    /// `motion_hold` rate of its own is drawn on ticks, this many a second,
-    /// and the post time styles read holds to the same ticks. 0 = off.
-    #[serde(default)]
-    pub motion_hold: f32,
-    /// Animated film grain intensity (0 = off; ~0.02-0.05 is subtle).
-    #[serde(default)]
-    pub film_grain: f32,
-    /// Color grade lift (per-channel add after ACES). Neutral = [0,0,0].
-    #[serde(default)]
-    pub grade_lift: [f32; 3],
-    /// Color grade gamma (per-channel midtone curve). Neutral = [1,1,1].
-    #[serde(default = "default_grade_one")]
-    pub grade_gamma: [f32; 3],
-    /// Color grade gain (per-channel multiply). Neutral = [1,1,1].
-    #[serde(default = "default_grade_one")]
-    pub grade_gain: [f32; 3],
-    /// FXAA anti-aliasing pass on the final composite (default off — the
-    /// headless pixel-diff gates run without it; ADR 0050).
-    #[serde(default)]
-    pub fxaa: bool,
     /// A look (#356): a `styles/<name>.look.toml` beside the scene (or its
     /// parent's `styles/`), or a built-in (`ascii_noir`, `graphite`, ...),
     /// laid under this block's own keys. `flint_render::look::resolve`
     /// applies it; until then the struct holds the scene's keys alone.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub look: Option<String>,
+    /// Looks the scene will cut or fade to later (#1159), named as
+    /// `look` is: a host builds their styles at the scene's entry, on
+    /// worker threads, so the frame a script's `set_look` shows one builds
+    /// nothing. The look itself isn't shown.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub preload_looks: Vec<String>,
+    /// Styles the scene will switch on later by name (#1159): a script's
+    /// `set_post_style`, a render mode's reality styles (`matrix`,
+    /// `tron`). Built at the scene's entry with every draw the stage gives
+    /// a style (blend, reveal, tear), so neither switching one on nor
+    /// tweening its reveal or tearing it builds on a frame.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub preload_styles: Vec<String>,
     /// The keys the scene's `[post_process]` wrote, as written (the loader
     /// records them), so a look goes under exactly those and a later
     /// `set_look` can re-lay a different one. `None` for a block built in
     /// code, which then counts every field as its own.
     #[serde(skip)]
     pub authored: Option<toml::Table>,
-}
-
-fn default_grade_one() -> [f32; 3] {
-    [1.0, 1.0, 1.0]
-}
+});
 
 fn default_true() -> bool {
     true
-}
-
-fn default_bloom_intensity() -> f32 {
-    0.04
-}
-
-fn default_bloom_threshold() -> f32 {
-    1.0
-}
-
-fn default_vignette_intensity() -> f32 {
-    0.3
-}
-
-fn default_vignette_smoothness() -> f32 {
-    2.0
-}
-
-fn default_exposure() -> f32 {
-    1.0
-}
-
-fn default_ssao_radius() -> f32 {
-    0.5
-}
-
-fn default_ssao_intensity() -> f32 {
-    1.0
-}
-
-fn default_ssao_samples() -> u32 {
-    64
-}
-
-fn default_fog_color() -> [f32; 3] {
-    [0.7, 0.75, 0.82]
-}
-
-fn default_fog_density() -> f32 {
-    0.02
-}
-
-fn default_fog_start() -> f32 {
-    5.0
-}
-
-fn default_fog_end() -> f32 {
-    100.0
-}
-
-fn default_fog_height_falloff() -> f32 {
-    0.1
-}
-
-fn default_fog_tint_color() -> [f32; 3] {
-    [0.42, 0.50, 0.65]
-}
-
-fn default_fog_tint_start() -> f32 {
-    100.0
-}
-
-fn default_fog_tint_end() -> f32 {
-    1000.0
-}
-
-fn default_dof_focus_distance() -> f32 {
-    10.0
-}
-
-fn default_dof_focus_range() -> f32 {
-    5.0
-}
-
-fn default_dither_intensity() -> f32 {
-    0.03
-}
-
-fn default_volumetric_samples() -> u32 {
-    32
-}
-
-fn default_volumetric_density() -> f32 {
-    1.0
-}
-
-fn default_volumetric_max_distance() -> f32 {
-    100.0
-}
-
-fn default_volumetric_decay() -> f32 {
-    0.98
 }
 
 /// The `[post_process]` keys that predate the style table, and the
@@ -449,34 +328,6 @@ fn closest_name(key: &str, known: &[String]) -> Option<String> {
         .map(|(_, k)| k.clone())
 }
 
-/// Levenshtein distance, small and good enough for field names.
-fn edit_distance(a: &str, b: &str) -> usize {
-    let b: Vec<char> = b.chars().collect();
-    let mut row: Vec<usize> = (0..=b.len()).collect();
-    for (i, ca) in a.chars().enumerate() {
-        let mut prev = row[0];
-        row[0] = i + 1;
-        for (j, cb) in b.iter().enumerate() {
-            let cur = row[j + 1];
-            row[j + 1] = if ca == *cb {
-                prev
-            } else {
-                1 + prev.min(row[j]).min(row[j + 1])
-            };
-            prev = cur;
-        }
-    }
-    row[b.len()]
-}
-
-fn default_edge_depth() -> f32 {
-    0.6
-}
-
-fn default_edge_normal() -> f32 {
-    2.5
-}
-
 impl PostProcessDef {
     /// Every key a `[post_process]` block can name, sorted: the struct's
     /// own fields, read back from a serialized one (so a new field is
@@ -502,6 +353,8 @@ impl PostProcessDef {
         def.contour_boil = Some(0.0);
         def.styles.insert("_".into(), toml::Table::new());
         def.look = Some(String::new());
+        def.preload_looks = vec![String::new()];
+        def.preload_styles = vec![String::new()];
         let mut names: Vec<String> = toml::Table::try_from(&def)
             .map(|t| t.keys().cloned().collect())
             .unwrap_or_default();
@@ -659,10 +512,6 @@ impl PostProcessDef {
     }
 }
 
-fn default_boil_on() -> u32 {
-    2
-}
-
 /// Camera configuration for the scene
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CameraDef {
@@ -780,9 +629,10 @@ pub struct EntityDef {
     /// Optional parent entity name
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parent: Option<String>,
-    /// Component data - all other fields are treated as components
+    /// Component data - all other fields are treated as components. By
+    /// name, so a load merges them in the same order every time
     #[serde(flatten)]
-    pub components: HashMap<String, toml::Value>,
+    pub components: BTreeMap<String, toml::Value>,
 }
 
 impl EntityDef {
@@ -790,7 +640,7 @@ impl EntityDef {
         Self {
             archetype: None,
             parent: None,
-            components: HashMap::new(),
+            components: BTreeMap::new(),
         }
     }
 
@@ -822,20 +672,64 @@ impl SceneFile {
     /// [`diagnose`](crate::diagnose) parse with.
     pub fn parse(text: &str) -> Result<Self, toml::de::Error> {
         let mut scene: SceneFile = toml::from_str(text)?;
-        if let Ok(mut doc) = toml::from_str::<toml::Table>(text) {
-            for name in Self::TYPED_TABLES {
-                if let Some(value) = doc.remove(*name) {
-                    scene.written.insert((*name).to_string(), value);
-                }
+        if let Ok(doc) = toml::from_str::<toml::Table>(text) {
+            scene.record_written(doc);
+        }
+        Ok(scene)
+    }
+
+    /// A scene [`parse`](Self::parse) refuses because a typed table
+    /// ([`TYPED_TABLES`](Self::TYPED_TABLES)) doesn't fit its type (#1061):
+    /// `[camera] fov = "wide"`. Each such table is left unset, and the rest
+    /// of the scene parsed as usual, with every typed table as written in
+    /// [`written`](Self::written), so [`diagnose`](crate::diagnose) can
+    /// hold it to its `[table.<name>]` schema and name the field. Beside
+    /// it, each refused table's name and what serde said of it.
+    ///
+    /// `None` when the text is not TOML, or when every typed table fits and
+    /// the refusal is elsewhere (`[scene]`, an entity): there is nothing
+    /// more to say than `parse`'s own error. Nothing loads a scene this way:
+    /// what a check reads.
+    pub fn parse_refusing(text: &str) -> Option<(Self, Vec<(&'static str, String)>)> {
+        let doc: toml::Table = toml::from_str(text).ok()?;
+        let mut rest = doc.clone();
+        let mut refused = Vec::new();
+        for name in Self::TYPED_TABLES {
+            let Some(value) = doc.get(*name) else {
+                continue;
+            };
+            let fits = match *name {
+                "camera" => value.clone().try_into::<CameraDef>().err(),
+                "environment" => value.clone().try_into::<EnvironmentDef>().err(),
+                _ => value.clone().try_into::<PostProcessDef>().err(),
+            };
+            if let Some(e) = fits {
+                rest.remove(*name);
+                refused.push((*name, e.message().trim_end().replace('\n', " ")));
             }
         }
-        if let Some(def) = &mut scene.post_process {
-            def.authored = match scene.written.get("post_process") {
+        if refused.is_empty() {
+            return None;
+        }
+        let mut scene: SceneFile = toml::Value::Table(rest).try_into().ok()?;
+        scene.record_written(doc);
+        Some((scene, refused))
+    }
+
+    /// Keep what the typed tables of `doc`, the whole file, wrote
+    /// ([`written`](Self::written), [`PostProcessDef::authored`]).
+    fn record_written(&mut self, mut doc: toml::Table) {
+        for name in Self::TYPED_TABLES {
+            if let Some(value) = doc.remove(*name) {
+                self.written.insert((*name).to_string(), value);
+            }
+        }
+        if let Some(def) = &mut self.post_process {
+            def.authored = match self.written.get("post_process") {
                 Some(toml::Value::Table(post)) => Some(post.clone()),
                 _ => None,
             };
         }
-        Ok(scene)
     }
 
     /// The scene-level table `name` as the file wrote it: one of
@@ -870,8 +764,8 @@ impl SceneFile {
             environment: None,
             post_process: None,
             tables: toml::Table::new(),
-            prefabs: HashMap::new(),
-            entities: HashMap::new(),
+            prefabs: BTreeMap::new(),
+            entities: BTreeMap::new(),
             written: toml::Table::new(),
         }
     }
@@ -998,6 +892,69 @@ at = 12.5
             .unwrap_err()
             .to_string();
         assert!(err.contains("missing field `scene`"), "{err}");
+    }
+
+    /// #1061: a typed table that doesn't fit its type is set aside, each of
+    /// them, and the rest of the scene parsed, with the table as written
+    /// kept for the schema pass. A refusal elsewhere is `parse`'s alone.
+    #[test]
+    fn parse_refusing_sets_aside_each_table_that_does_not_fit() {
+        let text = "[scene]\nname = \"s\"\n\n[camera]\nfov = \"wide\"\n\n\
+                    [environment]\ndiffuse_wrap = \"soft\"\n\n\
+                    [post_process]\nexposure = 2.0\n\n[entities.rock]\n";
+        assert!(SceneFile::parse(text).is_err());
+        let (scene, refused) = SceneFile::parse_refusing(text).expect("the rest parses");
+        let names: Vec<&str> = refused.iter().map(|(name, _)| *name).collect();
+        assert_eq!(names, ["camera", "environment"]);
+        assert!(refused[0].1.contains("expected f32"), "{refused:?}");
+        assert!(scene.camera.is_none() && scene.environment.is_none());
+        let post = scene.post_process.as_ref().expect("the table that fits");
+        assert_eq!(post.exposure, 2.0);
+        assert!(post.authored.is_some());
+        assert_eq!(scene.written["camera"]["fov"].as_str(), Some("wide"));
+        assert!(scene.entities.contains_key("rock"));
+
+        // Not TOML, a refusal outside the typed tables, a scene that parses
+        assert!(SceneFile::parse_refusing("[scene\n").is_none());
+        assert!(SceneFile::parse_refusing("[camera]\nfov = 1.0\n").is_none());
+        assert!(SceneFile::parse_refusing("[scene]\nname = \"s\"\n").is_none());
+    }
+
+    /// ADR 0115 (#1061): `scene.version` is informational. The same scene
+    /// under any version, or none, reads the same: its tables, entities and
+    /// the one migration, `fold_legacy_style_keys`, which keys on what the
+    /// scene writes and never on the number. A migration list ordered by
+    /// version is for the day a change can't be told from the data; when
+    /// it comes, this test changes with it.
+    #[test]
+    fn the_version_changes_nothing_a_scene_reads_as() {
+        const BODY: &str = "\n[post_process]\nkuwahara_enabled = true\nkuwahara_radius = 4\n\n\
+                            [camera]\nfov = 50\n\n[weather]\nrain = 0.5\n\n\
+                            [entities.rock.transform]\nposition = [1, 2, 3]\n";
+        let read = |version: Option<&str>| {
+            let head = match version {
+                Some(v) => format!("[scene]\nname = \"v\"\nversion = \"{v}\"\n"),
+                None => "[scene]\nname = \"v\"\n".to_string(),
+            };
+            let scene = SceneFile::parse(&(head + BODY)).unwrap();
+            let styles = scene.post_process.as_ref().unwrap().style_tables();
+            assert_eq!(
+                styles["kuwahara"]["radius"].as_integer(),
+                Some(4),
+                "folded under {version:?}"
+            );
+            let mut unversioned = scene.clone();
+            unversioned.scene.version = String::new();
+            (
+                toml::to_string(&unversioned).unwrap(),
+                scene.scene_tables(),
+                format!("{styles:?}"),
+            )
+        };
+        let baseline = read(None);
+        for version in ["1.0", "0.1", "2.0", "anything"] {
+            assert_eq!(read(Some(version)), baseline, "version {version}");
+        }
     }
 }
 

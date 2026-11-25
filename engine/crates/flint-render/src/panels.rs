@@ -32,6 +32,8 @@
 //! (`scene_renderer/panels.rs`).
 
 use crate::camera::Camera;
+use crate::gpu_counts::{CountedDevice, CountedQueue};
+use crate::TrustedShader;
 use flint_core::Vec3;
 
 /// The most panels a page draws; more are left out with a warning.
@@ -472,13 +474,13 @@ impl PanelCompositor {
                 count: None,
             }],
         });
-        let uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        let uniform_buffer = device.create_buffer_counted(&wgpu::BufferDescriptor {
             label: Some("Panel Uniforms"),
             size: SLOT * MAX_PANELS as u64,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        let uniform_bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        let uniform_bind = device.create_bind_group_counted(&wgpu::BindGroupDescriptor {
             label: Some("Panel Uniform Bind"),
             layout: &uniform_layout,
             entries: &[wgpu::BindGroupEntry {
@@ -490,16 +492,16 @@ impl PanelCompositor {
                 }),
             }],
         });
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        let shader = device.create_trusted_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Panel Compositor"),
             source: wgpu::ShaderSource::Wgsl(SHADER.into()),
         });
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("Panel Compositor Layout"),
-            bind_group_layouts: &[&uniform_layout, &texture_layout],
-            push_constant_ranges: &[],
+            bind_group_layouts: &[Some(&uniform_layout), Some(&texture_layout)],
+            immediate_size: 0,
         });
-        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        let pipeline = device.create_render_pipeline_counted(&wgpu::RenderPipelineDescriptor {
             label: Some("Panel Compositor"),
             layout: Some(&layout),
             vertex: wgpu::VertexState {
@@ -521,7 +523,7 @@ impl PanelCompositor {
             primitive: wgpu::PrimitiveState::default(),
             depth_stencil: None,
             multisample: wgpu::MultisampleState::default(),
-            multiview: None,
+            multiview_mask: None,
             cache: None,
         });
         Self {
@@ -543,7 +545,7 @@ impl PanelCompositor {
         device: &wgpu::Device,
         view: &wgpu::TextureView,
     ) -> wgpu::BindGroup {
-        device.create_bind_group(&wgpu::BindGroupDescriptor {
+        device.create_bind_group_counted(&wgpu::BindGroupDescriptor {
             label: Some("Panel Picture Bind"),
             layout: &self.texture_layout,
             entries: &[wgpu::BindGroupEntry {
@@ -575,13 +577,14 @@ impl PanelCompositor {
             bytes[at..at + std::mem::size_of::<PanelUniform>()]
                 .copy_from_slice(bytemuck::bytes_of(&u));
         }
-        queue.write_buffer(&self.uniform_buffer, 0, &bytes);
+        queue.write_buffer_counted(&self.uniform_buffer, 0, &bytes);
         let g = color_for(self.format, layout.gutter_color);
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("Panel Page"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                 view: target,
                 resolve_target: None,
+                depth_slice: None,
                 ops: wgpu::Operations {
                     load: wgpu::LoadOp::Clear(wgpu::Color {
                         r: g[0] as f64,
@@ -595,6 +598,7 @@ impl PanelCompositor {
             depth_stencil_attachment: None,
             timestamp_writes: None,
             occlusion_query_set: None,
+            multiview_mask: None,
         });
         pass.set_pipeline(&self.pipeline);
         for (i, (rect, bind)) in panels.iter().enumerate() {

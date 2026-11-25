@@ -1,5 +1,7 @@
 # Ocean
 
+> **Package:** `engine`: every game has it. Its ocean render feature is grouped in the engine's manifest as the package it becomes in a later phase, with no switch yet ([Packages](packages.md)).
+
 Flint renders an endless, physically-grounded ocean: a sum of Gerstner waves
 shaped by a JONSWAP wind-sea spectrum, drawn on a camera-following grid and
 shaded in hard cel bands. The waves are believable — real dispersion, real
@@ -43,8 +45,9 @@ If you change the wave math, CPU and GPU must move together. Two guards exist:
 
 - `gpu_packing_matches_cpu_evaluation` in `flint-core` asserts the packed GPU
   layout evaluates to the CPU result.
-- A `wave_probe` script pinning a visible buoy to `ocean_height` will visibly
-  detach from the surface the moment parity breaks.
+- The Ocean Debug panel's **Wave probe** pins an orange cross to the CPU's
+  height ahead of the camera, which visibly detaches from the surface the
+  moment parity breaks (see Debugging, below).
 
 A related trap: **wave phase is precomputed per frame in `f64` on the CPU and
 uploaded.** Never accumulate phase in `f32` in the shader — over a long
@@ -101,7 +104,7 @@ mask rather than a soft blend.
 | `foam_threshold` | Jacobian threshold — higher makes more foam. |
 | `foam_noise_scale` | World-space frequency of foam breakup. |
 | `ramp_steps` | Cel bands in the diffuse ramp (1–8). |
-| `specular_strength` | Sun glint. The glint is Fresnel-weighted, so it does not smear into a white disc under the camera. |
+| `specular_strength` | Sun glint, and each point and spot light's ([Lighting: Grass and water](lighting.md#grass-and-water)). The glint is Fresnel-weighted, so it does not smear into a white disc under the camera. |
 | `band_wobble` | Noise on the band contours. 0 gives razor edges; a little wobble stops them reading as machine-made. |
 | `band_dither` / `band_dither_scale` | Halftone dot transition at band edges, in dots per meter. |
 
@@ -118,24 +121,39 @@ composite's old near-1.0 sky cut.)
 
 ### Bioluminescence
 
-`foam_glow` (0 = off) makes foam emissive in `foam_glow_color`. Drive it from a
-time-of-day script to get plankton bloom nights where the wake lights up.
+`foam_glow` (0 = off) makes foam emissive in `foam_glow_color`, brightest where
+it is churned: contact foam first, then flecks and the shoreline. The engine
+never moves it. A game raises it from its own clock (with `set_field`) to get
+plankton bloom nights where the wake lights up.
 
 ### Contact foam
 
 Give any entity an `ocean_contact` component and the ocean grows a splash ring
-around its hull:
+around its footprint: a hull, a pier, a swimmer.
 
 ```toml
 [entities.boat.ocean_contact]
-half_x = 1.2
+half_x = 1.2   # half-extents along the entity's local X and Z
 half_z = 1.15
 ```
 
-The renderer tracks the hull's center, yaw and extents, differentiates its
-position for velocity, and the shader computes churn from *the water's orbital
-velocity relative to the hull, projected into the nearest hull face*. A flat
-sea stays quiet, the lee side stays quiet, and the windward face flares.
+The footprint is read from the entity's **world** transform, so a hull under a
+parent, or one posed with `rotation_quat` (as physics writes a dynamic body
+back), foams where it is drawn. Its heading is the line its footprint follows
+on the water, so a hull that pitches and rolls on the swell keeps its ring
+square to it, and the half-extents grow with the entity's world scale.
+
+Up to **four** `ocean_contact` entities foam at once. With more, the four
+nearest the camera foam, and each one left out is warned about once by name.
+Where two rings meet, the stronger shows. [`flint-examples/contact_foam.scene.toml`](https://github.com/chrischaps/flint-examples/blob/main/contact_foam.scene.toml)
+has three hulls, each posed a different way.
+
+The churn comes from *the water's orbital velocity relative to the hull,
+projected into the nearest hull face*. A flat sea stays quiet, the lee side
+stays quiet, and the windward face flares. The hull's own velocity is what
+the player's physics gives a dynamic body; any other hull's drawn position is
+differenced from frame to frame (clamped at 5 m/s, so a teleport doesn't read
+as a slam). A host passes velocities in `FrameInputs::contact_velocities`.
 
 | Field | Effect |
 |-------|--------|
@@ -260,7 +278,7 @@ it likes, with or without an `ocean`.
 
 ![A tarn above the sea, a river falling into it, its outflow falling on](../images/water-bodies.png)
 
-*`examples/water_bodies.scene.toml`: the tarn sits 6 m up, the river off the
+*[`flint-examples/water_bodies.scene.toml`](https://github.com/chrischaps/flint-examples/blob/main/water_bodies.scene.toml): the tarn sits 6 m up, the river off the
 plateau falls into it, and the outflow falls on to the sea. Fast water foams
 white along its flow.*
 
@@ -371,8 +389,13 @@ The **Ocean Debug** panel (`F3` in the player) exposes the whole component
 live — spectrum, colors, foam, contact foam, band edges, clarity, grid — and
 **Commit to File** writes your tuning back into the scene TOML.
 
-`show_probe` parks a bright buoy on the surface as a standing CPU/GPU parity
-check.
+Its **Diagnostics → Wave probe** box is a standing CPU/GPU parity check: an
+orange cross and stem pinned to the CPU's `sample_height` six metres ahead of
+the camera, drawn as depth-tested world lines. The stem must vanish into the
+water exactly at the cross; if the cross floats or sinks, the sampler and the
+shader have diverged. The box is the panel's, not the scene's, so it needs no
+entity or script. (It replaces the `ocean` component's old `show_probe`
+field, which only a game's own buoy script read.)
 
 Headless:
 

@@ -62,6 +62,12 @@ struct Variant {
     // Scalars, not a vec2 (which would align to 8)
     _pad_dissolve_b: u32,
     _pad_dissolve_c: u32,
+    // #507: where the mask can hold the variant's id, output pixels
+    // (x0, y0, x1, y1), the whole frame when its draws have no bounds
+    bounds: vec4<f32>,
+    // #929: with SNAP, its grid's band in the snap owner state
+    // (ascii_snap_owner.wgsl), as `snap_bands` holds one
+    owner: vec4<i32>,
 };
 
 // A variant whose edge glyphs are the whole frame's (`edge_glyphs`)
@@ -159,7 +165,23 @@ struct AsciiUniforms {
     // calibrated ramp's bands, which follow its glyphs' measured ink, or
     // EQUAL_BANDS at a ramp's first step for equal bands
     ramp_tone: array<vec4<f32>, 32>,
+    // Where the style mask can hold a variant's id (#507), output pixels
+    // (x0, y0, x1, y1): the variants' screen bounds grown by two of the
+    // largest cell, the whole frame when they have none
+    mask_rect: vec4<f32>,
+    // Each of `snap_grids`' band in the snap owner state (#929,
+    // ascii_snap_owner.wgsl): x, y = the grid's cell at the band's first
+    // texel, z = its first row + 1 (0: the grid has none), w = its columns
+    // | rows << 16
+    snap_bands: array<vec4<i32>, 8>,
 };
+
+// Whether the mask under output point `p` can hold a variant's id (#507).
+// Outside `mask_rect` it is 0, and so is every texel a cell or a silhouette
+// test away, so a reader there skips the load and takes slot 0.
+fn in_mask_rect(p: vec2<f32>) -> bool {
+    return all(p >= u.mask_rect.xy) && all(p < u.mask_rect.zw);
+}
 
 // A `ramp_tone` first step saying its ramp takes equal bands; `EQUAL_BANDS`
 // in ascii.rs.
@@ -204,16 +226,30 @@ const MAX_SNAP_GRIDS: u32 = 8u;
 // never reads them, so full-screen ASCII costs what it did when the table
 // lived in the uniform.
 @group(0) @binding(1) var<storage, read> variants: array<Variant>;
-@group(0) @binding(2) var<storage, read> slots: array<u32>;
+@group(0) @binding(2) var<storage, read> flint_slots: array<u32>;
 
 // The variant slot of mask id `id`: 0 (the whole frame) past the table
 fn slot_of(id: u32) -> u32 {
     // Id 0 is no styled entity, the whole frame's: most of a frame's
     // pixels, spared the table read (#337)
-    if id == 0u || id >= arrayLength(&slots) {
+    if id == 0u {
         return 0u;
     }
-    return slots[id];
+    return flint_slot(id);
+}
+
+// A variant's flag: its silhouette snaps to whole cells (#338)
+const SNAP: u32 = 4u;
+
+// Whether slot `slot` is a drawn variant whose silhouette snaps
+fn snaps(slot: u32) -> bool {
+    return slot != 0u && (variants[slot].flags & (SNAP | 1u)) == SNAP;
+}
+
+// The lattice sample `k` (0..16, row by row) of the cell whose top left is
+// `cell_min`, `cell` wide: a pixel's top left
+fn lattice(cell_min: vec2<f32>, cell: vec2<f32>, k: i32) -> vec2<f32> {
+    return floor(cell_min + (vec2<f32>(f32(k & 3), f32(k >> 2u)) + 0.5) / 4.0 * cell);
 }
 
 struct VertexOutput {
@@ -226,22 +262,6 @@ fn vs_main(@builtin(vertex_index) vi: u32) -> VertexOutput {
     var out: VertexOutput;
     out.position = vec4<f32>(uv * 2.0 - 1.0, 0.0, 1.0);
     return out;
-}
-
-fn to_display(c: vec3<f32>) -> vec3<f32> {
-    let lo = c * 12.92;
-    let hi = 1.055 * pow(c, vec3<f32>(1.0 / 2.4)) - 0.055;
-    return select(hi, lo, c <= vec3<f32>(0.0031308));
-}
-
-fn to_linear(c: vec3<f32>) -> vec3<f32> {
-    let lo = c / 12.92;
-    let hi = pow((c + 0.055) / 1.055, vec3<f32>(2.4));
-    return select(hi, lo, c <= vec3<f32>(0.04045));
-}
-
-fn luma(c: vec3<f32>) -> f32 {
-    return dot(c, vec3<f32>(0.2126, 0.7152, 0.0722));
 }
 
 // Luminance remapped to the ramp: contrast about mid-grey, then brightness.
@@ -291,7 +311,7 @@ fn exposed(c: vec3<f32>, gain: f32) -> vec3<f32> {
         return c;
     }
     if u.srgb == 1u {
-        return clamp(to_display(to_linear(c) * gain), vec3<f32>(0.0), vec3<f32>(1.0));
+        return clamp(flint_to_display(flint_to_linear(c) * gain), vec3<f32>(0.0), vec3<f32>(1.0));
     }
     return clamp(c * gain, vec3<f32>(0.0), vec3<f32>(1.0));
 }

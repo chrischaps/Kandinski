@@ -6,7 +6,7 @@
 //! A section has the style's toggle, a row per setting (a combo or text
 //! field for an option, a slider for a parameter, one colour picker for an
 //! `_r/_g/_b` triple; labels, hover text and whole-number steps come from
-//! the descriptor's hints), and four buttons: **Defaults** clears the
+//! each setting's own `StyleUi`, #510), and four buttons: **Defaults** clears the
 //! style's values, **Authored** puts back what the scene says, **Copy
 //! TOML** puts the `[post_process.styles.<name>]` block that reproduces
 //! what is on screen on the clipboard, so a look tuned by eye goes back
@@ -24,7 +24,8 @@
 
 use flint_render::stylize::reveal::{self, RevealShape, StyleReveal};
 use flint_render::stylize::{
-    self, ChoiceScope, StyleControl, StyleDescriptor, StyleOption, StyleSettings, StyleStage,
+    self, ChoiceScope, StyleControl, StyleDescriptor, StyleOption, StyleRegistry, StyleSettings,
+    StyleStage,
 };
 use flint_render::PostProcessConfig;
 use std::collections::HashMap;
@@ -35,7 +36,7 @@ use std::path::{Path, PathBuf};
 /// changed. Draws nothing for a display style, which runs after bloom.
 pub fn feeds_bloom_checkbox(
     ui: &mut egui::Ui,
-    style: &'static StyleDescriptor,
+    style: &StyleDescriptor,
     pp: &mut PostProcessConfig,
 ) -> bool {
     if style.stage != StyleStage::Hdr {
@@ -83,6 +84,11 @@ impl StylesEdit {
 /// The sliders' width in a style's grid, in points.
 const SLIDER_WIDTH: f32 = 130.0;
 
+/// The Blend row's hover text (#521).
+const BLEND_HELP: &str = "How much of the style shows over the frame it read: 1 is all of it, \
+     0 none (it leaves the chain). A script fades it with set_post_style_param(name, \
+     \"blend\", v), and set_look(name, seconds) fades a whole look. Scene key: blend";
+
 /// How long the "copied" note stays after Copy TOML, in seconds.
 const COPIED_NOTE_SECS: f64 = 1.5;
 
@@ -124,9 +130,23 @@ pub struct StylesEditor {
     /// (#875), so switching it back on brings the tuned tear back while
     /// the config (and Copy TOML) say nothing of it in between.
     reveal_stash: HashMap<&'static str, StyleReveal>,
+    /// The registry the host's renderer draws with (#742), mirrored by
+    /// [`set_styles`](Self::set_styles): one section a style.
+    styles: StyleRegistry,
 }
 
 impl StylesEditor {
+    /// Mirror the registry the renderer draws with (#742). Cheap: the
+    /// user styles are shared.
+    pub fn set_styles(&mut self, styles: &StyleRegistry) {
+        self.styles = styles.clone();
+    }
+
+    /// The registry the editor lists.
+    pub fn styles(&self) -> &StyleRegistry {
+        &self.styles
+    }
+
     /// The scene's folder, where options look for its palettes and glyph
     /// sets (#322); `None` offers the built-ins only. Calling it again (a
     /// scene load or reload) finds new files.
@@ -168,14 +188,14 @@ impl StylesEditor {
     /// defaults dropped), so it and the authored settings compare equal.
     pub fn commit(
         &self,
-        style: &'static StyleDescriptor,
+        style: &StyleDescriptor,
         pp: &mut PostProcessConfig,
     ) -> Result<(), String> {
         let path = self
             .scene_file
             .as_deref()
             .ok_or_else(|| "No scene file to write".to_string())?;
-        let committed = commit_style(path, style, pp)?;
+        let committed = commit_style(path, style, pp, &self.styles)?;
         pp.styles.restore(style.name, &committed);
         Ok(())
     }
@@ -190,7 +210,7 @@ impl StylesEditor {
     /// the style (the font, for ramps) or the scene changes.
     pub fn choices(
         &mut self,
-        style: &'static StyleDescriptor,
+        style: &StyleDescriptor,
         o: &StyleOption,
         pp: &PostProcessConfig,
     ) -> Vec<String> {
@@ -229,16 +249,17 @@ impl StylesEditor {
     ) -> StylesEdit {
         let mut edit = StylesEdit::default();
         self.marked = 0;
-        edit.changed |= chain_ui(ui, pp);
+        let styles = self.styles.clone();
+        edit.changed |= chain_ui(ui, pp, &styles);
         let mut any = false;
-        for style in stylize::registry().iter().copied() {
+        for style in styles.iter() {
             any = true;
             edit.merge(self.section(ui, style, pp, authored));
         }
         if !any {
             ui.weak("No styles registered");
         }
-        if !pp.enabled && stylize::registry().iter().any(|s| s.is_enabled(pp)) {
+        if !pp.enabled && styles.iter().any(|s| s.is_enabled(pp)) {
             ui.colored_label(
                 ui.visuals().warn_fg_color,
                 "Post-processing is off: styles don't draw",
@@ -250,7 +271,7 @@ impl StylesEditor {
     fn section(
         &mut self,
         ui: &mut egui::Ui,
-        style: &'static StyleDescriptor,
+        style: &StyleDescriptor,
         pp: &mut PostProcessConfig,
         authored: Option<&StyleSettings>,
     ) -> StylesEdit {
@@ -277,15 +298,15 @@ impl StylesEditor {
                     }
                 });
                 // A game binary's own Rust style (#419)
-                if stylize::is_game_style(style.name) {
+                if self.styles.is_game_style(style.name) {
                     ui.weak("game").on_hover_text(
                         "Written in Rust by this game and registered with \
-                         stylize::register; not part of the engine",
+                         StyleRegistry::register; not part of the engine",
                     );
                 }
                 // A user-authored style (ADR 0112, #275): where it lives, and
                 // whether it compiles
-                if let Some(source) = stylize::custom::source(style.name) {
+                if let Some(source) = self.styles.source(style.name) {
                     // Each pass's WGSL, and the targets the passes write (#412)
                     let mut hover = source.toml_path.display().to_string();
                     for pass in &source.passes {
@@ -306,7 +327,9 @@ impl StylesEditor {
                     }
                     hover.push_str("\nSaving any of these files reloads it");
                     ui.weak("user").on_hover_text(hover);
-                    if let Some((_, error)) = stylize::custom::errors()
+                    if let Some((_, error)) = self
+                        .styles
+                        .errors()
                         .into_iter()
                         .find(|(name, _)| name == style.name)
                     {
@@ -331,6 +354,8 @@ impl StylesEditor {
                         .num_columns(4)
                         .spacing([8.0, 4.0])
                         .show(ui, |ui| {
+                            edit.changed |= self.blend_row(ui, style, pp, authored);
+                            ui.end_row();
                             for control in style.controls() {
                                 edit.changed |= self.row(ui, style, control, pp, authored);
                                 ui.end_row();
@@ -394,7 +419,7 @@ impl StylesEditor {
     fn commit_button(
         &mut self,
         ui: &mut egui::Ui,
-        style: &'static StyleDescriptor,
+        style: &StyleDescriptor,
         pp: &mut PostProcessConfig,
     ) -> StylesEdit {
         let mut edit = StylesEdit::default();
@@ -412,7 +437,8 @@ impl StylesEditor {
             )
             .on_hover_text(format!(
                 "Write this look into {file}'s [post_process.styles.{}], keeping its comments \
-                 (values back at their default are removed)",
+                 (values back at their default are removed). Only this style is written: the \
+                 rest of F4 (bloom, fog, other styles) stays on screen as tuned, not saved",
                 style.name
             ));
         let button = match &self.commit_blocked {
@@ -460,7 +486,7 @@ impl StylesEditor {
     fn reveal_group(
         &mut self,
         ui: &mut egui::Ui,
-        style: &'static StyleDescriptor,
+        style: &StyleDescriptor,
         pp: &mut PostProcessConfig,
         authored: Option<&StyleSettings>,
     ) -> bool {
@@ -493,8 +519,9 @@ impl StylesEditor {
                 }
                 if let Some(amount) = next.amount {
                     ui.weak(format!(
-                        "{} at {}",
+                        "{}{} at {}",
                         next.shape().name(),
+                        if next.inverted() { ", inverted," } else { "" },
                         number(amount, false)
                     ));
                 }
@@ -528,8 +555,9 @@ impl StylesEditor {
 
     /// Style `name`'s reveal once its Reveal toggle is flipped `on` or off
     /// from `current`. On: what it was when last switched off, else
-    /// `current`, at `reveal = 1`. Off: nothing, with `current` kept for
-    /// the next time it goes on.
+    /// `current`, covering the whole frame (`reveal = 1`, or 0 inverted,
+    /// #1180). Off: nothing, with `current` kept for the next time it
+    /// goes on.
     fn toggled_reveal(
         &mut self,
         name: &'static str,
@@ -541,7 +569,7 @@ impl StylesEditor {
                 .reveal_stash
                 .remove(name)
                 .unwrap_or_else(|| current.clone());
-            next.amount = Some(1.0);
+            next.amount = Some(if next.inverted() { 0.0 } else { 1.0 });
             next
         } else {
             self.reveal_stash.insert(name, current.clone());
@@ -549,18 +577,48 @@ impl StylesEditor {
         }
     }
 
+    /// The style's Blend row (#521), first in its grid: how much of the
+    /// style shows over the frame it read, the table's `blend`. Like the
+    /// reveal it is the framework's, so no descriptor lists it and every
+    /// style gets it; 1 (all of it) is the default and writes no key. True
+    /// when it changed.
+    fn blend_row(
+        &mut self,
+        ui: &mut egui::Ui,
+        style: &StyleDescriptor,
+        pp: &mut PostProcessConfig,
+        authored: Option<&StyleSettings>,
+    ) -> bool {
+        let mut value = pp.styles.blend(style.name);
+        let scene = authored.map(|a| a.blend(style.name));
+        ui.label("Blend").on_hover_text(BLEND_HELP);
+        let mut changed = ui
+            .add(egui::Slider::new(&mut value, 0.0..=1.0).fixed_decimals(2))
+            .on_hover_text(BLEND_HELP)
+            .changed();
+        if reset_cell(ui, value < 1.0, "1") {
+            value = 1.0;
+            changed = true;
+        }
+        self.marked += dot_cell(ui, scene.filter(|s| *s != value).map(|s| number(s, false)));
+        if changed {
+            pp.styles.set_blend(style.name, Some(value));
+        }
+        changed
+    }
+
     /// One setting's row of four grid cells (label, widget, reset,
     /// authored dot); true when it changed.
     fn row(
         &mut self,
         ui: &mut egui::Ui,
-        style: &'static StyleDescriptor,
+        style: &StyleDescriptor,
         control: StyleControl,
         pp: &mut PostProcessConfig,
         authored: Option<&StyleSettings>,
     ) -> bool {
         let label = style.label_for(control.name());
-        let help = style.hint(control.name()).map_or("", |h| h.help);
+        let help = style.help_for(control.name());
         // A setting the current options don't read (#365) is drawn greyed
         // out, its hover line saying why; its reset and authored cells stay
         // live, so it can still be put back
@@ -668,7 +726,7 @@ impl StylesEditor {
                 }
             }
             StyleControl::Param(p) => {
-                let integer = style.hint(p.name).is_some_and(|h| h.integer);
+                let integer = style.is_integer(p.name);
                 let mut value = style.param(pp, p.name);
                 let scene = authored.map(|a| a.param(style.name, p.name).unwrap_or(p.default));
                 {
@@ -738,8 +796,9 @@ impl StylesEditor {
 /// holds for the style, read back from that block.
 pub fn commit_style(
     path: &Path,
-    style: &'static StyleDescriptor,
+    style: &StyleDescriptor,
     pp: &PostProcessConfig,
+    styles: &StyleRegistry,
 ) -> Result<StyleSettings, String> {
     let block = stylize::style_toml(style, pp);
     let mut doc = flint_scene::SceneDocument::from_file(path)?;
@@ -755,7 +814,7 @@ pub fn commit_style(
         .cloned()
         .unwrap_or_default();
     let tables = std::collections::BTreeMap::from([(style.name.to_string(), table)]);
-    let (settings, warnings) = StyleSettings::from_tables(&tables);
+    let (settings, warnings) = StyleSettings::from_tables(&tables, styles);
     for warning in warnings {
         tracing::warn!("Committed style block: {warning}");
     }
@@ -763,8 +822,13 @@ pub fn commit_style(
 }
 
 /// The styles on in `stage`, in the order its chain runs them (#299).
-pub fn chain_of(stage: StyleStage, pp: &PostProcessConfig) -> Vec<(&'static StyleDescriptor, f32)> {
-    stylize::stage_chain(stage, pp)
+pub fn chain_of<'s>(
+    stage: StyleStage,
+    pp: &PostProcessConfig,
+    styles: &'s StyleRegistry,
+) -> Vec<(&'s StyleDescriptor, f32)> {
+    styles
+        .stage_chain(stage, pp)
         .into_iter()
         .filter(|(d, _)| d.is_enabled(pp))
         .collect()
@@ -773,11 +837,7 @@ pub fn chain_of(stage: StyleStage, pp: &PostProcessConfig) -> Vec<(&'static Styl
 /// Run `chain[i]` one place earlier, swapping its order with the style
 /// before it. Equal orders (both at their defaults' tie) step the moved one
 /// just in front instead, so the move always shows.
-pub fn move_earlier(
-    pp: &mut PostProcessConfig,
-    chain: &[(&'static StyleDescriptor, f32)],
-    i: usize,
-) {
+pub fn move_earlier(pp: &mut PostProcessConfig, chain: &[(&StyleDescriptor, f32)], i: usize) {
     let ((a, oa), (b, ob)) = (chain[i - 1], chain[i]);
     if oa == ob {
         pp.styles.set_order(b.name, Some(oa - 0.5));
@@ -790,10 +850,10 @@ pub fn move_earlier(
 /// The chain line of each stage with a style on: its styles in running
 /// order, with buttons to move one earlier or later. True when the order
 /// changed.
-fn chain_ui(ui: &mut egui::Ui, pp: &mut PostProcessConfig) -> bool {
+fn chain_ui(ui: &mut egui::Ui, pp: &mut PostProcessConfig, styles: &StyleRegistry) -> bool {
     let mut changed = false;
     for (stage, name) in [(StyleStage::Hdr, "HDR"), (StyleStage::Display, "Display")] {
-        let chain = chain_of(stage, pp);
+        let chain = chain_of(stage, pp, styles);
         if chain.is_empty() {
             continue;
         }
@@ -858,9 +918,10 @@ fn reveal_rows(
     };
 
     // The amount: the toggle in the header puts it there or takes it away
-    let amount_help = "How much of the frame shows the style: 0 none of it (the style leaves \
-                       the chain, so the frame is the live one), 1 all of it. Scripts ease it \
-                       with tween_post_style_param. Scene key: reveal";
+    let amount_help = "How far the region has grown: 0 none of the frame, 1 all of it. The \
+                       style shows inside it (at 0 the style leaves the chain, so the frame is \
+                       the live one), or outside it when Inverted. Scripts ease it with \
+                       tween_post_style_param. Scene key: reveal";
     help(ui.label("Amount"), amount_help, None);
     let mut amount = next.amount.unwrap_or(1.0);
     if help(
@@ -913,6 +974,27 @@ fn reveal_rows(
                 |shape| format!("{:?}", shape.name()),
             )
         }),
+    );
+    ui.end_row();
+
+    // Which side of the edge the style is on (#1180)
+    let invert_help = "Keep the style outside the region instead: the frame it read shows \
+                       through the region as it grows, so an iris opens the plain picture from \
+                       Start x, y. Inverted, Amount 0 is the style everywhere and 1 the live \
+                       frame. Scene key: reveal_invert";
+    help(ui.label("Inverted"), invert_help, None);
+    let mut inverted = next.inverted();
+    if help(ui.checkbox(&mut inverted, ""), invert_help, None).changed() {
+        next.invert = Some(inverted);
+    }
+    if reset_cell(ui, next.invert.is_some_and(|i| i), "false") {
+        next.invert = None;
+    }
+    marked += dot_cell(
+        ui,
+        scene
+            .filter(|s| s.inverted() != next.inverted())
+            .map(|s| s.inverted().to_string()),
     );
     ui.end_row();
 
@@ -1112,6 +1194,7 @@ fn rgb_text(rgb: [f32; 3]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::run_headless_frame;
 
     /// Every piece of text the editor drew in one frame.
     fn drawn_text(
@@ -1123,8 +1206,8 @@ mod tests {
         let mut out = Vec::new();
         // Two passes: collapsing state settles on the first
         for _ in 0..2 {
-            let output = ctx.run(egui::RawInput::default(), |ctx| {
-                egui::CentralPanel::default().show(ctx, |ui| {
+            let output = run_headless_frame(&ctx, egui::RawInput::default(), |ui| {
+                egui::CentralPanel::default().show(ui, |ui| {
                     editor.ui(ui, pp, authored);
                 });
             });
@@ -1146,7 +1229,7 @@ mod tests {
 
     fn all_on() -> PostProcessConfig {
         let mut pp = PostProcessConfig::default();
-        for s in stylize::registry().iter() {
+        for s in stylize::builtins().iter() {
             pp.styles.set_enabled(s.name, true);
         }
         pp
@@ -1157,7 +1240,7 @@ mod tests {
         let mut editor = StylesEditor::default();
         let mut pp = all_on();
         let text = drawn_text(&mut editor, &mut pp, None);
-        for style in stylize::registry().iter() {
+        for style in stylize::builtins().iter() {
             assert!(text.contains(&style.label.to_string()), "{}", style.label);
             for control in style.controls() {
                 let label = style.label_for(control.name());
@@ -1192,10 +1275,10 @@ mod tests {
     fn drawn_strength(editor: &mut StylesEditor, pp: &mut PostProcessConfig) -> Vec<(String, f32)> {
         let ctx = egui::Context::default();
         let mut out = Vec::new();
-        let panel = ctx.style().visuals.panel_fill;
+        let panel = ctx.global_style().visuals.panel_fill;
         for _ in 0..2 {
-            let output = ctx.run(egui::RawInput::default(), |ctx| {
-                egui::CentralPanel::default().show(ctx, |ui| {
+            let output = run_headless_frame(&ctx, egui::RawInput::default(), |ui| {
+                egui::CentralPanel::default().show(ui, |ui| {
                     editor.ui(ui, pp, None);
                 });
             });
@@ -1265,12 +1348,12 @@ mod tests {
 
     #[test]
     fn a_style_without_conditions_draws_every_row_alike() {
-        // pencil has hints but no conditions: every label at one strength
+        // pencil has labels but no conditions: every label at one strength
         let mut editor = StylesEditor::default();
         let mut pp = PostProcessConfig::default();
         pp.styles.set_enabled("pencil", true);
         let drawn = drawn_strength(&mut editor, &mut pp);
-        let pencil = stylize::find("pencil").unwrap();
+        let pencil = stylize::builtin("pencil").unwrap();
         let labels: Vec<f32> = pencil
             .controls()
             .into_iter()
@@ -1291,11 +1374,12 @@ mod tests {
 
     /// A style with a free-text option (no choices, none found), as a
     /// file-named setting is. Registered nowhere; drawn by hand.
+    const TEXT_OPTIONS: &[StyleOption] = &[StyleOption::new("file", "", &[])];
     static TEXT_STYLE: StyleDescriptor =
         StyleDescriptor::new("text_test", "Text test", StyleStage::Display, |_| {
             unreachable!("never drawn")
         })
-        .options(&[StyleOption::new("file", "", &[])]);
+        .options(TEXT_OPTIONS);
 
     #[test]
     fn typing_a_file_name_survives_frames_and_commits_on_enter() {
@@ -1311,8 +1395,8 @@ mod tests {
                 events,
                 ..Default::default()
             };
-            let _ = ctx.run(input, |ctx| {
-                egui::CentralPanel::default().show(ctx, |ui| {
+            let _ = run_headless_frame(&ctx, input, |ui| {
+                egui::CentralPanel::default().show(ui, |ui| {
                     edit.merge(editor.section(ui, &TEXT_STYLE, pp, None));
                 });
             });
@@ -1336,22 +1420,22 @@ mod tests {
     fn the_scene_folder_adds_its_palettes_fonts_and_ramps() {
         let mut src = flint_core::vfs::MemorySource::new();
         src.insert(
-            "examples/palettes/tidepool.palette.toml",
+            "levels/palettes/tidepool.palette.toml",
             "colors = [\"#0a3d62\", \"#3c6382\"]\n",
         );
         src.insert(
-            "examples/fonts/plain.glyphs.toml",
+            "levels/fonts/plain.glyphs.toml",
             "[ramps.dots]\nglyphs = \" .:\"\n",
         );
         flint_core::vfs::scoped(std::sync::Arc::new(src), || {
-            let ascii = stylize::find("ascii").unwrap();
+            let ascii = stylize::builtin("ascii").unwrap();
             let option = |name: &str| ascii.options.iter().find(|o| o.name == name).unwrap();
             let mut editor = StylesEditor::default();
             let mut pp = all_on();
             // No scene: the built-ins
             let palettes = editor.choices(ascii, option("palette"), &pp);
             assert!(!palettes.iter().any(|p| p == "tidepool"), "{palettes:?}");
-            editor.set_scene_dir(Some(PathBuf::from("examples")));
+            editor.set_scene_dir(Some(PathBuf::from("levels")));
             let palettes = editor.choices(ascii, option("palette"), &pp);
             assert!(palettes.iter().any(|p| p == "tidepool"), "{palettes:?}");
             assert!(palettes.iter().any(|p| p == "phosphor"), "built-ins stay");
@@ -1365,7 +1449,7 @@ mod tests {
             // A fixed list is the descriptor's own
             assert_eq!(
                 editor.choices(ascii, option("color"), &pp),
-                option("color").choices
+                option("color").choices.to_vec()
             );
         });
     }
@@ -1376,8 +1460,9 @@ mod tests {
         pp.styles.set_enabled("watercolor", true);
         pp.styles.set_enabled("ascii", true);
         pp.styles.set_enabled("invert", true);
+        let styles = StyleRegistry::new();
         let names = |pp: &PostProcessConfig| -> Vec<&str> {
-            chain_of(StyleStage::Display, pp)
+            chain_of(StyleStage::Display, pp, &styles)
                 .iter()
                 .map(|(d, _)| d.name)
                 .collect()
@@ -1388,7 +1473,7 @@ mod tests {
         assert!(!text.iter().any(|t| t == "HDR chain:"), "nothing on in HDR");
 
         // ASCII before watercolor: the two swap orders
-        let chain = chain_of(StyleStage::Display, &pp);
+        let chain = chain_of(StyleStage::Display, &pp, &styles);
         move_earlier(&mut pp, &chain, 1);
         assert_eq!(names(&pp), ["ascii", "watercolor", "invert"]);
         assert_eq!(pp.styles.order("ascii"), Some(1.0));
@@ -1396,12 +1481,13 @@ mod tests {
         // A tie still moves
         pp.styles.set_order("invert", Some(2.0));
         assert_eq!(names(&pp), ["ascii", "watercolor", "invert"]);
-        let chain = chain_of(StyleStage::Display, &pp);
+        let chain = chain_of(StyleStage::Display, &pp, &styles);
         move_earlier(&mut pp, &chain, 2);
         assert_eq!(names(&pp), ["ascii", "invert", "watercolor"]);
     }
 
     /// A scene's `[post_process.styles]` as a fresh load reads it.
+    #[allow(clippy::disallowed_methods)] // a test reads its own files off the disk
     fn styles_in_file(path: &Path) -> StyleSettings {
         let text = std::fs::read_to_string(path).unwrap();
         let file: toml::Table = toml::from_str(&text).unwrap();
@@ -1415,12 +1501,13 @@ mod tests {
                     .collect()
             })
             .unwrap_or_default();
-        let (settings, warnings) = StyleSettings::from_tables(&tables);
+        let (settings, warnings) = StyleSettings::from_tables(&tables, &StyleRegistry::new());
         assert!(warnings.is_empty(), "{warnings:?}");
         settings
     }
 
     #[test]
+    #[allow(clippy::disallowed_methods)] // a test reads its own files off the disk
     fn commit_writes_the_look_and_clears_the_marks() {
         let dir = std::env::temp_dir().join(format!("flint-commit-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -1437,7 +1524,7 @@ mod tests {
             ..Default::default()
         };
         // Tuned in F4: a new cell and ramp, glow back at its default, a tint
-        let ascii = stylize::find("ascii").unwrap();
+        let ascii = stylize::builtin("ascii").unwrap();
         pp.styles.set_param("ascii", "cell", 9.0);
         pp.styles.set_option("ascii", "ramp", "blocks");
         let glow = ascii.params.iter().find(|p| p.name == "glow").unwrap();
@@ -1461,7 +1548,7 @@ mod tests {
         // Loaded fresh, the scene draws what was on screen
         let fresh = styles_in_file(&path);
         assert!(fresh.same_style("ascii", &pp.styles));
-        for p in ascii.params {
+        for p in &ascii.params {
             assert_eq!(
                 ascii.param(&shown, p.name),
                 ascii.param(&pp, p.name),
@@ -1469,7 +1556,7 @@ mod tests {
                 p.name
             );
         }
-        for o in ascii.options {
+        for o in &ascii.options {
             assert_eq!(
                 ascii.option(&shown, o.name),
                 ascii.option(&pp, o.name),
@@ -1513,14 +1600,14 @@ mod tests {
     fn every_style_has_a_reveal_group_with_a_row_per_key() {
         // #875: the reveal is the framework's, so each style gets the group
         let mut pp = pencil_wiped(0.5);
-        for s in stylize::registry().iter() {
+        for s in stylize::builtins().iter() {
             pp.styles.set_enabled(s.name, true);
         }
         let shown = pp.clone();
         let mut editor = StylesEditor::default();
         let text = drawn_text(&mut editor, &mut pp, None);
         let groups = text.iter().filter(|t| *t == "Reveal").count();
-        assert_eq!(groups, stylize::registry().len(), "{text:?}");
+        assert_eq!(groups, stylize::builtins().len(), "{text:?}");
         // Pencil's is open, since it has a reveal: every row, and the
         // header's summary
         assert!(text.contains(&"wipe at 0.5".to_string()), "{text:?}");
@@ -1548,7 +1635,7 @@ mod tests {
         let rim = drawn_strength(&mut editor, &mut pp);
         assert!(strength_of(&rim, "Rim colour") >= strength_of(&rim, "Ink") * 0.9);
         // Its default is the renderer's: pencil's paper, lifted
-        let paper = reveal::style_paper(stylize::find("pencil").unwrap(), &pp);
+        let paper = reveal::style_paper(stylize::builtin("pencil").unwrap(), &pp);
         let shown = pp.styles.reveal("pencil").unwrap().rim_color(paper);
         assert!(shown.iter().zip(paper).all(|(r, p)| *r > p), "{shown:?}");
     }
@@ -1577,7 +1664,7 @@ mod tests {
         let off = editor.toggled_reveal("pencil", &tuned, false);
         pp.styles.replace_reveal("pencil", off);
         assert!(pp.styles.reveal("pencil").is_none());
-        let pencil = stylize::find("pencil").unwrap();
+        let pencil = stylize::builtin("pencil").unwrap();
         assert!(!stylize::style_toml(pencil, &pp).contains("reveal"));
         // On again: the wipe comes back, at reveal = 1
         let on = editor.toggled_reveal("pencil", &StyleReveal::default(), true);
@@ -1593,6 +1680,133 @@ mod tests {
                 ..Default::default()
             }
         );
+        // An inverted one (#1180) comes back covering the frame too: at 0
+        let inverted = StyleReveal {
+            amount: Some(0.3),
+            shape: Some(RevealShape::Iris),
+            invert: Some(true),
+            ..Default::default()
+        };
+        editor.toggled_reveal("ascii", &inverted, false);
+        let on = editor.toggled_reveal("ascii", &StyleReveal::default(), true);
+        assert_eq!(on.amount, Some(0.0));
+        assert_eq!(on.coverage(), Some(1.0));
+        assert!(on.inverted());
+    }
+
+    #[test]
+    fn every_style_has_a_blend_row() {
+        let mut editor = StylesEditor::default();
+        let mut pp = all_on();
+        let text = drawn_text(&mut editor, &mut pp, None);
+        let rows = text.iter().filter(|t| *t == "Blend").count();
+        assert_eq!(rows, stylize::builtins().len(), "{text:?}");
+        // At 1 it draws no reset and changes nothing
+        assert_eq!(pp.styles, all_on().styles);
+    }
+
+    /// One frame of `style`'s section with `events`: what it changed, and
+    /// each text it drew with where.
+    fn blend_frame(
+        ctx: &egui::Context,
+        editor: &mut StylesEditor,
+        style: &'static StyleDescriptor,
+        pp: &mut PostProcessConfig,
+        authored: &StyleSettings,
+        events: Vec<egui::Event>,
+    ) -> (StylesEdit, Vec<(String, egui::Rect)>) {
+        let mut edit = StylesEdit::default();
+        let input = egui::RawInput {
+            events,
+            ..Default::default()
+        };
+        let output = run_headless_frame(ctx, input, |ui| {
+            egui::CentralPanel::default().show(ui, |ui| {
+                edit.merge(editor.section(ui, style, pp, Some(authored)));
+            });
+        });
+        fn walk(shape: &egui::Shape, out: &mut Vec<(String, egui::Rect)>) {
+            match shape {
+                egui::Shape::Text(t) => {
+                    out.push((t.galley.job.text.clone(), t.visual_bounding_rect()))
+                }
+                egui::Shape::Vec(v) => v.iter().for_each(|s| walk(s, out)),
+                _ => {}
+            }
+        }
+        let mut drawn = Vec::new();
+        for clipped in &output.shapes {
+            walk(&clipped.shape, &mut drawn);
+        }
+        (edit, drawn)
+    }
+
+    #[test]
+    fn the_blend_slider_fades_the_style_and_resets_to_1() {
+        let ctx = egui::Context::default();
+        let mut editor = StylesEditor::default();
+        let kuwahara = stylize::builtin("kuwahara").unwrap();
+        let mut authored = StyleSettings::default();
+        authored.set_enabled("kuwahara", true);
+        let mut pp = PostProcessConfig {
+            styles: authored.clone(),
+            ..Default::default()
+        };
+        let mut frame = |pp: &mut PostProcessConfig, events| {
+            // `ui` zeroes the count each frame; one section alone doesn't
+            editor.marked = 0;
+            let (edit, drawn) = blend_frame(&ctx, &mut editor, kuwahara, pp, &authored, events);
+            (edit, drawn, editor.marked)
+        };
+        frame(&mut pp, vec![]);
+        let (_, drawn, _) = frame(&mut pp, vec![]);
+        let row = |drawn: &[(String, egui::Rect)], text: &str| {
+            let label = drawn.iter().find(|(t, _)| t == "Blend").unwrap().1;
+            drawn
+                .iter()
+                .find(|(t, r)| t == text && (r.center().y - label.center().y).abs() < 4.0)
+                .map(|(_, r)| *r)
+        };
+        // The slider's value reads 1; its rail runs left of that
+        let value = row(&drawn, "1.00").unwrap_or_else(|| panic!("no blend value in {drawn:?}"));
+        let at = egui::pos2(value.left() - SLIDER_WIDTH * 0.75, value.center().y);
+        let press = |pressed| egui::Event::PointerButton {
+            pos: at,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: Default::default(),
+        };
+        frame(&mut pp, vec![egui::Event::PointerMoved(at)]);
+        let (pressed, _, _) = frame(&mut pp, vec![press(true)]);
+        frame(&mut pp, vec![press(false)]);
+        frame(&mut pp, vec![egui::Event::PointerGone]);
+        assert!(pressed.changed);
+        let faded = pp.styles.blend("kuwahara");
+        assert!(faded > 0.0 && faded < 0.5, "blend {faded}");
+        assert!(pp.styles.is_enabled("kuwahara"), "blend leaves it on");
+        let toml = stylize::style_toml(kuwahara, &pp);
+        assert!(toml.contains("blend = "), "{toml}");
+
+        // Against the scene's 1: the dot, the edited header and a reset
+        let (_, drawn, marked) = frame(&mut pp, vec![]);
+        assert_eq!(marked, 1);
+        assert!(drawn.iter().any(|(t, _)| t == "edited"));
+        let reset = row(&drawn, "↺").expect("a reset beside the blend");
+        let at = reset.center();
+        let press = |pressed| egui::Event::PointerButton {
+            pos: at,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: Default::default(),
+        };
+        frame(&mut pp, vec![egui::Event::PointerMoved(at)]);
+        frame(&mut pp, vec![press(true)]);
+        let (released, _, _) = frame(&mut pp, vec![press(false)]);
+        assert!(released.changed);
+        // Back at 1 the table says nothing of it, as the scene's
+        assert_eq!(pp.styles.blend("kuwahara"), 1.0);
+        assert!(pp.styles.same_style("kuwahara", &authored));
+        assert!(!stylize::style_toml(kuwahara, &pp).contains("blend"));
     }
 
     #[test]
@@ -1602,7 +1816,7 @@ mod tests {
         pp.styles
             .set_reveal("pencil", "reveal_edge", &value, true)
             .unwrap();
-        let text = stylize::style_toml(stylize::find("pencil").unwrap(), &pp);
+        let text = stylize::style_toml(stylize::builtin("pencil").unwrap(), &pp);
         for line in [
             "reveal = 0.42",
             "reveal_shape = \"wipe\"",
@@ -1627,6 +1841,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::disallowed_methods)] // a test reads its own files off the disk
     fn commit_writes_the_reveal_and_takes_it_out_when_off() {
         let dir = std::env::temp_dir().join(format!("flint-reveal-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -1637,7 +1852,7 @@ mod tests {
              reveal_x = 0.56\nboil = 4.0\n",
         )
         .unwrap();
-        let pencil = stylize::find("pencil").unwrap();
+        let pencil = stylize::builtin("pencil").unwrap();
         let mut editor = StylesEditor::default();
         editor.set_scene_file(Some(path.clone()));
 

@@ -17,6 +17,12 @@ use crate::spec::{LivingConfig, ProcGenSpec, Stagger, VarianceConfig, JITTER_TAR
 use crate::types::{BoundingBox, BranchSegment, MeshData};
 use crate::{ProcGenError, Result};
 
+/// One piece of a living structure, with its stable `id` and `parent`: a tree's
+/// branch, a form's section of its spine. The living layer is generic over what
+/// grows it, so it says `Segment`; the type is the tree generator's
+/// [`BranchSegment`], which every living generator already emits.
+pub type Segment = BranchSegment;
+
 /// How many times [`LivingSkeleton::with_variance`] corrects its size. A
 /// fixed count, so the result doesn't depend on a tolerance. Limbs stay on the
 /// trunk, so the box isn't quite proportional to the scale and one round isn't
@@ -144,6 +150,13 @@ impl WarpedTime {
 /// value.
 pub const STAGGER_PER_LEVEL: f64 = 0.15;
 
+/// The fastest a boil can be asked to tick, times its spec's pace (#529).
+pub const JITTER_RATE_MAX: f32 = 8.0;
+
+/// The fastest a form's words can be asked to drift along their lines, times
+/// its spec's `row_pace` (#576).
+pub const ROW_RATE_MAX: f32 = 8.0;
+
 /// The clock a living prop drifts on: hold, then glide to the next pose over
 /// the last `glide` of each `step`, with its parts out of phase.
 ///
@@ -177,12 +190,12 @@ impl LivingClock {
     }
 
     /// The clock at `t` seconds for one segment, with its phase offset.
-    pub fn for_segment(&self, t: f64, segment: &BranchSegment) -> WarpedTime {
+    pub fn for_segment(&self, t: f64, segment: &Segment) -> WarpedTime {
         WarpedTime::at_beat(t / f64::from(self.step) + self.phase(segment), self.glide)
     }
 
     /// How far ahead of the prop's own beat this segment runs, in beats.
-    pub fn phase(&self, segment: &BranchSegment) -> f64 {
+    pub fn phase(&self, segment: &Segment) -> f64 {
         match self.stagger {
             Stagger::None => 0.0,
             Stagger::PerLevel => f64::from(segment.depth) * STAGGER_PER_LEVEL,
@@ -193,7 +206,7 @@ impl LivingClock {
     }
 
     /// [`for_segment`](Self::for_segment) for every segment, written over `out`.
-    pub fn times_into(&self, t: f64, segments: &[BranchSegment], out: &mut Vec<WarpedTime>) {
+    pub fn times_into(&self, t: f64, segments: &[Segment], out: &mut Vec<WarpedTime>) {
         out.clear();
         out.extend(segments.iter().map(|s| self.for_segment(t, s)));
     }
@@ -457,6 +470,194 @@ pub struct CardBoil {
     pub weights: [f32; 3],
 }
 
+/// Lines of writing whose words drift along them, as text reflows (#576):
+/// `form_v1`'s `row_pace`.
+///
+/// A word (or, when there are more words than the palette has room for, a
+/// few neighbours together) gets a bone of its own after the jitter's, which
+/// carries it along its line's track: the surface sampled across the line, so
+/// it keeps to a curved section. Past the line's ends it is squashed along
+/// the line to the part still inside, which for a plain stroke looks the
+/// same as clipping it, and so a word slides out under the right margin and
+/// in again under the left, a line's width plus one word later. A word's own
+/// boil is a turn of its bone, about its centre, so its card weights none of
+/// the jitter bones.
+///
+/// It all reads one clock in seconds (the prop's row time), so it's a pure
+/// function of that and the same on every run.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RowDrift {
+    /// The lines, each a track its words travel.
+    pub lines: Vec<RowLine>,
+    /// One per drift bone, in bone order from [`Self::first_bone`].
+    pub words: Vec<RowWord>,
+    /// `card_words[k]`: the word whose bone leaf card `k` rides.
+    pub card_words: Vec<u32>,
+    /// Vertices a leaf card takes, so a vertex finds its card.
+    pub card_vertices: usize,
+    /// The palette's first drift bone: after the segments' and the jitter's.
+    pub first_bone: u16,
+}
+
+/// One line of writing as its words travel it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RowLine {
+    /// The bone of the segment the line rides.
+    pub bone: u16,
+    /// Metres a second its words move along it, at a row rate of 1. Above 0
+    /// they move the way the line reads.
+    pub pace: f32,
+    /// Half its width: words show from `-half` to `half` along it.
+    pub half: f32,
+    /// How far a word's start goes round before it's back where it began: the
+    /// line's width, its longest word and a gap, so a word that has slid out
+    /// at one end has wholly gone before it starts in at the other.
+    pub period: f32,
+    /// The track, sampled evenly from `-half` to `half` in the rest pose: a
+    /// word's centre (on the surface, lifted as the cards are).
+    pub points: Vec<Vec3>,
+    /// Along the line at each sample, a unit vector.
+    pub alongs: Vec<Vec3>,
+    /// The surface's outward normal at each sample.
+    pub normals: Vec<Vec3>,
+}
+
+/// One drift bone's word: a card, or a few neighbours on one line.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RowWord {
+    /// Its line, an index into [`RowDrift::lines`].
+    pub line: u32,
+    /// Where it starts along the line in the rest pose, from `-half`.
+    pub start: f32,
+    /// Its length along the line.
+    pub length: f32,
+    /// The jitter channel it turns with.
+    pub channel: u16,
+    /// How much of the channel's turn it takes, and which way round.
+    pub share: f32,
+}
+
+impl RowLine {
+    /// The track at `x` (from `-half` to `half`): the point, and the frame
+    /// there as columns (along, normal, across).
+    fn at(&self, x: f32) -> (Vec3, [Vec3; 3]) {
+        let n = self.points.len();
+        if n == 1 || self.half <= 0.0 {
+            return (self.points[0], frame_of(self.alongs[0], self.normals[0]));
+        }
+        let s = ((x + self.half) / (2.0 * self.half)).clamp(0.0, 1.0) * (n - 1) as f32;
+        let i = (s.floor() as usize).min(n - 2);
+        let f = s - i as f32;
+        let mix = |a: &[Vec3]| a[i] + (a[i + 1] - a[i]) * f;
+        (
+            mix(&self.points),
+            frame_of(mix(&self.alongs), mix(&self.normals)),
+        )
+    }
+}
+
+/// An orthonormal frame from a direction along the line and a normal: along,
+/// the normal made square to it, and across.
+fn frame_of(along: Vec3, normal: Vec3) -> [Vec3; 3] {
+    let a = along.normalized();
+    let n = (normal - a * normal.dot(&a)).normalized();
+    [a, n, a.cross(&n)]
+}
+
+impl RowDrift {
+    /// Where word `w` shows at `seconds` of row time: the middle of what's
+    /// inside the line, and how much of the word that is (0 gone, 1 whole).
+    pub fn shown(&self, w: usize, seconds: f64) -> (f32, f32) {
+        let word = &self.words[w];
+        let line = &self.lines[word.line as usize];
+        let length = word.length.max(1e-6);
+        // A word's start runs round a loop of `period`, measured from where
+        // it has just wholly left the left end, so that wherever it shows it
+        // has one place.
+        let from = f64::from(-line.half - length);
+        let period = f64::from(line.period.max(2.0 * line.half + length));
+        let travelled = f64::from(line.pace) * seconds;
+        let start = (from + (f64::from(word.start) - from + travelled).rem_euclid(period)) as f32;
+        let (lo, hi) = (start.max(-line.half), (start + length).min(line.half));
+        if hi <= lo {
+            let edge = if start >= line.half {
+                line.half
+            } else {
+                -line.half
+            };
+            return (edge, 0.0);
+        }
+        (0.5 * (lo + hi), ((hi - lo) / length).min(1.0))
+    }
+
+    /// The drift bones at `seconds` of row time with these jitter `turns`,
+    /// pushed onto `out`, which already holds the segment bones (and the
+    /// jitter's): each word's segment bone times its move in the rest pose.
+    pub fn bones_into(
+        &self,
+        turns: &[f32; JITTER_CHANNELS],
+        seconds: f64,
+        out: &mut Vec<[[f32; 4]; 4]>,
+    ) {
+        debug_assert_eq!(out.len(), usize::from(self.first_bone));
+        for (w, word) in self.words.iter().enumerate() {
+            let line = &self.lines[word.line as usize];
+            let (rest_at, rest_frame) = line.at(word.start + 0.5 * word.length);
+            let (x, kept) = self.shown(w, seconds);
+            let (now_at, now_frame) = line.at(x);
+            let turn = turns[word.channel as usize] * word.share;
+            let moved = word_move(rest_at, rest_frame, now_at, now_frame, kept, turn);
+            let segment = out[usize::from(line.bone)];
+            out.push(mat_mul(&segment, &moved));
+        }
+    }
+}
+
+/// A word's move in the rest pose: turned by `turn` about its normal, squashed
+/// along its line to `kept`, then carried from the track's frame where it
+/// rests to the frame where it shows.
+fn word_move(
+    rest_at: Vec3,
+    rest: [Vec3; 3],
+    now_at: Vec3,
+    now: [Vec3; 3],
+    kept: f32,
+    turn: f32,
+) -> [[f32; 4]; 4] {
+    // In the rest frame's coordinates (along, normal, across): a turn about
+    // the normal, then the squash along the line.
+    let (c, s) = (turn.cos(), turn.sin());
+    let local = [[c * kept, 0.0, -s], [0.0, 1.0, 0.0], [s * kept, 0.0, c]];
+    // linear = now * local * rest^T, as columns.
+    let mut linear = [[0.0f32; 3]; 3];
+    for (j, column) in linear.iter_mut().enumerate() {
+        // Column j is the image of world axis j.
+        let e = Vec3::from_array(std::array::from_fn(|i| if i == j { 1.0 } else { 0.0 }));
+        let r = [rest[0].dot(&e), rest[1].dot(&e), rest[2].dot(&e)];
+        let l: [f32; 3] =
+            std::array::from_fn(|row| (0..3).map(|k| local[k][row] * r[k]).sum::<f32>());
+        let v = now[0] * l[0] + now[1] * l[1] + now[2] * l[2];
+        *column = v.to_array();
+    }
+    let h = rest_at.to_array();
+    let moved: [f32; 3] =
+        std::array::from_fn(|r| linear[0][r] * h[0] + linear[1][r] * h[1] + linear[2][r] * h[2]);
+    let t = now_at.to_array();
+    [
+        [linear[0][0], linear[0][1], linear[0][2], 0.0],
+        [linear[1][0], linear[1][1], linear[1][2], 0.0],
+        [linear[2][0], linear[2][1], linear[2][2], 0.0],
+        [t[0] - moved[0], t[1] - moved[1], t[2] - moved[2], 1.0],
+    ]
+}
+
+/// `a * b`, both column-major.
+fn mat_mul(a: &[[f32; 4]; 4], b: &[[f32; 4]; 4]) -> [[f32; 4]; 4] {
+    std::array::from_fn(|col| {
+        std::array::from_fn(|row| (0..4).map(|k| a[k][row] * b[col][k]).sum())
+    })
+}
+
 /// A leaf card's place on the skeleton. It rides its segment rigidly.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct LeafBinding {
@@ -475,7 +676,7 @@ pub struct LivingSkeleton {
     pub lineage_seed: u64,
     /// The rest pose's segments, each with its stable id and parent. A
     /// parent always comes before its children.
-    pub segments: Vec<BranchSegment>,
+    pub segments: Vec<Segment>,
     /// The leaf cards in the rest pose, whole and in order: card `k` is
     /// `card_index_count` indices starting at `k * card_index_count`.
     pub leaf_mesh: MeshData,
@@ -537,18 +738,14 @@ impl LivingSkeleton {
     ///
     /// This also works on a blend of two poses, which is what keeps a blended
     /// tree whole.
-    pub fn posed_segments(&self, pose: &LivingPose) -> Result<Vec<BranchSegment>> {
+    pub fn posed_segments(&self, pose: &LivingPose) -> Result<Vec<Segment>> {
         let mut posed = Vec::with_capacity(self.segments.len());
         self.posed_segments_into(pose, &mut posed)?;
         Ok(posed)
     }
 
     /// [`posed_segments`](Self::posed_segments), written over `posed`.
-    pub fn posed_segments_into(
-        &self,
-        pose: &LivingPose,
-        posed: &mut Vec<BranchSegment>,
-    ) -> Result<()> {
+    pub fn posed_segments_into(&self, pose: &LivingPose, posed: &mut Vec<Segment>) -> Result<()> {
         self.check_pose(pose)?;
         posed.clear();
         for (rest, p) in self.segments.iter().zip(&pose.segments) {
@@ -565,7 +762,7 @@ impl LivingSkeleton {
             let end = start + dir * (rest.length() * p.length_scale);
             let slide = Vec3::from_array(p.slide);
             let (start, end) = (start + slide, end + slide);
-            posed.push(BranchSegment {
+            posed.push(Segment {
                 start,
                 end,
                 radius_start: rest.radius_start * p.radius_scale,
@@ -732,7 +929,7 @@ impl LivingSkeleton {
     }
 
     /// How `pose` carries leaf card `k`, given the segments it poses.
-    fn card_carry(&self, k: usize, pose: &LivingPose, posed: &[BranchSegment]) -> CardCarry {
+    fn card_carry(&self, k: usize, pose: &LivingPose, posed: &[Segment]) -> CardCarry {
         let card = &self.leaf_bindings[k];
         let (rest, now) = (
             &self.segments[card.segment as usize],
@@ -823,6 +1020,9 @@ pub struct LivingRig {
     pub card_boil: Vec<CardBoil>,
     /// Which parts are leaves, counting the sub-meshes that have any indices.
     pub leaf_parts: Vec<usize>,
+    /// Lines whose words drift along them (#576), each word on a bone after
+    /// the jitter's. `None` for a tree, and for a form whose words stay put.
+    pub rows: Option<RowDrift>,
 }
 
 impl LivingRig {
@@ -864,7 +1064,7 @@ impl LivingRig {
         &self,
         skeleton: &LivingSkeleton,
         pose: &LivingPose,
-        posed: &mut Vec<BranchSegment>,
+        posed: &mut Vec<Segment>,
         out: &mut Vec<[[f32; 4]; 4]>,
     ) -> Result<()> {
         skeleton.posed_segments_into(pose, posed)?;
@@ -885,6 +1085,19 @@ impl LivingRig {
     /// it has three slots free.
     pub fn runtime_joints(&self, vertex: usize) -> ([u16; 4], [f32; 4]) {
         let v = &self.mesh.vertices[vertex];
+        // A drifting word's card rides its word's bone alone, which turns it
+        // as the jitter would.
+        if let Some(rows) = &self.rows {
+            if let Some(word) = vertex
+                .checked_sub(self.first_leaf_vertex)
+                .and_then(|leaf| rows.card_words.get(leaf / rows.card_vertices.max(1)))
+            {
+                return (
+                    [rows.first_bone + *word as u16, 0, 0, 0],
+                    [1.0, 0.0, 0.0, 0.0],
+                );
+            }
+        }
         match vertex
             .checked_sub(self.first_leaf_vertex)
             .and_then(|leaf| self.card_boil.get(leaf))
@@ -905,6 +1118,33 @@ impl LivingRig {
             ),
             None => (v.joint_indices, v.joint_weights),
         }
+    }
+
+    /// How many bones its runtime palette has: the trunk's and segments', the
+    /// jitter's, and a drifting word's each.
+    pub fn palette_len(&self) -> usize {
+        self.bone_segments.len() + BOIL_BONES + self.rows.as_ref().map_or(0, |r| r.words.len())
+    }
+
+    /// The bones after the segments': the jitter's at `turns`, then each
+    /// drifting word's at `row_seconds` of row time. `out` holds the segment
+    /// bones (a [`Self::palette`]) and gets the rest pushed on.
+    pub fn fast_bones_into(
+        &self,
+        turns: &[f32; JITTER_CHANNELS],
+        row_seconds: f64,
+        out: &mut Vec<[[f32; 4]; 4]>,
+    ) {
+        boil_bones(turns, out);
+        if let Some(rows) = &self.rows {
+            rows.bones_into(turns, row_seconds, out);
+        }
+    }
+
+    /// [`Self::fast_bones_into`] held still: no jitter, and every word where
+    /// it was written.
+    pub fn still_bones_into(&self, out: &mut Vec<[[f32; 4]; 4]>) {
+        self.fast_bones_into(&[0.0; JITTER_CHANNELS], 0.0, out);
     }
 
     /// The rest mesh moved by `palette` on the CPU, the way the GPU does it:
@@ -942,7 +1182,7 @@ impl LivingRig {
 
 /// Every bit of `h` spread across all of them (MurmurHash3's finalizer),
 /// stable across runs and platforms.
-pub(crate) fn mix64(h: u64) -> u64 {
+pub fn mix64(h: u64) -> u64 {
     let mut h = h ^ (h >> 33);
     h = h.wrapping_mul(0xff51_afd7_ed55_8ccd);
     h ^= h >> 33;
@@ -1000,8 +1240,8 @@ mod tests {
         }
     }
 
-    fn segment(id: u32, depth: u32) -> BranchSegment {
-        BranchSegment {
+    fn segment(id: u32, depth: u32) -> Segment {
+        Segment {
             start: Vec3::ZERO,
             end: Vec3::UP,
             radius_start: 0.1,

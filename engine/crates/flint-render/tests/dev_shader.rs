@@ -8,10 +8,12 @@
 //! A binary of its own, since the folder is the process's. Needs a GPU
 //! adapter; without one it prints a note and passes.
 
+#![allow(clippy::disallowed_methods)] // the test's own targets and read-backs, not the renderer's, so uncounted (#1091)
+
 mod shared_gpu;
 
 use flint_ecs::FlintWorld;
-use flint_render::stylize::{dev_shader, registry};
+use flint_render::stylize::{builtins, dev_shader};
 use flint_render::{Camera, RendererConfig, SceneRenderer};
 use std::path::{Path, PathBuf};
 
@@ -62,7 +64,12 @@ impl Frame {
     }
 
     fn draw(&self, renderer: &mut SceneRenderer, world: &FlintWorld) -> Vec<u8> {
-        renderer.update_from_world(world, self.device);
+        renderer.prepare(
+            self.device,
+            self.queue,
+            world,
+            &flint_render::FrameInputs::default(),
+        );
         renderer.render_to(
             self.device,
             self.queue,
@@ -81,9 +88,9 @@ impl Frame {
         let mut encoder = self.device.create_command_encoder(&Default::default());
         encoder.copy_texture_to_buffer(
             self.color.as_image_copy(),
-            wgpu::ImageCopyBuffer {
+            wgpu::TexelCopyBufferInfo {
                 buffer: &buffer,
-                layout: wgpu::ImageDataLayout {
+                layout: wgpu::TexelCopyBufferLayout {
                     offset: 0,
                     bytes_per_row: Some(row),
                     rows_per_image: None,
@@ -99,8 +106,11 @@ impl Frame {
         buffer
             .slice(..)
             .map_async(wgpu::MapMode::Read, |r| r.unwrap());
-        self.device.poll(wgpu::Maintain::Wait);
-        let data = buffer.slice(..).get_mapped_range();
+        let _ = flint_render::wait_for_gpu(&self.device);
+        let data = buffer
+            .slice(..)
+            .get_mapped_range()
+            .expect("mapped buffer range");
         (0..SIZE as usize)
             .flat_map(|y| {
                 let start = y * row as usize;
@@ -124,6 +134,7 @@ fn settle(renderer: &mut SceneRenderer, device: &wgpu::Device) {
 
 /// `src/stylize/*.wgsl` and `src/palette.wgsl` (which `../palette.wgsl`
 /// names) copied under `root`.
+#[allow(clippy::disallowed_methods)] // a test reads its own files off the disk
 fn copy_shaders(root: &Path) -> PathBuf {
     let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
     let dir = root.join("stylize");
@@ -135,7 +146,11 @@ fn copy_shaders(root: &Path) -> PathBuf {
             std::fs::copy(&path, dir.join(path.file_name().unwrap())).unwrap();
         }
     }
-    std::fs::copy(src.join("palette.wgsl"), root.join("palette.wgsl")).unwrap();
+    // The shared files built-in styles name from the folder above
+    // (`../palette.wgsl`; the tear's noise, `../tear_mask.wgsl`, #746)
+    for shared in ["palette.wgsl", "tear_mask.wgsl"] {
+        std::fs::copy(src.join(shared), root.join(shared)).unwrap();
+    }
     dir
 }
 
@@ -151,6 +166,7 @@ fn write(path: &Path, text: &str) {
 }
 
 #[test]
+#[allow(clippy::disallowed_methods)] // a test reads its own files off the disk
 fn a_built_in_styles_shader_reloads_from_the_folder() {
     let Some(lease) = shared_gpu::lease_alone() else {
         flint_render::gpu_select::skip_without_gpu("no GPU adapter");
@@ -168,14 +184,14 @@ fn a_built_in_styles_shader_reloads_from_the_folder() {
     let mut all =
         SceneRenderer::new_headless(device, queue, FORMAT, SIZE, SIZE, RendererConfig::default());
     let mut config = all.post_process_config().clone();
-    for d in registry() {
+    for d in builtins() {
         config.styles.set_enabled(d.name, true);
     }
     all.set_post_process_config(config);
     all.ensure_style_resources(device);
     frame.draw(&mut all, &world);
     assert_eq!(dev_shader::errors(), Vec::<(String, String)>::new());
-    for d in registry() {
+    for d in builtins() {
         assert!(
             all.post_process_config().styles.is_enabled(d.name),
             "{} failed to build from {}",

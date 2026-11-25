@@ -51,22 +51,6 @@ cloud_tint = [1.0, 0.90, 0.78, 0.8]
 cloud_coverage = 0.3
 sun_glow = 1.4
 
-[entities.sun]
-[entities.sun.transform]
-position = [0, 50, 0]
-[entities.sun.directional_light]
-direction = [0.75, -0.38, 0.35]
-color = [1.0, 0.86, 0.66]
-intensity = 2.4
-
-[entities.fill]
-[entities.fill.transform]
-position = [0, 30, 0]
-[entities.fill.directional_light]
-direction = [-0.4, -0.8, -0.4]
-color = [0.55, 0.65, 0.85]
-intensity = 0.35
-
 [entities.ground]
 archetype = "furniture"
 [entities.ground.transform]
@@ -83,7 +67,7 @@ metallic = 0.0
 [entities.meadow.transform]
 position = [-48, 0, -48]
 [entities.meadow.grass_ground]
-mask = "mesh_meadow/mask.png"
+mask = "./mesh_meadow/mask.png"
 width = 96.0
 depth = 96.0
 scale_by_mask = true
@@ -111,7 +95,7 @@ position = [0.4, 0.22, 3.0]
 rotation = [0, 15, 0]
 scale = [0.01, 0.01, 0.01]
 [entities.bench.model]
-asset = "wooden_bench"
+asset = "./models/wooden_bench.glb"
 [entities.bench.ascii_style]
 ramp = "blocks"
 color = "tint"
@@ -126,7 +110,7 @@ archetype = "character"
 position = [-0.9, 0, 4.4]
 rotation = [0, 25, 0]
 [entities.ybot.model]
-asset = "YBotWithIdle"
+asset = "./models/YBotWithIdle.glb"
 [entities.ybot.skeleton]
 skin = "Armature"
 [entities.ybot.ascii_style]
@@ -137,7 +121,7 @@ archetype = "furniture"
 position = [2.4, 0.48, 5.4]
 scale = [0.5, 0.5, 0.5]
 [entities.barrel.model]
-asset = "barrel"
+asset = "./models/barrel.glb"
 [entities.barrel.ascii_style]
 grid = "object"
 # Dark wood: its own tones stretched over the ramp (#289), in place of the
@@ -168,7 +152,7 @@ parent = "crate"
 position = [0.0, 0.8, 0.0]
 scale = [0.035, 0.035, 0.035]
 [entities.lantern.model]
-asset = "Lantern"
+asset = "./models/Lantern.glb"
 
 # --- Smooth, against its parent's style ---
 

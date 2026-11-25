@@ -9,6 +9,7 @@ pub mod branches;
 pub mod leaves;
 mod living;
 pub mod lod;
+mod noise_pose;
 mod trunk;
 
 pub use bark::generate_bark_normal_map;
@@ -903,7 +904,7 @@ impl Generator for TreeGenerator {
         use serde_json::{json, Value};
 
         // `x-when` says which branch method reads a key (see
-        // `param_ui::lint_params`): the editor hides the rest and `flint gen`
+        // `crate::validate_params`): the editor hides the rest and `flint gen`
         // warns about them. `tree_schema_says_which_method_reads_each_key`
         // holds the schema to it.
         let only = |method: &str, mut prop: Value| {
@@ -1596,8 +1597,8 @@ branch_levels = 2
                 include_str!("../../../../../specs/oak_tree.procgen.toml"),
             ),
             (
-                "oak_tree2",
-                include_str!("../../../../../specs/oak_tree.procgen2.toml"),
+                "oak_tree_deep",
+                include_str!("../../../../../specs/oak_tree_deep.procgen.toml"),
             ),
             (
                 "weeping_willow",

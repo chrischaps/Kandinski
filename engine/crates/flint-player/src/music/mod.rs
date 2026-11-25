@@ -27,9 +27,9 @@ pub(crate) mod conducted;
 pub(crate) mod rhythm;
 
 use crate::player_app::subsystem::{SceneCtx, Stage, StageCtx, Subsystem};
-use flint_core::components::MUSIC_SESSION;
 use flint_core::project::Project;
 use flint_ecs::FlintWorld;
+use flint_music::components::MUSIC_SESSION;
 use flint_music::{Conductor, EventScript, SuiteManifest, SuiteSession};
 use flint_script::MusicClock;
 use std::path::{Path, PathBuf};
@@ -60,13 +60,6 @@ pub(crate) fn component_in(world: &FlintWorld) -> Option<toml::Value> {
     found
 }
 
-/// Whether the world plays music, which on the web mixes on the main
-/// thread (#730): a suite clocks itself on kira's manager.
-#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
-pub(crate) fn plays_music(world: &FlintWorld) -> bool {
-    !world.entities_with_component(MUSIC_SESSION).is_empty()
-}
-
 /// A string field of the component; empty or whitespace counts as absent.
 pub(crate) fn comp_str(comp: &toml::Value, key: &str) -> Option<String> {
     comp.get(key)
@@ -89,42 +82,28 @@ fn base_dir(project: &Project, comp: &toml::Value, scene_path: &str) -> PathBuf 
 
 /// The scene's music subsystem, if it has a `music_session`: the rhythm
 /// game's for a component with a `chart` (in a build with the `rhythm`
-/// feature), the music's otherwise.
+/// feature), the music's otherwise. In a capture (`flint render
+/// --scripts`), the music's alone and only for scripts that run: the beat
+/// on the game clock, no sound, no chart judged (#1252).
 pub(crate) fn for_scene(ctx: &mut SceneCtx) -> Option<Box<dyn Subsystem>> {
+    if ctx.capture.as_ref().is_some_and(|c| !c.scripts) {
+        return None;
+    }
     let comp = component_in(ctx.world)?;
     let base = base_dir(ctx.project, &comp, ctx.scene_path);
-    if comp_str(&comp, "chart").is_some() {
+    if ctx.capture.is_none() && comp_str(&comp, "chart").is_some() {
         #[cfg(feature = "rhythm")]
         return Some(Box::new(rhythm::RhythmSubsystem::new(base, comp, ctx)));
         #[cfg(not(feature = "rhythm"))]
-        println!(
-            "[music] this player is built without the `rhythm` feature: the suite plays, \
+        tracing::warn!(target: "music",
+            "this player is built without the `rhythm` feature: the suite plays, \
              its chart isn't judged"
         );
     }
     match MusicSubsystem::new(&base, &comp) {
         Ok(music) => Some(Box::new(music)),
         Err(e) => {
-            eprintln!("[music] {e}");
-            None
-        }
-    }
-}
-
-/// The subsystem for a stepped capture (`flint render --scripts`): the beat
-/// on the game clock, no sound. `None` for a scene without music or whose
-/// suite doesn't load.
-pub(crate) fn for_capture(
-    world: &FlintWorld,
-    project: &Project,
-    scene_path: &str,
-) -> Option<Box<dyn Subsystem>> {
-    let comp = component_in(world)?;
-    let base = base_dir(project, &comp, scene_path);
-    match MusicSubsystem::new(&base, &comp) {
-        Ok(music) => Some(Box::new(music)),
-        Err(e) => {
-            eprintln!("[music] {e}");
+            tracing::warn!(target: "music", "{e}");
             None
         }
     }
@@ -188,9 +167,14 @@ pub(crate) struct MusicSubsystem {
     events: Option<EventScript>,
     base: PathBuf,
     latency_ms: Option<f64>,
-    /// The suite on the shared manager; `None` with no device, where the
-    /// beat still counts on the game clock.
+    /// The suite on the engine's mixer (kira here, or the browser's
+    /// worklet, #1216); `None` with no device, where the beat still counts
+    /// on the game clock.
     session: Option<SuiteSession>,
+    /// The mixer the session was started on (`AudioEngine::mixer_epoch`):
+    /// when the mix moves (the worklet failing), its handles went with the
+    /// old one and the suite starts again on the new.
+    hosted_on: u32,
     /// The beat on the game clock (a stepped capture, no device).
     game_clock: GameClockMusic,
     /// Whether a start has been tried with a device there, so a failed one
@@ -244,22 +228,39 @@ impl MusicSubsystem {
             base: base.to_path_buf(),
             latency_ms,
             session: None,
+            hosted_on: 0,
             tried_with_device: false,
             charted: comp_str(comp, "chart").is_some(),
         })
     }
 
-    /// Start the suite on the shared manager, once there's a device.
+    /// Start the suite on the engine's mixer, once there's a device.
     fn start(&mut self, audio: Option<&mut flint_audio::engine::AudioEngine>) {
+        let Some(audio) = audio else { return };
+        if self.session.is_some() && audio.mixer_epoch() != self.hosted_on {
+            // Its handles went with the mixer they were made on
+            tracing::warn!(target: "music",
+                "suite '{}': the mix moved to the {}; starting it again there",
+                self.manifest.id,
+                audio.mixer_name()
+            );
+            self.session = None;
+            self.tried_with_device = false;
+        }
         if self.session.is_some() || self.tried_with_device {
             return;
         }
-        let Some(manager) = audio.and_then(|a| a.manager_mut()) else {
+        let stems = flint_music::session::FileStems::new(&self.base);
+        // Hosted on the engine's mixer (#730): not while silent (the web's
+        // Begin is still to come); in the browser, in its worklet (#1216).
+        let Ok(started) =
+            audio.host(|mixer| SuiteSession::start(&self.manifest, mixer, &stems, self.latency_ms))
+        else {
             return;
         };
         self.tried_with_device = true;
-        let stems = flint_music::session::FileStems::new(&self.base);
-        match SuiteSession::start(&self.manifest, manager, &stems, self.latency_ms) {
+        self.hosted_on = audio.mixer_epoch();
+        match started {
             Ok(mut session) => {
                 if let Some(events) = &self.events {
                     for ev in &events.events {
@@ -267,9 +268,10 @@ impl MusicSubsystem {
                     }
                 }
                 let buses: Vec<&str> = self.manifest.buses_in_order().map(|(n, _)| n).collect();
-                println!(
-                    "[music] suite '{}' playing: {} bus(es) ({}), {}",
+                tracing::info!(target: "music",
+                    "suite '{}' playing on the {}: {} bus(es) ({}), {}",
                     self.manifest.id,
+                    audio.mixer_name(),
                     buses.len(),
                     buses.join(", "),
                     match self.latency_ms {
@@ -279,7 +281,9 @@ impl MusicSubsystem {
                 );
                 self.session = Some(session);
             }
-            Err(e) => eprintln!("[music] suite '{}' failed to start: {e}", self.manifest.id),
+            Err(e) => {
+                tracing::warn!(target: "music", "suite '{}' failed to start: {e}", self.manifest.id)
+            }
         }
     }
 
@@ -288,7 +292,7 @@ impl MusicSubsystem {
     fn stop(&mut self) {
         if let Some(mut session) = self.session.take() {
             session.stop(STOP_FADE_MS);
-            println!("[music] suite '{}' stopped", self.manifest.id);
+            tracing::info!(target: "music", "suite '{}' stopped", self.manifest.id);
         }
     }
 

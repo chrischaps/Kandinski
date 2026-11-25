@@ -91,9 +91,15 @@ impl ViewGizmo {
         }
     }
 
-    /// Draw the gizmo and return any user interaction
-    pub fn draw(&mut self, ctx: &egui::Context, cam: &CameraView) -> Option<GizmoAction> {
-        let central_rect = ctx.available_rect();
+    /// Draw the gizmo and return any user interaction. `central_rect` is
+    /// what the side panels leave (egui 0.36 has no
+    /// `Context::available_rect`; the caller's root `Ui` knows it).
+    pub fn draw(
+        &mut self,
+        ctx: &egui::Context,
+        cam: &CameraView,
+        central_rect: egui::Rect,
+    ) -> Option<GizmoAction> {
         let gizmo_pos = egui::pos2(
             central_rect.right() - GIZMO_DIAMETER - MARGIN,
             central_rect.top() + MARGIN,
@@ -281,9 +287,11 @@ impl ViewGizmo {
         } else if response.dragged() && !self.drag_started_on_axis {
             let delta = response.drag_delta();
             if delta.length() > 0.0 {
+                // The cube turns as it's dragged, the way a drag in the
+                // view turns the scene (#1153): down shows its top
                 action = Some(GizmoAction::OrbitDelta {
                     dyaw: -delta.x * 0.01,
-                    dpitch: -delta.y * 0.01,
+                    dpitch: delta.y * 0.01,
                 });
             }
         }

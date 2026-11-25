@@ -3,20 +3,17 @@
 //! The [`ProcGenResolver`] indexes `*.procgen.toml` files by their `meta.name`
 //! and provides cached generation through the [`ProcGenCache`].
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 
 use crate::cache::{ProcGenCache, ProcGenCacheConfig};
 use crate::disk_cache::DiskStats;
-use crate::living_props::{
-    LineageDone, LivingDefaults, LivingPropId, LivingPropRequest, LivingProps, POSE_CACHE_BYTES,
-};
 use crate::output::GeneratorOutput;
 use crate::queue::{AssetKind, CompletedAsset, GenerationRequest, ProcGenQueue, QueueStats};
 use crate::registry::GeneratorRegistry;
 use crate::spec::ProcGenSpec;
-use crate::{register_built_in_generators, CacheStats, ProcGenError, Result, Seed};
+use crate::{CacheStats, ProcGenError, Result, Seed};
 use flint_core::ContentHash;
 
 /// Discovers procgen specs by name and generates assets with caching.
@@ -29,8 +26,8 @@ pub struct ProcGenResolver {
     cache: ProcGenCache,
     /// Frame-budgeted generation queue
     queue: ProcGenQueue,
-    /// The scene's living props, which share the queue's frame budget
-    living: LivingProps,
+    /// Specs whose params have been checked: each is warned about once
+    checked: HashSet<String>,
 }
 
 impl ProcGenResolver {
@@ -39,17 +36,15 @@ impl ProcGenResolver {
         Self::with_config(ProcGenCacheConfig::default())
     }
 
-    /// Create a resolver whose cache and queue use `config`, with the
-    /// built-in generators (and `mock`, for tests and validation).
+    /// Create a resolver whose cache and queue use `config`, with
+    /// [`GeneratorRegistry::with_built_ins`]: the generators `flint gen`
+    /// knows.
     pub fn with_config(config: ProcGenCacheConfig) -> Self {
-        let mut registry = GeneratorRegistry::new();
-        register_built_in_generators(&mut registry);
-        registry.register(Box::new(crate::mock::MockGenerator));
-        Self::with_registry(config, registry)
+        Self::with_registry(config, GeneratorRegistry::with_built_ins())
     }
 
     /// Create a resolver over a registry built elsewhere, used as it is: no
-    /// built-in is added, so call [`register_built_in_generators`] on it
+    /// built-in is added, so call [`crate::register_built_in_generators`] on it
     /// first to keep them. This is how a resolver is rebuilt with another
     /// cache without losing the generators a game registered (#195):
     ///
@@ -67,7 +62,7 @@ impl ProcGenResolver {
             registry,
             cache: ProcGenCache::new(config),
             queue: ProcGenQueue::new(budget_ms),
-            living: LivingProps::new(POSE_CACHE_BYTES),
+            checked: HashSet::new(),
         }
     }
 
@@ -86,6 +81,8 @@ impl ProcGenResolver {
 
     /// Index one spec, as discovery would have.
     pub fn index_spec(&mut self, spec: ProcGenSpec) {
+        // A replaced spec is checked again when it is next asked for
+        self.checked.remove(&spec.meta.name);
         self.specs.insert(spec.meta.name.clone(), spec);
     }
 
@@ -116,6 +113,33 @@ impl ProcGenResolver {
             ));
         }
         Ok(())
+    }
+
+    /// What is wrong with the named spec's params against its generator's
+    /// schema ([`crate::validate_params`]): empty when the spec isn't
+    /// indexed or its generator isn't registered (those are
+    /// [`check_generator`](Self::check_generator)'s to say).
+    pub fn param_issues(&self, name: &str) -> Vec<crate::ParamIssue> {
+        let Some(spec) = self.specs.get(name) else {
+            return Vec::new();
+        };
+        match self.registry.get(&spec.generator) {
+            Some(generator) => crate::validate_params(&generator.param_schema(), &spec.params),
+            None => Vec::new(),
+        }
+    }
+
+    /// Warn, once a spec, about what [`param_issues`](Self::param_issues)
+    /// finds: the first time a spec is asked for, whichever way. The spec
+    /// still generates; `flint check` and `flint validate` say the same
+    /// before a run.
+    fn warn_params_once(&mut self, name: &str) {
+        if !self.specs.contains_key(name) || !self.checked.insert(name.to_string()) {
+            return;
+        }
+        for issue in self.param_issues(name) {
+            tracing::warn!("procgen spec '{name}': {issue}");
+        }
     }
 
     /// Register another generator alongside the built-ins (a game's own, or
@@ -168,6 +192,7 @@ impl ProcGenResolver {
     ///
     /// A hit returns the cached output itself, shared: no copy is made.
     pub fn generate(&mut self, name: &str) -> Result<Arc<GeneratorOutput>> {
+        self.warn_params_once(name);
         let spec = self
             .specs
             .get(name)
@@ -203,6 +228,7 @@ impl ProcGenResolver {
         entity_position: [f32; 3],
         asset_kind: AssetKind,
     ) -> bool {
+        self.warn_params_once(name);
         let spec = match self.specs.get(name) {
             Some(s) => s.clone(),
             None => return false,
@@ -260,14 +286,16 @@ impl ProcGenResolver {
             .is_some_and(|(hash, seed)| self.cache.contains(hash, &seed))
     }
 
-    /// Add a living prop. Returns its id and the name of the mesh it draws, one
-    /// per spec and lineage; `Err` says why its spec can't live, in which case
-    /// nothing was added. Nothing is generated yet.
-    pub fn add_living_prop(
+    /// The spec a living prop named, checked that it can live, with what its
+    /// poses depend on (the generator's revision and the whole spec), which
+    /// keys their cache. `Err` says why it can't. This and
+    /// [`budget_left_ms`](Self::budget_left_ms) are what flint-living's props
+    /// borrow (#1024): the resolver holds nothing of theirs.
+    pub fn living_spec(
         &mut self,
-        request: LivingPropRequest,
-    ) -> std::result::Result<(LivingPropId, String), String> {
-        let name = &request.spec_name;
+        name: &str,
+    ) -> std::result::Result<(&ProcGenSpec, String), String> {
+        self.warn_params_once(name);
         let spec = self
             .specs
             .get(name)
@@ -284,44 +312,13 @@ impl ProcGenResolver {
             .ok_or_else(|| format!("its generator '{}' can't live", spec.generator))?
             .check_living(spec)
             .map_err(|e| e.to_string())?;
-        // What a pose depends on: the generator's revision and the whole spec.
         let identity = format!(
             "{}@{}\n{}",
             generator.type_name(),
             generator.revision(),
             toml::to_string(spec).unwrap_or_default()
         );
-        Ok(self.living.add(request, spec, &identity))
-    }
-
-    /// Build every living lineage and fill every ring now, unbudgeted, for a
-    /// scene load whose first frame should find them full.
-    pub fn make_living_now(&mut self) -> Vec<LineageDone> {
-        self.living.make_all_now(&self.registry)
-    }
-
-    /// One frame of living props: move their clock on by `dt` (0 while paused),
-    /// then generate what the rings are missing, in whatever the asset queue
-    /// left of the frame budget. Call after [`process_frame`](Self::process_frame).
-    /// Lineages that finished come back to be uploaded. Does nothing at all in
-    /// a scene with no living props.
-    pub fn process_living(&mut self, dt: f64) -> Vec<LineageDone> {
-        self.process_living_in(dt, None)
-    }
-
-    /// [`process_living`](Self::process_living) in a scene with a wooze field,
-    /// given with the moment on its own clock to sample it at. `None` for a scene
-    /// with none, in which props keep to their specs and nothing is sampled.
-    pub fn process_living_in(
-        &mut self,
-        dt: f64,
-        wooze: Option<(&flint_wooze::WoozeField, f64)>,
-    ) -> Vec<LineageDone> {
-        if self.living.is_empty() {
-            return Vec::new();
-        }
-        let left = self.queue.budget_ms() - self.queue.stats().budget_used_ms;
-        self.living.tick(dt, left, &self.registry, wooze)
+        Ok((spec, identity))
     }
 
     /// The milliseconds a frame may spend generating, assets and poses together.
@@ -329,77 +326,16 @@ impl ProcGenResolver {
         self.queue.budget_ms()
     }
 
-    /// One step of living props with no frame budget: every pose the rings want
-    /// is there when this returns. For a capture, where nobody is waiting on the
-    /// frame and a pose arriving late would change the picture (#216).
-    pub fn step_living_now(
-        &mut self,
-        dt: f64,
-        wooze: Option<(&flint_wooze::WoozeField, f64)>,
-    ) -> Vec<LineageDone> {
-        if self.living.is_empty() {
-            return Vec::new();
-        }
-        self.living.tick(dt, f64::INFINITY, &self.registry, wooze)
+    /// What this frame's budget has left once the asset queue has had its
+    /// share: the time living props (flint-living) may spend on poses. Read it
+    /// after [`process_frame`](Self::process_frame).
+    pub fn budget_left_ms(&self) -> f64 {
+        self.queue.budget_ms() - self.queue.stats().budget_used_ms
     }
 
-    /// [`process_living_in`](Self::process_living_in) for a second look at the
-    /// scene's props (#238), made with [`LivingProps::fork`]: its own knobs, the
-    /// same clock and frame budget, and the scene's pose cache, so a pose either
-    /// side has made the other finds. Its lineages are built, so nothing comes back.
-    pub fn process_living_beside(
-        &mut self,
-        side: &mut LivingProps,
-        dt: f64,
-        wooze: Option<(&flint_wooze::WoozeField, f64)>,
-    ) {
-        if side.is_empty() {
-            return;
-        }
-        let left = self.queue.budget_ms() - self.queue.stats().budget_used_ms;
-        self.living.swap_cache(side);
-        side.tick(dt, left, &self.registry, wooze);
-        self.living.swap_cache(side);
-    }
-
-    /// Finish what the knobs of the scene's props have started, now and with no
-    /// budget: see [`LivingProps::settle_now`]. With `side`, that side's instead,
-    /// on the scene's pose cache.
-    pub fn settle_living_now(&mut self, side: Option<&mut LivingProps>) {
-        match side {
-            Some(side) => {
-                self.living.swap_cache(side);
-                side.settle_now(&self.registry);
-                self.living.swap_cache(side);
-            }
-            None => self.living.settle_now(&self.registry),
-        }
-    }
-
-    /// The frame's whole budget, for tests that want it tight or wide.
-    #[cfg(test)]
-    pub(crate) fn frame_budget_for_test(&mut self, budget_ms: f64) {
+    /// Set the frame's whole budget, for a test that wants it tight or wide.
+    pub fn set_frame_budget_ms(&mut self, budget_ms: f64) {
         self.queue.set_budget_ms(budget_ms);
-    }
-
-    /// The scene's living props and how their rings have fared.
-    pub fn living_props(&self) -> &LivingProps {
-        &self.living
-    }
-
-    /// The scene's living props, to blend them.
-    pub fn living_props_mut(&mut self) -> &mut LivingProps {
-        &mut self.living
-    }
-
-    /// What the scene says about living props, for the props added after this.
-    pub fn set_living_defaults(&mut self, defaults: LivingDefaults) {
-        self.living.set_defaults(defaults);
-    }
-
-    /// Forget the scene's living props, keeping the poses already made.
-    pub fn clear_living_props(&mut self) {
-        self.living.clear_props();
     }
 
     /// Current queue statistics.
@@ -625,7 +561,10 @@ value = 42",
         assert_eq!(resolver.check_generator("test_cube"), Ok(()));
         let err = resolver.check_generator("rock").unwrap_err();
         assert!(err.contains("'boulder_v9' is not registered"), "{err}");
-        assert!(err.contains("mock, texture_v1"), "sorted known list: {err}");
+        assert!(
+            err.contains("mock, sweep_v1, terrain_v1, texture_v1"),
+            "sorted known list: {err}"
+        );
         assert!(resolver.check_generator("nonexistent").is_err());
         // Checking generates nothing.
         assert_eq!(resolver.cache_stats().misses, 0);

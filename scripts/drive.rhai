@@ -1821,7 +1821,7 @@ fn on_update() {
     set_post_style_param("horizon", "echo", 0.55 * echo_s);
     let p_beat = p_sf / 4.0;
     set_post_style_param("horizon", "echo_phase", p_beat - floor(p_beat));
-    set_bloom_intensity(0.22 * (1.0 + 0.25 * kick_now));
+    set_post("bloom_intensity", 0.22 * (1.0 + 0.25 * kick_now));
     set_post_style_param("horizon", "sun_gain", na[2] + (nb[2] - na[2]) * kt);
     set_post_style_param("horizon", "stripes", na[3] + (nb[3] - na[3]) * kt);
     set_post_style_param("horizon", "rings", na[4] + (nb[4] - na[4]) * kt);
@@ -1831,7 +1831,7 @@ fn on_update() {
     set_post_style_param("horizon", "sun_x", sun_lean);
     set_post_style_param("horizon", "stripe_phase", now * 0.10);
     let fog = mix3(P_FOG[k0], P_FOG[k1], kt);
-    set_fog_color(fog[0], fog[1], fog[2]);
+    set_post("fog_color", [fog[0], fog[1], fog[2]]);
     // the slow things: only when the blend has moved a step
     let sky_key = q0 * 100 + (kt * 40.0).to_int();
     let accent = mix3(P_EDGE[k0], P_EDGE[k1], kt);
@@ -1885,7 +1885,7 @@ fn on_update() {
         // never more than 2 degrees
         set_camera_roll(clamp(-roll * 0.30 - c0 * 0.10 * sp1, -0.035, 0.035));
     }
-    set_radial_blur(clamp((sp1 - 0.6) * 0.3 + boost_s * 0.07, 0.0, 0.18));
+    set_post("radial_blur", clamp((sp1 - 0.6) * 0.3 + boost_s * 0.07, 0.0, 0.18));
     set_post_style_param("crt", "aberration", (0.5 + 1.6 * sp1 * sp1 + shake * shake_amt * 3.0 + boost_s * 2.0) * fx_amt);
 
     // ═══ telemetry ══════════════════════════════════════════════

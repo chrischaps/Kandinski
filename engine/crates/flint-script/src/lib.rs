@@ -7,6 +7,13 @@
 //!
 //! Scripts can read/write ECS data, respond to collisions/triggers/input,
 //! control animation and audio, and hot-reload while the game is running.
+// Unit tests read their files off the disk and assert on TOML as written;
+// the lib build still holds the rules (#761)
+#![cfg_attr(test, allow(clippy::disallowed_methods))]
+// Everything the crate says goes through `tracing`, so `RUST_LOG` can
+// quiet it and stdout stays the caller's (`flint render --report json`,
+// #703, #1010); unit tests may still print their measurements
+#![cfg_attr(not(test), deny(clippy::print_stdout, clippy::print_stderr))]
 
 pub mod api;
 #[cfg(feature = "check")]
@@ -14,6 +21,8 @@ pub mod check;
 pub mod context;
 pub mod draw2d;
 pub mod engine;
+pub mod errors;
+pub mod fn_times;
 pub mod host;
 #[cfg(test)]
 mod layout_tests;
@@ -23,8 +32,11 @@ pub mod projector;
 pub mod random;
 #[cfg(not(target_arch = "wasm32"))]
 mod reload_worker;
+pub mod rig;
 pub mod style_reader;
 pub mod sync;
+pub mod testing;
+pub mod tween;
 pub mod ui;
 
 pub use context::MusicClock;
@@ -32,7 +44,10 @@ pub use context::StateScope;
 pub use context::{CameraOverrides, FrameRequests, PostProcessOverrides};
 pub use context::{DrawCommand, DrawItem};
 use context::{InputSnapshot, ScriptCommand};
+pub use context::{SoundPlay, SoundRef};
+pub use engine::output::FnTime;
 use engine::ScriptEngine;
+pub use errors::{ScriptError, ScriptErrors};
 use flint_core::Result;
 use flint_ecs::FlintWorld;
 use flint_runtime::{GameEvent, InputState, RuntimeSystem};
@@ -41,6 +56,7 @@ pub use module::{ModuleCommand, ScriptModule};
 pub use projector::{GroundField, Projector, ScreenPoint, View};
 pub use style_reader::{EntityStyle, StyleReader};
 use sync::ScriptSync;
+pub use tween::{FieldTweens, TWEEN_DONE};
 
 /// Top-level scripting system integrating engine, sync, and the game loop
 pub struct ScriptSystem {
@@ -61,15 +77,86 @@ pub struct ScriptSystem {
 pub const MAX_PENDING_EXPRESSIONS: usize = 256;
 
 impl ScriptSystem {
-    /// Time each script's `on_update` from now on, for a perf readout.
-    pub fn set_update_timing(&mut self, on: bool) {
-        self.engine.set_update_timing(on);
+    /// Time every script callback from now on, for a perf readout (#703:
+    /// `on_update` alone before).
+    pub fn set_timing(&mut self, on: bool) {
+        self.engine.set_timing(on);
     }
 
-    /// Each script file's time in the last frame's `on_update`, ms; empty
-    /// unless [`set_update_timing`](Self::set_update_timing) is on.
-    pub fn update_times(&self) -> &[(String, f32)] {
-        self.engine.update_times()
+    /// Whether [`set_timing`](Self::set_timing) is on.
+    pub fn timing(&self) -> bool {
+        self.engine.timing()
+    }
+
+    /// What the scripts took since the last take, ms: each callback under
+    /// `<source>:<callback>` (`scripts/hud.rhai:on_draw_ui`), and the script
+    /// system's own steps in brackets (`[hot reload]`, `[load]`), less the
+    /// callbacks they ran. Empty unless [`set_timing`](Self::set_timing) is
+    /// on. A host takes them after each batch of calls, so each lands in
+    /// the frame it was spent in.
+    pub fn take_times(&mut self) -> Vec<(String, f32)> {
+        self.engine.take_times()
+    }
+
+    /// What each callback's functions took since the last take (#1100):
+    /// the engine functions it called (`raycast()`, every overload one
+    /// record) and its script's own (`scripts/hud.rhai:draw_bar()`), each
+    /// with its calls, total and worst ms, under the callback's
+    /// `<source>:<callback>` label. Empty unless timing is on. Take it with
+    /// [`take_times`](Self::take_times).
+    pub fn take_function_times(&mut self) -> Vec<FnTime> {
+        self.engine.take_function_times()
+    }
+
+    /// Every script error of the run (#693): each failure counted once per
+    /// file, callback, line and message, load and compile errors included,
+    /// kept through scene changes. `errors().on_screen()` is what the
+    /// player's card shows, `errors().summary()` what a run prints at its
+    /// end.
+    pub fn errors(&self) -> &ScriptErrors {
+        self.engine.errors()
+    }
+
+    /// Count an error a host found about a script outside any callback (a
+    /// playtest's `--test-script` that has no entity to go on, #1192).
+    pub fn record_error(&mut self, failure: errors::Failure) {
+        self.engine.record_error(failure);
+    }
+
+    /// What the scripts' `test_*` calls said so far (#714): assertions by
+    /// place, the first `test_pass` / `test_fail`, and `test_log`'s values.
+    /// A copy: the record lives in the script context.
+    pub fn test_record(&self) -> testing::TestRecord {
+        crate::lock_or_recover(&self.engine.ctx).test.clone()
+    }
+
+    /// Whether a script has called `test_pass()` or `test_fail()`, without
+    /// copying the record: a playtest asks every frame.
+    pub fn test_decided(&self) -> bool {
+        crate::lock_or_recover(&self.engine.ctx)
+            .test
+            .verdict
+            .is_some()
+    }
+
+    /// Which of the actions `names` the loaded scripts read: an action a
+    /// script spells as a string literal (`is_action_pressed("move_left")`,
+    /// `if action == "jump"` in `on_action`), read from its AST so a comment
+    /// doesn't count, and `interact` when a script defines `on_interact`.
+    /// The player's controls line lists these (#716). Once a load, never a
+    /// frame.
+    pub fn actions_read<'a>(&self, names: impl IntoIterator<Item = &'a str>) -> Vec<&'a str> {
+        let scripts = &self.engine.scripts;
+        names
+            .into_iter()
+            .filter(|name| {
+                scripts.values().any(|script| {
+                    engine::instance::names_string(&script.ast, name)
+                        || (*name == "interact"
+                            && script.defines(flint_core::callbacks::Callback::Interact))
+                })
+            })
+            .collect()
     }
 
     pub fn new() -> Self {
@@ -202,6 +289,7 @@ impl ScriptSystem {
             touch_just_ended,
             touch_taps,
             touch_swipes,
+            text_edits: input.text_edits().to_vec(),
         };
 
         self.engine
@@ -290,6 +378,24 @@ impl ScriptSystem {
     /// The quality settings in force, for `get_quality()`.
     pub fn set_quality_state(&mut self, quality: flint_core::quality::QualitySettings) {
         crate::lock_or_recover(&self.engine.ctx).quality = quality;
+    }
+
+    /// The look the scene draws with now, for `get_look()` (#497): `None`
+    /// for the scene's own keys alone. A host calls it whenever the look
+    /// changes (a script's `set_look`, F4, a transition), so a read sees
+    /// the look as the script finds it.
+    pub fn set_current_look(&mut self, look: Option<&str>) {
+        let look = look.unwrap_or("");
+        let mut c = crate::lock_or_recover(&self.engine.ctx);
+        if c.look != look {
+            c.look = look.to_string();
+        }
+    }
+
+    /// Every look the scene can see, by name, for `list_looks()` (#497):
+    /// the host's `flint_render::look::list_in` of the scene, at its entry.
+    pub fn set_looks(&mut self, names: Vec<String>) {
+        crate::lock_or_recover(&self.engine.ctx).looks = names;
     }
 
     /// What the GPU is, for `gpu_info()`.
@@ -394,6 +500,25 @@ impl ScriptSystem {
         c.audio_output_latency = output_latency;
     }
 
+    /// The handles (`play_sound*`'s, the audio engine's keys) of the sounds
+    /// playing now, for `is_sound_playing` (#1000). The host sets it every
+    /// frame before scripts run, beside [`set_audio_clock`](Self::set_audio_clock).
+    pub fn set_sounds_playing(&mut self, handles: impl IntoIterator<Item = u64>) {
+        let mut c = crate::lock_or_recover(&self.engine.ctx);
+        c.sounds_playing.clear();
+        c.sounds_playing.extend(handles);
+    }
+
+    /// The player's own bus volumes, by name, for `user_bus_volume`
+    /// (#1217): the host's at start and after each change. A bus missing
+    /// from it reads as 1.
+    pub fn set_user_bus_volumes<'a>(&mut self, volumes: impl IntoIterator<Item = (&'a str, f64)>) {
+        let mut c = crate::lock_or_recover(&self.engine.ctx);
+        c.user_bus_volumes.clear();
+        c.user_bus_volumes
+            .extend(volumes.into_iter().map(|(name, v)| (name.to_string(), v)));
+    }
+
     /// Load the script a `script.source` names for a specific entity (for
     /// chunk loading), searched for from `from_dir`, the chunk's own
     /// directory, by the project's one rule (`AssetKind::Scripts`), and
@@ -418,6 +543,10 @@ impl ScriptSystem {
         entity_id: flint_core::EntityId,
         script_path: &std::path::Path,
     ) {
+        let _note =
+            flint_core::frame_notes::begin(flint_core::frame_notes::NoteKind::ScriptLoad, || {
+                flint_core::project::shown(script_path)
+            });
         match self.engine.compile_file(script_path) {
             Ok(ast) => {
                 let source = script_path
@@ -425,12 +554,59 @@ impl ScriptSystem {
                     .and_then(|f| f.to_str())
                     .unwrap_or("unknown.rhai")
                     .to_string();
-                println!("[script] Loaded (chunk): {:?} → {}", entity_id, source);
-                self.engine.add_script(entity_id, ast, source);
+                tracing::info!(target: "script", "Loaded (chunk): {:?} → {}", entity_id, source);
+                let file = errors::shown_file(script_path);
+                self.engine
+                    .add_named_script(entity_id, ast, source, "", Some(&file));
                 self.sync.discovered.insert(entity_id);
             }
             Err(e) => {
-                tracing::warn!("Compile error for chunk entity {:?}: {}", entity_id, e);
+                let file = errors::shown_file(script_path);
+                let entity = format!("entity {}", entity_id.raw());
+                self.engine
+                    .record_error(errors::Failure::compile(&file, &entity, &e));
+            }
+        }
+    }
+
+    /// Attach the script at `script_path` (as given, not searched for) to
+    /// `entity_id`, named `entity_name` in its errors and test records: a
+    /// host's own script beside the scene's, such as `flint playtest
+    /// --test-script`'s (#1192). The entity is marked found either way, so
+    /// a `script` component it carries is never searched for by name; a
+    /// file that doesn't read or compile is the script's `load` or
+    /// `compile` error. Its top level and `on_init` run with the scene's
+    /// at the next `initialize`. Not followed by hot reload.
+    pub fn attach_script_file(
+        &mut self,
+        entity_id: flint_core::EntityId,
+        entity_name: &str,
+        script_path: &std::path::Path,
+    ) {
+        self.sync.discovered.insert(entity_id);
+        let file = errors::shown_file(script_path);
+        if !flint_core::vfs::exists(script_path) {
+            self.engine.record_error(errors::Failure::load(
+                &file,
+                entity_name,
+                &format!("no script file at {file}"),
+            ));
+            return;
+        }
+        match self.engine.compile_file(script_path) {
+            Ok(ast) => {
+                tracing::debug!(target: "load", kind = "script", "[script] Loaded: {entity_name} → {file}");
+                self.engine.add_named_script(
+                    entity_id,
+                    ast,
+                    file.clone(),
+                    entity_name,
+                    Some(&file),
+                );
+            }
+            Err(e) => {
+                self.engine
+                    .record_error(errors::Failure::compile(&file, entity_name, &e));
             }
         }
     }
@@ -467,20 +643,33 @@ impl ScriptSystem {
         self.engine.drain_world_lines()
     }
 
+    /// Take the screen field (`field_disc` / `field_ring` / `field_cone`,
+    /// #859) scripts filled this frame, for the renderer's
+    /// `FrameInputs::style_field`. Take it once a frame, after the last
+    /// callback that can draw it (`on_draw_ui`).
+    pub fn drain_style_field(&mut self) -> flint_core::style_field::StyleField {
+        self.engine.drain_style_field()
+    }
+
     /// Drain the depth-tested world text (`draw_world_text`, ADR 0104)
     /// scripts queued this frame, for the host to lay out and draw
     pub fn drain_world_texts(&mut self) -> Vec<flint_core::world_text::WorldText> {
         self.engine.drain_world_texts()
     }
 
-    /// Generate draw commands from the data-driven UI system (unclipped)
-    pub fn generate_ui_draw_commands(&mut self, screen_w: f32, screen_h: f32) -> Vec<DrawItem> {
+    /// The data-driven UI documents (#731), for a host to show an element or
+    /// move focus as input would (`flint render --ui-show`, `--ui-focus`).
+    pub fn with_ui<R>(&mut self, f: impl FnOnce(&mut crate::ui::UiSystem) -> R) -> R {
         let mut c = crate::lock_or_recover(&self.engine.ctx);
-        c.ui_system
-            .generate_draw_commands(screen_w, screen_h)
-            .into_iter()
-            .map(DrawItem::unclipped)
-            .collect()
+        f(&mut c.ui_system)
+    }
+
+    /// Generate draw commands from the data-driven UI system, each clipped
+    /// to the scrolling lists it is inside (#1229)
+    pub fn generate_ui_draw_commands(&mut self, screen_w: f32, screen_h: f32) -> Vec<DrawItem> {
+        flint_core::scope!("script::ui_layout");
+        let mut c = crate::lock_or_recover(&self.engine.ctx);
+        c.ui_system.generate_draw_commands(screen_w, screen_h)
     }
 
     /// Call on_animation_end(clip_name) for entities whose sprite animation finished
@@ -578,6 +767,8 @@ impl ScriptSystem {
                 .iter()
                 .filter_map(|sig| api::registry::parse_signature(sig))
                 .filter(|f| !registry.declares(&f.name, f.params.len()))
+                // The function-timing wrappers' own (#1100), no script's to call
+                .filter(|f| f.name != fn_times::ENTER)
                 .collect();
             fns.sort_by(|a, b| (&a.name, a.params.len()).cmp(&(&b.name, b.params.len())));
             fns.dedup_by(|a, b| a.signature == b.signature);
@@ -604,6 +795,8 @@ impl ScriptSystem {
     /// `measure_text` / `measure_text_ex`.
     pub fn set_text_measurer(&mut self, f: Option<context::TextMeasurer>) {
         let mut c = crate::lock_or_recover(&self.engine.ctx);
+        // UI documents lay their labels out with it too (#731)
+        c.ui_system.set_measurer(f.clone());
         c.text_measurer = f;
     }
 }
@@ -628,33 +821,42 @@ impl RuntimeSystem for ScriptSystem {
 
         let count = self.engine.scripts.len();
         if count > 0 {
-            eprintln!("Script system initialized ({} scripts)", count);
+            tracing::debug!(target: "load", "Script system initialized ({} scripts)", count);
         }
 
         Ok(())
     }
 
     fn update(&mut self, world: &mut FlintWorld, _dt: f64) -> Result<()> {
-        // A perf readout times each step below, and each script's on_update.
-        self.engine.clear_update_times();
-        let timing = self.engine.timing();
-        let now = || timing.then(web_time::Instant::now);
+        flint_core::scope!("script::update");
+        // Errors say which frame they first happened in (#693)
+        self.engine.errors.next_frame();
+        // A perf readout times every callback (ScriptEngine::call), and
+        // the steps below on their own (#703)
 
         // Check for hot-reloaded scripts
-        let began = now();
-        self.sync.check_hot_reload(&mut self.engine);
+        let began = self.engine.step_began();
+        {
+            flint_core::scope!("script::hot_reload_poll");
+            {
+                flint_core::scope!("script::poll_scripts");
+                self.sync.check_hot_reload(&mut self.engine, world);
+            }
 
-        // Check for edited .ui.toml / .style.toml / token files
-        crate::lock_or_recover(&self.engine.ctx)
-            .ui_system
-            .poll_reload();
-        if let Some(began) = began {
-            self.engine.add_update_time("[hot reload]", began);
+            // Check for edited .ui.toml / .style.toml / token files
+            flint_core::scope!("script::poll_ui");
+            crate::lock_or_recover(&self.engine.ctx)
+                .ui_system
+                .poll_reload();
         }
+        self.engine.step_done("[hot reload]", began);
 
         // Discover any new script entities
-        let began = now();
-        self.sync.discover_and_load(world, &mut self.engine);
+        let began = self.engine.step_began();
+        {
+            flint_core::scope!("script::discover");
+            self.sync.discover_and_load(world, &mut self.engine);
+        }
 
         // Save data at an older version (a slot a script switched to last
         // frame, or one no earlier scene's scripts could migrate), before
@@ -663,25 +865,15 @@ impl RuntimeSystem for ScriptSystem {
 
         // Call on_init for newly added scripts
         self.engine.call_inits(world);
-        if let Some(began) = began {
-            self.engine.add_update_time("[load, on_init]", began);
-        }
+        self.engine.step_done("[load]", began);
 
         // Process events (collision, trigger, action callbacks)
-        let began = now();
         let events = std::mem::take(&mut self.pending_events);
         self.engine.process_events(&events, world);
-        if let Some(began) = began {
-            self.engine.add_update_time("[events]", began);
-        }
 
         // Expression states from outside (Flint#518), so on_update sees them
-        let began = now();
         let states: Vec<rhai::Map> = self.pending_expressions.drain(..).collect();
         self.engine.deliver_expressions(world, states);
-        if let Some(began) = began {
-            self.engine.add_update_time("[expression]", began);
-        }
 
         // Call on_update() for all scripts
         self.engine.call_updates(world);
@@ -941,8 +1133,6 @@ mod tests {
         let draw = r#"fn on_update() {
             record(`${random()} ${random()} ${random_range(5.0, 6.0)}`);
         }"#;
-        // In on_init: top-level statements run again before every callback,
-        // so a seed_random(n) up there would restart the sequence each frame
         let seeded_here = r#"
             fn on_init() { seed_random(1234); }
             fn on_update() {
@@ -950,6 +1140,14 @@ mod tests {
             }"#;
         let by_host = run(draw, Some(1234));
         assert_eq!(run(seeded_here, None), by_host);
+        // At the top of the script too: it runs once (#692), so the seed no
+        // longer restarts the sequence before every callback
+        let seeded_at_top = r#"
+            seed_random(1234);
+            fn on_update() {
+                record(`${random()} ${random()} ${random_range(5.0, 6.0)}`);
+            }"#;
+        assert_eq!(run(seeded_at_top, None), by_host);
         assert_eq!(
             run(seeded_here, Some(99)),
             by_host,
@@ -1085,13 +1283,13 @@ mod tests {
         let mut system = ScriptSystem::new();
         {
             let mut c = crate::lock_or_recover(&system.engine.ctx);
-            c.requests.post.desaturation = Some(0.85);
+            c.requests.post.set("desaturate", &0.85.into()).unwrap();
         }
         let commands = system.drain_commands();
         assert!(
             matches!(
                 commands.as_slice(),
-                [ScriptCommand::SetPostProcess { post }] if post.desaturation == Some(0.85)
+                [ScriptCommand::SetPostProcess { post }] if post.f32("desaturate") == Some(0.85)
             ),
             "{commands:?}"
         );

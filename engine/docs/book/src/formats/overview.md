@@ -88,7 +88,7 @@ sheen_strength = 0.15
 
 ### `[post_process]`
 
-Configures the HDR post-processing pipeline. Every key is optional. See [Post-Processing](../concepts/post-processing.md) for what each effect does and the matching `flint render` flags.
+Configures the HDR post-processing pipeline. Every key is optional. See [Post-Processing](../concepts/post-processing.md) for what each effect does and the matching `flint render` flags. The table below is a summary; `flint render --list-effects` prints every key from the engine itself, with the range its effect is tuned for (a value past it warns as `post-range`, [#741](../concepts/post-processing.md#listing-the-keys)).
 
 ```toml
 [post_process]
@@ -107,6 +107,7 @@ fxaa = false
 | `bloom_enabled` | bool | `true` | Bloom pass |
 | `bloom_intensity` | f32 | `0.04` | Bloom strength |
 | `bloom_threshold` | f32 | `1.0` | Brightness above which pixels bloom |
+| `bloom_soft_threshold` | f32 | `0.5` | How softly blooming starts below the threshold; `0` is a hard cut |
 | `vignette_enabled` | bool | `false` | Edge darkening |
 | `vignette_intensity` | f32 | `0.3` | Vignette strength |
 | `vignette_smoothness` | f32 | `2.0` | Vignette falloff curve |
@@ -114,6 +115,7 @@ fxaa = false
 | `ssao_enabled` | bool | `true` | Screen-space ambient occlusion |
 | `ssao_radius` | f32 | `0.5` | SSAO sample radius (world units) |
 | `ssao_intensity` | f32 | `1.0` | SSAO darkening strength |
+| `ssao_bias` | f32 | `0.025` | Depth a sample must clear to occlude, against self-shadowing acne |
 | `ssao_samples` | u32 | `64` | Hemisphere samples per pixel, 1–64. The heaviest per-pixel cost in the stack; `16` is ~4x cheaper and usually indistinguishable on matte scenes |
 | `fog_enabled` | bool | `false` | Distance fog |
 | `fog_color` | `[f32; 3]` | `[0.7, 0.75, 0.82]` | Fog colour |
@@ -130,6 +132,7 @@ fxaa = false
 | `fog_tint_end` | f32 | `1000.0` | Distance at which it reaches full strength |
 | `dither_enabled` | bool | `false` | Ordered dither |
 | `dither_intensity` | f32 | `0.03` | Dither strength |
+| `dither_style` | u32 | `0` | `0` linear light, `1` Bayer in display levels, `2` triangular noise in display levels (#503) |
 | `volumetric_enabled` | bool | `false` | Volumetric light (god rays) |
 | `volumetric_samples` | u32 | `32` | Ray-march steps |
 | `volumetric_density` | f32 | `1.0` | Scattering density |
@@ -449,9 +452,29 @@ twist = 5.0               # Banked turn
 | `spline.closed` | bool | Whether the spline forms a closed loop |
 | `sampling.spacing` | f32 | Distance between sampled points along the curve |
 | `control_points[].position` | `[f32; 3]` | 3D position `[x, y, z]` |
-| `control_points[].twist` | f32 | Banking angle in degrees (interpolated with C1 continuity via Catmull-Rom) |
+| `control_points[].twist` | f32 | Banking angle in degrees (interpolated with C1 continuity via Catmull-Rom). Default 0 |
+| `control_points[].gap_after` | bool | No geometry from this point to the next: a `spline_mesh` stops and caps itself on both sides. Default false |
+| `control_points[].attrs` | table | The game's own data along the path, from this point to the next: `attrs = { surface = "ice", speed = 0.6 }`. Any TOML values; may not name `gap_after` |
+
+`[spline]` and at least two control points are required, each `position` exactly three numbers, and `spacing` above 0 (default 2). `closed` defaults to true. A file that breaks any of these is named with its line and column, by `flint check` as `bad-spline` and in the warning the loader logs, and the spline is left out; keys the format doesn't read (`name`) are allowed.
 
 The engine samples the control points into a dense array using Catmull-Rom interpolation, stored as the `spline_data` ECS component. Scripts can query this data via `spline_closest_point()` and `spline_sample_at()`.
+
+**Attributes along the path.** A point's `attrs` hold from it to the next point; a point that doesn't name an attribute leaves it unset there (it doesn't carry the last value on). Neighbouring points with equal values make one span, and on a closed spline a span through the last point carries on round into the first. `gap_after = true` is read the same way, as the attribute `gap_after`, `true` over each gap. A script reads them with `spline_point_attr(spline, "surface", t)` (the value, or `()`) and `spline_point_attr_span(spline, "gap_after", t)` (`#{value, start_t, end_t}`, or `()`):
+
+```toml
+[[control_points]]
+position = [0, 0, 0]
+attrs = { surface = "ice" }    # ice from here...
+
+[[control_points]]
+position = [40, 0, 0]
+attrs = { surface = "ice" }    # ...through here, one span...
+gap_after = true               # ...and a jump from here to the next point
+
+[[control_points]]
+position = [80, 4, 0]          # no surface from here
+```
 
 ## UI Layouts (`ui/*.ui.toml`)
 
@@ -574,15 +597,15 @@ The rhythm system ([Music Sessions](../concepts/music-sessions.md)) has its own 
 
 | File | Purpose |
 |------|---------|
-| `*.suite.toml` | Suite manifest: `[suite]` id and title, `[audio] sample_rate`, `[[tempo]]` anchors (`sample`, `bpm`, `time_signature`), `[[sections]]` (`name`, `start_sample`, and for a rhythm suite `pulse_window_ms`), and one `[buses.<name>]` per bus, named by the suite and mixed in the order it declares them, with `file` or `silent = true`. Optional `[[degraded_alternates]]`. A rhythm suite adds `[reintegration]` (`re_entry_sections`, `lead_bus`, `reassembly_bars`) and keeps exactly the six buses `foundation`, `harmony`, `world_voice`, `home_theme`, `child_motif`, `texture`. Checked by `flint validate-suite`. |
+| `*.suite.toml` | Suite manifest: `[suite]` id and title, `[audio] sample_rate`, `[[tempo]]` anchors (`sample`, `bpm`, `time_signature`), `[[sections]]` (`name`, `start_sample`, and for a rhythm suite `pulse_window_ms`), and one `[buses.<name>]` per bus, named by the suite and mixed in the order it declares them, with `file` or `silent = true`. Optional `[[degraded_alternates]]`. A rhythm suite adds `[reintegration]` (`re_entry_sections`, `lead_bus`, `reassembly_bars`) and keeps exactly the six buses `foundation`, `harmony`, `world_voice`, `home_theme`, `child_motif`, `texture`. Checked by `flint music validate`. |
 | `*.chart.toml` | Beatmap: `suite` id, `[[curves]]` (`channel` ∈ `lean`, `sway`, `pressure_l`, `pressure_r`; `beat`; `value`; `interp` ∈ `linear`, `hold`, `smooth`), `[[pulses]]` (`beat`, `kind` ∈ `pulse`, `press`, `flick`, optional `window_ms`, `strength`, `direction`), `[[cues]]` (`beat`, `cue`, optional `params`), `[[intensity]]` (`beat`, `value`). |
-| `*.events.toml` | Offline event script for `flint render-suite`: `[[events]]` with `at = "bar:N"` or `"beat:N"`, `bus`, `action` ∈ `set_gain` (`db`, `ramp_ms`), `set_lpf` (`hz`, `ramp_ms`), `set_detune` (`semitones`, `ramp_ms`), `marker` (`label`). |
-| `*.session.jsonl` | Recorded input session (`flint play-chart --record`): one JSON object per line, a `header` (suite, chart, sample rate, latency and calibration offsets, config snapshots) followed by `lean` (`sample`, `x`, `y`) and `pulse` (`sample`, `kind`) events stamped in suite samples. Replayed by `flint replay-chart --session`. |
+| `*.events.toml` | Offline event script for `flint music render`: `[[events]]` with `at = "bar:N"` or `"beat:N"`, `bus`, `action` ∈ `set_gain` (`db`, `ramp_ms`), `set_lpf` (`hz`, `ramp_ms`), `set_detune` (`semitones`, `ramp_ms`), `marker` (`label`). |
+| `*.session.jsonl` | Recorded input session (`flint music chart play --record`): one JSON object per line, a `header` (suite, chart, sample rate, latency and calibration offsets, config snapshots) followed by `lean` (`sample`, `x`, `y`) and `pulse` (`sample`, `kind`) events stamped in suite samples. Replayed by `flint music chart replay --session`. |
 | `config/coherence.toml` | Coherence integrator tuning (`--config`) |
 | `config/ladder.toml` | Disintegration ladder: rungs, hysteresis, per-rung audio and visual params, and the `[seam]` table (`lead_in_beats` 0–8, default 0) (`--ladder`) |
 | `config/gradient.toml` | Error-driven audio gradient (`--gradient`) |
 | `config/haptics.toml` | Rumble entrainment (`--haptics`) |
-| `logs/latency/calibration-*.toml` | Written by `flint calibrate`; the median tap offset feeds later sessions. `flint spike-rumble` writes its timing report beside it |
+| `logs/latency/calibration-*.toml` | Written by `flint music calibrate`; the median tap offset feeds later sessions. The rumble spike (`cargo run -p flint-input-capture --example spike_rumble`) writes its timing report beside it |
 | `logs/sessions/*.session.jsonl`, `logs/judgment/*.jsonl` | Default locations for recorded sessions and replay judgment logs |
 
 ## Configuration (`~/.flint/config.toml`, `.flint/config.toml`)

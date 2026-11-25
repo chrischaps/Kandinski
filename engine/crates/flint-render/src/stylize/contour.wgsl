@@ -2,7 +2,9 @@
 //
 // One full-screen draw, so its cost doesn't grow with the scene. Lines come from
 // two places: silhouettes, as a break in depth, and the edges between painted
-// fills, as a break in luminance. It reads whatever the Kuwahara pass made, so
+// fills, as a break in luminance. The silhouettes are the shared edge pass's
+// (#743, `edges.wgsl`), which every line style reads: depth steps on their near
+// side, and none where a plane is only seen edge-on, so flat ground draws none. It reads whatever the Kuwahara pass made, so
 // paint sits under the ink and never smears it.
 //
 // With boil above zero, each drawing (one value of `seed`) re-decides where the
@@ -28,7 +30,8 @@ struct ContourUniforms {
     seed: u32,
     // Metres at which a line has faded by half. 0 never fades.
     fade: f32,
-    _pad1: u32,
+    // The shared edges' depth threshold, to read their steps back (#743)
+    edge_depth: f32,
     _pad2: u32,
 };
 
@@ -44,6 +47,10 @@ var scene_sampler: sampler;
 var depth_texture: texture_2d<f32>;
 @group(2) @binding(1)
 var depth_sampler: sampler;
+// The shared geometry edges, at the depth's size (a blank texel if their pass
+// couldn't be built)
+@group(2) @binding(2)
+var edge_texture: texture_2d<f32>;
 
 struct VertexOutput {
     @builtin(position) position: vec4<f32>,
@@ -65,33 +72,19 @@ const WOBBLE_CELLS: f32 = 55.0;
 const WIDTH_CELLS: f32 = 22.0;
 const PRESSURE_CELLS: f32 = 9.0;
 
-// A hash of a lattice point and a drawing. Integer, so it reads the same on every
-// GPU and doesn't break down far from the origin the way sin() hashes do.
-fn hash(x: i32, y: i32, seed: u32) -> f32 {
-    var h = (u32(x) * 1597334677u) ^ (u32(y) * 3812015801u) ^ (seed * 2798796415u);
-    h = (h ^ (h >> 16u)) * 2654435769u;
-    h = (h ^ (h >> 15u)) * 2246822519u;
-    h = h ^ (h >> 16u);
-    return f32(h) / 4294967295.0;
+// The boil's noise is stylize/noise.wgsl's flint_vnoise (#1256)
+
+// The depth step under uv, as a share of the distance (the shared edges'
+// measure), 0 off an edge. Read through the nearest sampler (the edges are
+// the depth's size, as is the depth it samples): the same texel as
+// `flint_edge_texel`'s textureLoad, but the hardware does the addressing,
+// and the nine taps' integer conversions and clamps were 0.008 ms of the
+// pass at 1080p (#1257)
+fn step_at(uv: vec2<f32>) -> f32 {
+    return flint_edge_step(textureSampleLevel(edge_texture, depth_sampler, uv, 0.0), params.edge_depth);
 }
 
-// Smooth value noise in 0..1.
-fn noise(p: vec2<f32>, seed: u32) -> f32 {
-    let cell = floor(p);
-    let f = p - cell;
-    let u = f * f * (3.0 - 2.0 * f);
-    let x = i32(cell.x);
-    let y = i32(cell.y);
-    let a = hash(x, y, seed);
-    let b = hash(x + 1, y, seed);
-    let c = hash(x, y + 1, seed);
-    let d = hash(x + 1, y + 1, seed);
-    return mix(mix(a, b, u.x), mix(c, d, u.x), u.y);
-}
-
-// 1 / view distance. On any flat surface this is linear across the screen, so its
-// second difference is zero however steep the view, and a floor seen at a grazing
-// angle draws no lines.
+// 1 / view distance, for how far off a line is.
 fn inverse_depth(uv: vec2<f32>) -> f32 {
     let d = textureSampleLevel(depth_texture, depth_sampler, uv, 0.0).r;
     return (params.far - d * (params.far - params.near)) / (params.near * params.far);
@@ -100,7 +93,7 @@ fn inverse_depth(uv: vec2<f32>) -> f32 {
 // Luminance squeezed into 0..1, so a bright sky doesn't outweigh everything.
 fn tone(uv: vec2<f32>) -> f32 {
     let c = textureSampleLevel(scene_texture, scene_sampler, uv, 0.0).rgb;
-    let l = dot(c, vec3<f32>(0.2126, 0.7152, 0.0722));
+    let l = flint_luma(c);
     return l / (1.0 + l);
 }
 
@@ -121,41 +114,39 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         // Push: the line wanders off its edge, far over a long run and a little
         // over a short one, by more when the line is wide.
         let far_push = vec2<f32>(
-            noise(q * PUSH_CELLS, seed),
-            noise(q * PUSH_CELLS + 37.0, seed),
+            flint_vnoise(q * PUSH_CELLS, seed),
+            flint_vnoise(q * PUSH_CELLS + 37.0, seed),
         ) - 0.5;
         let near_push = vec2<f32>(
-            noise(q * WOBBLE_CELLS + 11.0, seed),
-            noise(q * WOBBLE_CELLS + 53.0, seed),
+            flint_vnoise(q * WOBBLE_CELLS + 11.0, seed),
+            flint_vnoise(q * WOBBLE_CELLS + 53.0, seed),
         ) - 0.5;
         let push = (far_push * 2.0 + near_push * 0.8) * params.boil * (1.0 + width);
         uv = in.uv + push * tx;
 
         // Width: the pen swells and thins along the line.
-        let swell = noise(q * WIDTH_CELLS + 91.0, seed) * 2.0 - 1.0;
+        let swell = flint_vnoise(q * WIDTH_CELLS + 91.0, seed) * 2.0 - 1.0;
         width = max(width * (1.0 + swell * params.boil * 0.85), 0.75);
 
         // Pressure: here and there the pen lifts.
-        let lift = smoothstep(0.52, 0.78, noise(q * PRESSURE_CELLS + 7.0, seed));
+        let lift = smoothstep(0.52, 0.78, flint_vnoise(q * PRESSURE_CELLS + 7.0, seed));
         pressure = 1.0 - lift * min(params.boil, 1.0) * 0.8;
     }
 
     let d = vec2<f32>(width) * tx;
 
-    // Depth: the second difference of 1 / distance, on both axes and both
-    // diagonals, against the distance here.
-    let c = inverse_depth(uv);
-    let l = inverse_depth(uv - vec2<f32>(d.x, 0.0));
-    let r = inverse_depth(uv + vec2<f32>(d.x, 0.0));
-    let t = inverse_depth(uv - vec2<f32>(0.0, d.y));
-    let b = inverse_depth(uv + vec2<f32>(0.0, d.y));
-    let tl = inverse_depth(uv - d);
-    let br = inverse_depth(uv + d);
-    let tr = inverse_depth(uv + vec2<f32>(d.x, -d.y));
-    let bl = inverse_depth(uv + vec2<f32>(-d.x, d.y));
-    let across = max(abs(l + r - 2.0 * c), abs(t + b - 2.0 * c));
-    let diagonal = max(abs(tl + br - 2.0 * c), abs(tr + bl - 2.0 * c));
-    let depth_edge = max(across, diagonal) / max(c, 1e-6);
+    // Depth: the strongest step within the line's reach, on both axes and both
+    // diagonals: the shared edges are one pixel wide, on a step's near side, and
+    // the reach gives the line its width
+    let across = max(
+        max(step_at(uv - vec2<f32>(d.x, 0.0)), step_at(uv + vec2<f32>(d.x, 0.0))),
+        max(step_at(uv - vec2<f32>(0.0, d.y)), step_at(uv + vec2<f32>(0.0, d.y))),
+    );
+    let diagonal = max(
+        max(step_at(uv - d), step_at(uv + d)),
+        max(step_at(uv + vec2<f32>(d.x, -d.y)), step_at(uv + vec2<f32>(-d.x, d.y))),
+    );
+    let depth_edge = max(step_at(uv), max(across, diagonal));
 
     // Luminance: a plain gradient over the same reach.
     var luma_edge = 0.0;
@@ -170,8 +161,15 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 
     // Far away the same line covers a whole leaf, and a tree goes solid. A pen
     // draws less of what's further off, so lines thin out with the distance to the
-    // nearest surface at this edge, which is the one the line belongs to.
-    if (params.fade > 0.0) {
+    // nearest surface at this edge, which is the one the line belongs to. Most
+    // pixels are no line, and their five depth reads were a sixth of the pass
+    // (#1257): a fade of no ink is no ink, so they skip it.
+    if (params.fade > 0.0 && ink > 0.0) {
+        let c = inverse_depth(uv);
+        let l = inverse_depth(uv - vec2<f32>(d.x, 0.0));
+        let r = inverse_depth(uv + vec2<f32>(d.x, 0.0));
+        let t = inverse_depth(uv - vec2<f32>(0.0, d.y));
+        let b = inverse_depth(uv + vec2<f32>(0.0, d.y));
         let nearest = max(max(c, l), max(max(r, t), b));
         let distance = 1.0 / max(nearest, 1e-6);
         let x = distance / params.fade;
