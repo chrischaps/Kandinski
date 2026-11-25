@@ -10,6 +10,11 @@ remembered it: a dark plane ruled with neon, a banded sun on the horizon,
 scenery set in glowing glyphs. A new land arrives from the horizon: tiles take
 its colours as they come round, so you drive *into* it.
 
+**Project page:** [chaps.dev/projects/afterglow](https://chaps.dev/projects/afterglow/): a
+film of Sunset Coast turning into Neon City with the music, clips of a race, a drift, Composition and
+a checkpoint, and a still of every land. **Play it in the browser:**
+[play.chaps.dev/?game=afterglow](https://play.chaps.dev/?game=afterglow).
+
 ## Three ways to drive
 
 | | |
