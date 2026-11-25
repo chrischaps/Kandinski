@@ -1,6 +1,7 @@
 //! Headless rendering context for offscreen render-to-image
 
 use crate::context::RenderError;
+use crate::gpu_counts::CountedDevice;
 
 /// Offscreen wgpu context that renders to a texture instead of a window surface
 pub struct HeadlessContext {
@@ -13,9 +14,6 @@ pub struct HeadlessContext {
     pub color_view: wgpu::TextureView,
     pub depth_texture: wgpu::Texture,
     pub depth_view: wgpu::TextureView,
-    /// `depth_texture`'s id, new with each texture (#379; see
-    /// [`RenderContext::depth_id`](crate::RenderContext::depth_id)).
-    pub depth_id: u64,
     /// The adapter drawing, so a timing can say which GPU and backend it
     /// measured (#292: `WGPU_BACKEND` is otherwise invisible in the output).
     pub adapter_info: wgpu::AdapterInfo,
@@ -24,6 +22,18 @@ pub struct HeadlessContext {
 impl HeadlessContext {
     /// Create a new headless rendering context with the given dimensions
     pub async fn new(width: u32, height: u32) -> Result<Self, RenderError> {
+        Self::with_features(width, height, wgpu::Features::empty()).await
+    }
+
+    /// [`new`](Self::new), also asking for `extra` features where the
+    /// adapter has them (#1203: a replay's draw times want timestamps
+    /// inside passes). The device gets what the adapter offers of them;
+    /// ask `device.features()` what it got.
+    pub async fn with_features(
+        width: u32,
+        height: u32,
+        extra: wgpu::Features,
+    ) -> Result<Self, RenderError> {
         let instance = crate::gpu_select::instance();
 
         let adapter = crate::gpu_select::request_adapter(&instance, None)
@@ -31,17 +41,15 @@ impl HeadlessContext {
             .ok_or(RenderError::AdapterNotFound)?;
 
         let (device, queue) = adapter
-            .request_device(
-                &wgpu::DeviceDescriptor {
-                    label: Some("Flint Headless Device"),
-                    // Timestamps where the adapter has them, so the
-                    // renderer's GPU timing can be turned on (ADR 0108).
-                    required_features: adapter.features() & wgpu::Features::TIMESTAMP_QUERY,
-                    required_limits: wgpu::Limits::default(),
-                    memory_hints: Default::default(),
-                },
-                None,
-            )
+            .request_device(&wgpu::DeviceDescriptor {
+                label: Some("Flint Headless Device"),
+                // Timestamps where the adapter has them, so the
+                // renderer's GPU timing can be turned on (ADR 0108).
+                required_features: adapter.features() & (wgpu::Features::TIMESTAMP_QUERY | extra),
+                required_limits: wgpu::Limits::default(),
+                memory_hints: Default::default(),
+                ..Default::default()
+            })
             .await
             .map_err(|e| RenderError::DeviceCreation(e.to_string()))?;
 
@@ -59,7 +67,6 @@ impl HeadlessContext {
             color_view,
             depth_texture,
             depth_view,
-            depth_id: crate::bind_cache::new_depth_id(),
             adapter_info: adapter.get_info(),
         })
     }
@@ -79,13 +86,12 @@ impl HeadlessContext {
         self.color_view = color_view;
         self.depth_texture = depth_texture;
         self.depth_view = depth_view;
-        self.depth_id = crate::bind_cache::new_depth_id();
     }
 
-    /// The depth view with its id, so the renderer keeps bind groups over
-    /// it from frame to frame (#379).
+    /// The depth view, for the renderer, which keeps bind groups over it
+    /// for as long as it is the same view (#379, #960).
     pub fn depth_target(&self) -> crate::bind_cache::DepthTarget<'_> {
-        crate::bind_cache::DepthTarget::new(&self.depth_view, self.depth_id)
+        crate::bind_cache::DepthTarget::new(&self.depth_view)
     }
 
     fn targets(
@@ -104,7 +110,7 @@ impl HeadlessContext {
             height,
             depth_or_array_layers: 1,
         };
-        let color_texture = device.create_texture(&wgpu::TextureDescriptor {
+        let color_texture = device.create_texture_counted(&wgpu::TextureDescriptor {
             label: Some("Headless Color Texture"),
             size,
             mip_level_count: 1,
@@ -112,17 +118,22 @@ impl HeadlessContext {
             dimension: wgpu::TextureDimension::D2,
             format,
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
-            view_formats: &[],
+            // A HUD paints through the plain twin, as the player's does
+            // (`hud_view`, #731)
+            view_formats: &[format.remove_srgb_suffix()],
         });
         let color_view = color_texture.create_view(&wgpu::TextureViewDescriptor::default());
-        let depth_texture = device.create_texture(&wgpu::TextureDescriptor {
+        let depth_texture = device.create_texture_counted(&wgpu::TextureDescriptor {
             label: Some("Headless Depth Texture"),
             size,
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format: wgpu::TextureFormat::Depth32Float,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::TEXTURE_BINDING
+                // Copied out by a frame capture (#1085)
+                | wgpu::TextureUsages::COPY_SRC,
             view_formats: &[],
         });
         let depth_view = depth_texture.create_view(&wgpu::TextureViewDescriptor::default());
@@ -137,7 +148,7 @@ impl HeadlessContext {
         let padded_bytes_per_row = unpadded_bytes_per_row.div_ceil(align) * align;
 
         let buffer_size = (padded_bytes_per_row * self.height) as u64;
-        let staging_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+        let staging_buffer = self.device.create_buffer_counted(&wgpu::BufferDescriptor {
             label: Some("Pixel Readback Buffer"),
             size: buffer_size,
             usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
@@ -151,15 +162,15 @@ impl HeadlessContext {
             });
 
         encoder.copy_texture_to_buffer(
-            wgpu::ImageCopyTexture {
+            wgpu::TexelCopyTextureInfo {
                 texture: &self.color_texture,
                 mip_level: 0,
                 origin: wgpu::Origin3d::ZERO,
                 aspect: wgpu::TextureAspect::All,
             },
-            wgpu::ImageCopyBuffer {
+            wgpu::TexelCopyBufferInfo {
                 buffer: &staging_buffer,
-                layout: wgpu::ImageDataLayout {
+                layout: wgpu::TexelCopyBufferLayout {
                     offset: 0,
                     bytes_per_row: Some(padded_bytes_per_row),
                     rows_per_image: Some(self.height),
@@ -180,13 +191,15 @@ impl HeadlessContext {
         buffer_slice.map_async(wgpu::MapMode::Read, move |result| {
             let _ = tx.send(result);
         });
-        self.device.poll(wgpu::Maintain::Wait);
+        let _ = crate::wait_for_gpu(&self.device);
 
         rx.recv()
             .map_err(|e| RenderError::BufferReadFailed(e.to_string()))?
             .map_err(|e| RenderError::BufferReadFailed(e.to_string()))?;
 
-        let data = buffer_slice.get_mapped_range();
+        let data = buffer_slice
+            .get_mapped_range()
+            .expect("mapped buffer range");
 
         // Strip row padding if present
         let mut pixels = Vec::with_capacity((self.width * self.height * bytes_per_pixel) as usize);
@@ -200,6 +213,17 @@ impl HeadlessContext {
         staging_buffer.unmap();
 
         Ok(pixels)
+    }
+
+    /// A view of the colour target in its format without the sRGB suffix,
+    /// for an egui pass (#731): as the player's `RenderContext::hud_view`,
+    /// so a HUD blends in display space (#428).
+    pub fn hud_view(&self) -> wgpu::TextureView {
+        self.color_texture
+            .create_view(&wgpu::TextureViewDescriptor {
+                format: Some(self.format.remove_srgb_suffix()),
+                ..Default::default()
+            })
     }
 
     /// Aspect ratio of this context

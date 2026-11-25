@@ -3,6 +3,7 @@
 //! Uses the committed prototype fixtures (real FLAC stems) because
 //! `open_shared` resolves stems from disk; skipped when the game repo's
 //! fixtures aren't present (engine CI), like `prototype_fixture_renders_offline`.
+#![allow(clippy::disallowed_methods)] // a test: reads its files off the disk, not through the vfs
 
 use flint_music::offline::{OfflineBackend, OfflineBackendSettings};
 use flint_rhythm::chart_session::{judgment_offset_samples, ChartSession, ChartSessionConfig};
@@ -133,10 +134,9 @@ fn open_shared_ticks_taps_and_finishes_on_offline_manager() {
         assert_eq!(ts.start_sample, ms.start_sample);
         assert_eq!(
             ts.re_entry,
-            manifest
-                .reintegration
-                .as_ref()
-                .is_some_and(|r| r.re_entry_sections.contains(&ms.name)),
+            flint_rhythm::reintegration::Reintegration::of(&manifest)
+                .unwrap()
+                .is_some_and(|r| r.re_enters_at(&ms.name)),
             "re-entry flag matches the manifest for '{}'",
             ms.name
         );

@@ -289,7 +289,14 @@ impl PersistentStore {
     }
 
     /// Set a value by key. Overwrites any existing value.
+    ///
+    /// Setting a key to the value it already holds is not a change: the
+    /// store stays clean, so a script that writes its state every frame
+    /// doesn't rewrite the save file every second (#1119).
     pub fn set(&mut self, key: &str, value: toml::Value) {
+        if self.data.get(key) == Some(&value) {
+            return;
+        }
         self.data.insert(key.to_string(), value);
         self.dirty = true;
     }
@@ -321,9 +328,11 @@ impl PersistentStore {
         self.data.clear();
     }
 
-    /// Return all keys.
+    /// Every key, sorted (#689): the map's own order differs run to run.
     pub fn keys(&self) -> Vec<&str> {
-        self.data.keys().map(|k| k.as_str()).collect()
+        let mut keys: Vec<&str> = self.data.keys().map(|k| k.as_str()).collect();
+        keys.sort_unstable();
+        keys
     }
 
     // ─── Version ──────────────────────────────────────────
@@ -757,6 +766,17 @@ mod tests {
 
         store.clear();
         assert!(!store.is_dirty(), "clearing an empty store is not a change");
+
+        store.set("a", toml::Value::Integer(1));
+        store.mark_clean();
+        store.set("a", toml::Value::Integer(1));
+        assert!(
+            !store.is_dirty(),
+            "setting a key to its current value is not a change (#1119)"
+        );
+        store.set("a", toml::Value::Float(1.0));
+        assert!(store.is_dirty(), "a new type is a change");
+        store.mark_clean();
 
         assert!(!store.take_flush_request());
         store.request_flush();

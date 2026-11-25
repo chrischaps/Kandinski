@@ -1,5 +1,7 @@
 # Queries
 
+> **Package:** `engine`, the kernel: every game has it ([Packages](packages.md)).
+
 Flint's query language is a simple filter: one resource, and at most one condition on it. `entities where archetype == 'door'` is a whole query. It is parsed by a PEG grammar (pest) and run against the ECS world. Three things use it: `flint query`, the `query` of a [constraint](constraints.md), and the viewer, which evaluates the same constraints.
 
 ## Grammar
@@ -11,7 +13,8 @@ query     = { SOI ~ resource ~ (where_clause)? ~ EOI }
 resource  = { "entities" | "components" }
 where_clause = { "where" ~ condition }
 condition = { field ~ operator ~ value }
-field     = { identifier ~ ("." ~ identifier)* }
+field     = { identifier ~ ("." ~ identifier | index)* }
+index     = { "[" ~ ASCII_DIGIT+ ~ "]" }
 operator  = { "==" | "!=" | "contains" | ">=" | "<=" | ">" | "<" }
 value     = { string | number | boolean }
 ```
@@ -43,14 +46,19 @@ Two resource types can be queried:
 
 ## Field Paths
 
-Fields use dot notation to access nested values:
+Fields use dot notation to access nested values, and step into an array by an axis or an index:
 
 | Pattern | Meaning |
 |---------|---------|
 | `archetype` | The entity's archetype name |
 | `name` | The entity's name |
 | `door.locked` | The `locked` field of the `door` component |
-| `transform.position` | The `position` field of the `transform` component |
+| `transform.position.z` | The third element of `transform.position`: `x`, `y`, `z` and `w` name an array's first four |
+| `transform.position[2]` | The same element by its index, counted from 0 |
+| `path.points[3].x` | The first element of the fourth entry of a list of vectors |
+| `path.stops[1].name` | The `name` field of the second table in a list of tables |
+
+A comparison needs a string, number or boolean at the end of the path, so `transform.position == 5` (a whole array) matches nothing. A path that finds nothing matches nothing, the same as a field the entity doesn't have: an index past an array's end (`transform.position[3]`, `.w` of a three-element vector), a step into a value that is not an array or table (`door.locked.x`), or an index into a table. That holds for `!=` too, so `transform.position.w != 0` doesn't pick every entity without a fourth element. None of these is an error.
 
 Examples:
 
@@ -64,6 +72,10 @@ flint query "entities where door.locked == true"
 flint query "entities where audio_source.volume > 0.5"
 flint query "entities where material.roughness >= 0.8"
 flint query "entities where collider.shape == 'box'"
+
+# One element of a vector
+flint query "entities where transform.position.z > 5"
+flint query "entities where transform.position[1] < 0"
 ```
 
 ## Value Types
@@ -109,7 +121,23 @@ flint query "entities where door.locked == true" --scene levels/tavern.scene.tom
 # project's flint.toml `schemas`, else schemas/ in the working directory,
 # beside the scene and one level up
 flint query "entities" --scene levels/tavern.scene.toml --schemas engine/schemas --schemas schemas
+
+# Each entity with its components' values, as `flint entity show` prints one
+flint query "entities where door.locked == true" --scene levels/tavern.scene.toml --data
+
+# The same query of a running game started with --inspect-listen 127.0.0.1:7878
+flint query "entities where door.locked == true" --attach 7878
+
+# Where is the player? Selected on, not printed and read
+flint query "entities where transform.position.z > 5" --attach 7878
 ```
+
+A file and a running game are asked through one function
+(`flint_query::answer`), so the grammar, the entities picked and the JSON
+are the same for both. A game answers with its world as it stands that
+frame: a door a script unlocked is unlocked, a player who walked has moved.
+`flint-player --dump-world` writes the same entities to a file at game times.
+See [Asking a running game](../cli-reference/overview.md#asking-a-running-game).
 
 ## What it does not do
 

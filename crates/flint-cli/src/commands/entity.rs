@@ -6,10 +6,13 @@
 //! loaded first, so an edit that would leave the scene unloadable (a dangling
 //! `parent`, props a schema rejects) is refused before the file changes.
 
+use super::common_args::load_scene;
+use crate::output::{self, Answer};
 use anyhow::{Context, Result};
 use clap::Subcommand;
-use flint_scene::{load_scene, load_scene_text, SceneDocument, SceneFile};
+use flint_scene::{load_scene_text, SceneDocument, SceneFile};
 use flint_schema::{validate_component_data, SchemaRegistry};
+use serde_json::json;
 use std::path::Path;
 
 #[derive(Subcommand)]
@@ -82,14 +85,21 @@ pub enum EntityCommands {
         schemas: Vec<String>,
     },
 
-    /// Show entity details
+    /// Show entity details: its components' values, from a scene file or
+    /// a running game (--attach)
     Show {
         /// Entity name
         name: String,
 
         /// Path to scene file
-        #[arg(long)]
-        scene: String,
+        #[arg(long, required_unless_present = "attach")]
+        scene: Option<String>,
+
+        /// Ask a running game instead of a file: the address it was started
+        /// with as `--inspect-listen` (IP:PORT, or a port on 127.0.0.1), as
+        /// it stands now (#713)
+        #[arg(long, value_name = "IP:PORT", conflicts_with_all = ["scene", "schemas"])]
+        attach: Option<String>,
 
         /// Output format (json or toml)
         #[arg(long, default_value = "json")]
@@ -137,9 +147,16 @@ pub fn run(cmd: EntityCommands) -> Result<()> {
         EntityCommands::Show {
             name,
             scene,
+            attach,
             format,
             schemas,
-        } => show(&name, &scene, &format, &schemas),
+        } => show(
+            &name,
+            scene.as_deref(),
+            attach.as_deref(),
+            &format,
+            &schemas,
+        ),
     }
 }
 
@@ -161,7 +178,7 @@ fn create(
     }
 
     // The scene as it loads, prefab instances and all, for the names in it
-    let (world, _) = load_scene(scene_path, &registry).context("Failed to load scene")?;
+    let (world, _) = load_scene(scene_path, &registry)?;
     if world.contains_name(name) {
         anyhow::bail!("Entity '{}' already exists", name);
     }
@@ -185,7 +202,7 @@ fn create(
 
     // The new file must load, and what the props set must fit the schemas
     let (world, _) = load_scene_text(&text, path, &registry)
-        .context("Refusing to write: the scene would not load")?;
+        .with_context(|| format!("Refusing to write {scene_path}: the scene would not load"))?;
     let id = world
         .get_id(name)
         .ok_or_else(|| anyhow::anyhow!("Refusing to write: '{}' did not load", name))?;
@@ -206,8 +223,15 @@ fn create(
     }
 
     std::fs::write(scene_path, text)?;
-    println!("Created entity '{}' with archetype '{}'", name, archetype);
-    Ok(())
+    output::emit(&Answer::new(
+        format!("Created entity '{name}' with archetype '{archetype}'"),
+        json!({
+            "created": name,
+            "archetype": archetype,
+            "parent": parent,
+            "scene": scene_path,
+        }),
+    ))
 }
 
 /// `--props` as components, components and fields sorted by name so the same
@@ -239,13 +263,13 @@ fn parse_props(json: &str) -> Result<Vec<(String, toml::Value)>> {
 
 fn list(scene_path: &str, format: &str, schemas: &[String]) -> Result<()> {
     let registry = load_registry(scene_path, schemas)?;
-    let (world, _) = load_scene(scene_path, &registry).context("Failed to load scene")?;
+    let (world, _) = load_scene(scene_path, &registry)?;
 
     let entities = world.all_entities();
 
-    match format {
+    match output::format_or_json(format) {
         "json" => {
-            println!("{}", serde_json::to_string_pretty(&entities)?);
+            output::document(&serde_json::to_value(&entities)?);
         }
         "toml" => {
             #[derive(serde::Serialize)]
@@ -266,7 +290,7 @@ fn delete(name: &str, scene_path: &str, recursive: bool, schemas: &[String]) -> 
     let mut doc = SceneDocument::from_file(path).map_err(anyhow::Error::msg)?;
 
     if !doc.has_entity(name) {
-        let (world, _) = load_scene(scene_path, &registry).context("Failed to load scene")?;
+        let (world, _) = load_scene(scene_path, &registry)?;
         if !world.contains_name(name) {
             anyhow::bail!("Entity '{}' not found", name);
         }
@@ -303,56 +327,53 @@ fn delete(name: &str, scene_path: &str, recursive: bool, schemas: &[String]) -> 
 
     // A prefab instance's `parent`, say, can still name what went
     load_scene_text(&text, path, &registry)
-        .context("Refusing to write: the scene would not load")?;
+        .with_context(|| format!("Refusing to write {scene_path}: the scene would not load"))?;
     std::fs::write(scene_path, text)?;
 
-    match doomed.len() {
-        1 => println!("Deleted entity '{}'", name),
-        n => println!(
+    let text = match doomed.len() {
+        1 => format!("Deleted entity '{name}'"),
+        n => format!(
             "Deleted entity '{}' and {} under it: {}",
             name,
             n - 1,
             doomed[..n - 1].join(", ")
         ),
-    }
-    Ok(())
+    };
+    output::emit(&Answer::new(
+        text,
+        json!({ "deleted": doomed, "scene": scene_path }),
+    ))
 }
 
-fn show(name: &str, scene_path: &str, format: &str, schemas: &[String]) -> Result<()> {
-    let registry = load_registry(scene_path, schemas)?;
-    let (world, _) = load_scene(scene_path, &registry).context("Failed to load scene")?;
-
-    let id = world
-        .get_id(name)
-        .ok_or_else(|| anyhow::anyhow!("Entity '{}' not found", name))?;
-
-    let info = world
-        .all_entities()
-        .into_iter()
-        .find(|e| e.name == name)
-        .ok_or_else(|| anyhow::anyhow!("Entity '{}' not found", name))?;
-
-    let components = world.get_components(id);
-
-    #[derive(serde::Serialize)]
-    struct EntityDetails {
-        #[serde(flatten)]
-        info: flint_ecs::EntityInfo,
-        data: Option<std::collections::HashMap<String, toml::Value>>,
-    }
-
-    let details = EntityDetails {
-        info,
-        data: components.map(|c| c.data.clone()),
+/// One entity's details from a scene file, or from a running game with
+/// `--attach` (#713): either way `flint_query::answer`'s, so the two print
+/// the same.
+fn show(
+    name: &str,
+    scene_path: Option<&str>,
+    attach: Option<&str>,
+    format: &str,
+    schemas: &[String],
+) -> Result<()> {
+    let ask = flint_query::Ask::Entity {
+        entity: name.to_owned(),
+    };
+    let details = match (attach, scene_path) {
+        (Some(addr), _) => super::attach::ask(addr, &ask)?.answer,
+        (None, Some(scene_path)) => {
+            let registry = load_registry(scene_path, schemas)?;
+            let (world, _) = load_scene(scene_path, &registry)?;
+            flint_query::answer(&world, &ask).map_err(anyhow::Error::msg)?
+        }
+        (None, None) => anyhow::bail!("give --scene <file> or --attach <IP:PORT>"),
     };
 
-    match format {
-        "json" => {
-            println!("{}", serde_json::to_string_pretty(&details)?);
-        }
-        "toml" => {
-            println!("{}", toml::to_string_pretty(&details)?);
-        }
+    match output::format_or_json(format) {
+        "json" => output::document(&details),
+        "toml" => println!(
+            "{}",
+            toml::to_string_pretty(&super::attach::without_nulls(details))?
+        ),
         _ => anyhow::bail!("Unknown format: {}", format),
     }
 

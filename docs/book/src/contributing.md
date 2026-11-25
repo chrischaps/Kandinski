@@ -5,7 +5,7 @@ The five numbered engine phases (ECS, constraints, PBR rendering, runtime, AI as
 - **Bug reports** --- file issues on GitHub
 - **Schema definitions** --- new component and archetype schemas
 - **Documentation** --- improvements to this guide
-- **Test coverage** --- additional unit and integration tests (1,107 tests across the 24 default workspace crates; 6 ignored)
+- **Test coverage** --- additional unit and integration tests (`cargo test` runs them; CI does not yet, so a PR says what it ran)
 - **Constraint kinds** --- new validation rule types
 - **Physics** --- additional collider shapes, improved character controller behavior
 - **Rendering** --- post-processing effects, LOD, additional debug views
@@ -30,25 +30,28 @@ bash scripts/ci.sh        # what a PR must pass: formatting (--full adds clippy 
 
 ## Running the Examples
 
-`examples/` holds the curated scenes, each listed in `examples/index.toml` with a topic and a one-line purpose:
+The curated scenes are their own repository, [flint-examples](https://github.com/chrischaps/flint-examples), each listed in its [`index.toml`](https://github.com/chrischaps/flint-examples/blob/main/index.toml) with a topic and a one-line purpose. Clone it into the checkout ([Getting the Examples](getting-started/installation.md#getting-the-examples)):
 
 ```bash
-cargo run --bin flint -- examples                  # every example, by topic
-cargo run --bin flint -- examples --topic stylize   # one topic
-cargo run --bin flint -- examples --check           # what CI runs: indexed and valid
+git clone https://github.com/chrischaps/flint-examples
+cargo run --bin flint -- examples --dir flint-examples                  # every example, by topic
+cargo run --bin flint -- examples --dir flint-examples --topic stylize   # one topic
+cargo run --bin flint -- examples --dir flint-examples --check           # what its CI runs: indexed and valid
 ```
 
-A new example needs an entry in the index. The examples are free to change: the render goldens load frozen copies under `tests/fixtures/scenes/`, never `examples/`, so improving one never means re-blessing a golden. A scene only a test needs goes in `tests/fixtures/scenes/`, with the assets it loads.
+A new example needs an entry in the index, and is a pull request to flint-examples. An entry whose scene needs a package beyond the kernel says so, `packages = ["living"]`: a `flint` built without it passes over that example in `--check`, by name (`SKIP grove.scene.toml: needs the living package, ...`), rather than failing it. The examples are free to change: the render goldens load frozen copies under `tests/fixtures/scenes/`, never an example, so improving one never means re-blessing a golden. A scene only a test needs goes in `tests/fixtures/scenes/`, with every file it loads.
+
+An engine feature that comes with an example bench is two pull requests: the engine's first, with its tests on fixtures, then flint-examples', which takes the merged engine (`git subtree pull --prefix=engine flint-engine main --squash`) and adds the bench. Until the second lands, the engine PR can name the bench only as a link to its branch.
 
 ```bash
 # Scene viewer with hot-reload
-cargo run --bin flint -- edit examples/phase4_runtime.scene.toml --watch
+cargo run --bin flint -- edit flint-examples/phase4_runtime.scene.toml --watch
 
 # First-person walkable scene
-cargo run --bin flint -- play examples/phase4_runtime.scene.toml
+cargo run --bin flint -- play flint-examples/phase4_runtime.scene.toml
 
 # Headless snapshot (the primary validation tool for agents)
-cargo run --release --bin flint -- render examples/showcase_tavern.scene.toml -o tavern.png
+cargo run --release --bin flint -- render flint-examples/showcase_tavern.scene.toml -o tavern.png
 ```
 
 Release builds are strongly recommended for `render`, `play`, and the full test suite; debug builds of `flint-cli` need the 8 MB main-thread stack that `.cargo/config.toml` links on Windows.
@@ -81,7 +84,7 @@ Changelog: none (reason)
 
 ## Architecture
 
-The project is a 27-member Cargo workspace: 26 crates under `crates/` plus the `tools/arch-analyzer` static analyzer. See the [Architecture Overview](architecture/overview.md) and [Crate Dependency Graph](architecture/crate-graph.md) for how the crates relate to each other. Key principles:
+The project is a 34-member Cargo workspace: 33 crates under `crates/` plus the `tools/arch-analyzer` static analyzer. See the [Architecture Overview](architecture/overview.md) and [Crate Dependency Graph](architecture/crate-graph.md) for how the crates relate to each other. Key principles:
 
 - Dependencies flow in one direction (binary crates at the top, `flint-core` at the bottom)
 - Components are dynamic `toml::Value`, not Rust types --- schemas are runtime data

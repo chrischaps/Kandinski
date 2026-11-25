@@ -3,12 +3,14 @@
 //!
 //! These need a GPU adapter. Without one each test prints a note and passes.
 
+#![allow(clippy::disallowed_methods)] // the test's own targets and read-backs, not the renderer's, so uncounted (#1091)
+
 mod shared_gpu;
 
+use flint_core::field_frame::BoilFrame;
 use flint_ecs::FlintWorld;
 use flint_import::ImportedMaterial;
 use flint_render::{Camera, DebugMode, PostProcessConfig, RendererConfig, SceneRenderer, Vertex};
-use flint_wooze::BoilFrame;
 
 const SIZE: u32 = 128;
 const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
@@ -22,7 +24,7 @@ struct Gpu {
     _lease: shared_gpu::Lease,
 }
 
-/// The shared device (#598), alongside the other tests.
+/// The shared device (#598), alongside the other tests holding it.
 fn gpu() -> Option<Gpu> {
     shared_gpu::lease().map(frame_for)
 }
@@ -163,8 +165,15 @@ impl Gpu {
         bench
             .renderer
             .ensure_kuwahara_resources(self.device, self.queue);
-        bench.renderer.set_boil(boil);
-        bench.renderer.update_from_world(&bench.world, self.device);
+        bench.renderer.prepare(
+            self.device,
+            self.queue,
+            &bench.world,
+            &flint_render::FrameInputs {
+                boil,
+                ..Default::default()
+            },
+        );
         bench.renderer.render_to(
             self.device,
             self.queue,
@@ -172,7 +181,7 @@ impl Gpu {
             &bench.camera,
             &self.color_view,
         );
-        self.device.poll(wgpu::Maintain::Wait);
+        let _ = flint_render::wait_for_gpu(&self.device);
 
         let row = (SIZE * 4).div_ceil(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT)
             * wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
@@ -185,9 +194,9 @@ impl Gpu {
         let mut encoder = self.device.create_command_encoder(&Default::default());
         encoder.copy_texture_to_buffer(
             self.color.as_image_copy(),
-            wgpu::ImageCopyBuffer {
+            wgpu::TexelCopyBufferInfo {
                 buffer: &buffer,
-                layout: wgpu::ImageDataLayout {
+                layout: wgpu::TexelCopyBufferLayout {
                     offset: 0,
                     bytes_per_row: Some(row),
                     rows_per_image: None,
@@ -203,8 +212,11 @@ impl Gpu {
         buffer
             .slice(..)
             .map_async(wgpu::MapMode::Read, |r| r.unwrap());
-        self.device.poll(wgpu::Maintain::Wait);
-        let data = buffer.slice(..).get_mapped_range();
+        let _ = flint_render::wait_for_gpu(&self.device);
+        let data = buffer
+            .slice(..)
+            .get_mapped_range()
+            .expect("mapped buffer range");
         (0..SIZE as usize)
             .flat_map(|y| {
                 let start = y * row as usize;
@@ -337,7 +349,6 @@ fn the_contour_survives_a_resize() {
     let before = gpu.pixels(&mut bench, &config, drawing(3, 1.0));
     bench.renderer.resize_postprocess(gpu.device, SIZE, SIZE);
     // Nothing calls ensure here: the resize must have made its texture again.
-    bench.renderer.set_boil(drawing(3, 1.0));
     let after = gpu.pixels(&mut bench, &config, drawing(3, 1.0));
     assert_eq!(before, after);
 }

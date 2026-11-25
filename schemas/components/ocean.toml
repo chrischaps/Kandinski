@@ -27,12 +27,33 @@ ramp_steps = { type = "f32", description = "Cel bands in the diffuse ramp (1-8)"
 specular_strength = { type = "f32", description = "Sun glint intensity (0 disables)", default = 1.0 }
 band_wobble = { type = "f32", description = "Ramp edge wobble: noise raggedizes cel band contours (0 = razor edges)", default = 0.2 }
 band_dither = { type = "f32", description = "Halftone dither width at band edges: dots grow/merge across the transition (0 = hard line)", default = 0.0 }
-rain_ripple = { type = "f32", description = "Rain impact-ring density 0..1 (weather-driven; 0 = off)", default = 0.0 }
+rain_ripple = { type = "f32", description = "Rain impact-ring density 0..1: expanding rings where drops land, fading out by about 30 m from the camera (0 = off)", default = 0.0 }
 band_dither_scale = { type = "f32", description = "Halftone dot grid frequency in dots per meter", default = 1.5 }
 foam_glow_color = { type = "color", description = "Bioluminescent foam glow color (RGBA linear, emissive teal-green)", default = [0.35, 0.95, 0.75, 1.0] }
-foam_glow = { type = "f32", description = "Bioluminescent glow strength (0 = off; time_of_day.rhai fades it in at night)", default = 0.0 }
+foam_glow = { type = "f32", description = "Bioluminescent glow strength: emissive light from churned foam, brightest at contact foam (0 = off)", default = 0.0 }
 
-# ── Contact foam (splash ring around the scene's ocean_contact hull) ────
+# ── Tint (#746): the palette moves toward another, which a game drives ───
+# A tint names the colours it moves toward, or a preset that does
+# (tint_preset, #1035: blood, the crimson tide; underside, the surface seen
+# from below). The tint_* fields and tint_preset carry no schema default: a
+# default is written into the component at load, where it would beat the
+# preset. With no preset written (#1041), a colour left out is the sea's
+# own (deep_color...) and every other setting changes nothing, so `tint`
+# alone moves the sea toward itself.
+tint = { type = "f32", description = "How far the palette moves to the tint's, 0..1; with tint_pools above 0, also how much of the sea the pools cover (0 = off)", default = 0.0 }
+tint_preset = { type = "enum", values = ["blood", "underside"], description = "A named tint the tint_* fields below fall back on when unwritten: blood (the crimson tide: night-dark pools that spread with tint, two wobbling bands) or underside (the surface seen from under it: murk blues and flat foam panes, below only). A script switches between them with one set_field; a written tint_* field still wins. Unwritten: none, so the fields fall back on the sea's own palette and change nothing" }
+tint_deep_color = { type = "color", description = "The tint's deep water colour (RGBA linear); unwritten, the preset's, else deep_color" }
+tint_shallow_color = { type = "color", description = "The tint's shallow water colour (RGBA linear); unwritten, the preset's, else shallow_color" }
+tint_sss_color = { type = "color", description = "The tint's subsurface glow colour (RGBA linear); unwritten, the preset's, else sss_color" }
+tint_foam_color = { type = "color", description = "The tint's foam colour, the shore foam's too (RGBA linear); unwritten, the preset's, else foam_color" }
+tint_sky = { type = "color", description = "What the sky's reflection is multiplied by where tinted (RGB; [1, 1, 1] leaves it); unwritten, the preset's, else [1, 1, 1]" }
+tint_ramp_steps = { type = "f32", description = "Cel bands where tinted (0 = the sea's own ramp_steps); unwritten, the preset's, else 0" }
+tint_band_wobble = { type = "f32", description = "Added to band_wobble where tinted; unwritten, the preset's, else 0" }
+tint_pools = { type = "f32", description = "World-anchored pools, this many per metre, spreading to full cover as tint rises (0 = tint evenly); unwritten, the preset's, else 0" }
+tint_keep_light = { type = "bool", description = "Scale the tint's deep and shallow by the palette's own brightness, so a night sea stays dark; unwritten, the preset's, else false" }
+tint_below = { type = "bool", description = "Tint only the surface seen from below, the ceiling over a submerged camera; unwritten, the preset's, else false" }
+
+# ── Contact foam (a splash ring round each ocean_contact entity) ────────
 splash_strength = { type = "f32", description = "Contact foam overall gain (0 disables)", default = 1.0 }
 splash_width = { type = "f32", description = "Max foam band width outward from the hull at full churn (m)", default = 0.35 }
 splash_flicker_speed = { type = "f32", description = "Contact foam lapping/flicker animation rate", default = 1.6 }
@@ -57,6 +78,3 @@ sky_reflection_strength = { type = "f32", description = "Fresnel-weighted analyt
 grid_scale = { type = "f32", description = "Inner metric scale of the camera-following grid (m)", default = 60.0 }
 fade_start = { type = "f32", description = "Distance where wave displacement starts fading (m)", default = 90.0 }
 fade_end = { type = "f32", description = "Distance where the ocean is flat (m)", default = 170.0 }
-
-# ── Diagnostics ─────────────────────────────────────────────────────────
-show_probe = { type = "bool", description = "Show the CPU/GPU parity buoy (a wave_probe script pins it to ocean_height; parked underwater when false)", default = false }

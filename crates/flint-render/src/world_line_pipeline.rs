@@ -12,6 +12,8 @@
 //! FXAA. Colours are display-space (sRGB), as the HUD's are, so a ring keeps
 //! the colour it had as a HUD line. Fog, bloom and tonemapping don't touch it.
 
+use crate::gpu_counts::{CountedDevice, CountedQueue};
+use crate::TrustedShader;
 use bytemuck::{Pod, Zeroable};
 use flint_core::world_line::WorldLine;
 
@@ -196,22 +198,22 @@ impl WorldLinePipeline {
     /// `format` is the final target's (the surface's); the pass is single
     /// sample against a `Depth32Float` depth view.
     pub fn new(device: &wgpu::Device, format: wgpu::TextureFormat) -> Self {
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        let shader = device.create_trusted_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("World Line Shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("world_line_shader.wgsl").into()),
         });
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("World Line Pipeline Layout"),
             bind_group_layouts: &[],
-            push_constant_ranges: &[],
+            immediate_size: 0,
         });
-        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        let pipeline = device.create_render_pipeline_counted(&wgpu::RenderPipelineDescriptor {
             label: Some("World Line Pipeline"),
             layout: Some(&layout),
             vertex: wgpu::VertexState {
                 module: &shader,
                 entry_point: Some("vs_world_line"),
-                buffers: &[WorldLineVertex::desc()],
+                buffers: &[Some(WorldLineVertex::desc())],
                 compilation_options: Default::default(),
             },
             fragment: Some(wgpu::FragmentState {
@@ -231,13 +233,13 @@ impl WorldLinePipeline {
             },
             depth_stencil: Some(wgpu::DepthStencilState {
                 format: wgpu::TextureFormat::Depth32Float,
-                depth_write_enabled: false,
-                depth_compare: wgpu::CompareFunction::LessEqual,
+                depth_write_enabled: Some(false),
+                depth_compare: Some(wgpu::CompareFunction::LessEqual),
                 stencil: wgpu::StencilState::default(),
                 bias: wgpu::DepthBiasState::default(),
             }),
             multisample: wgpu::MultisampleState::default(),
-            multiview: None,
+            multiview_mask: None,
             cache: None,
         });
         Self {
@@ -268,7 +270,7 @@ impl WorldLinePipeline {
         }
         if self.capacity < self.vertices.len() {
             let capacity = self.vertices.len().next_power_of_two();
-            self.buffer = Some(device.create_buffer(&wgpu::BufferDescriptor {
+            self.buffer = Some(device.create_buffer_counted(&wgpu::BufferDescriptor {
                 label: Some("World Line Vertices"),
                 size: (capacity * std::mem::size_of::<WorldLineVertex>()) as u64,
                 usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
@@ -277,13 +279,14 @@ impl WorldLinePipeline {
             self.capacity = capacity;
         }
         let buffer = self.buffer.as_ref().expect("allocated above");
-        queue.write_buffer(buffer, 0, bytemuck::cast_slice(&self.vertices));
+        queue.write_buffer_counted(buffer, 0, bytemuck::cast_slice(&self.vertices));
 
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("World Lines"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                 view: target,
                 resolve_target: None,
+                depth_slice: None,
                 ops: wgpu::Operations {
                     load: wgpu::LoadOp::Load,
                     store: wgpu::StoreOp::Store,
@@ -299,6 +302,7 @@ impl WorldLinePipeline {
             }),
             timestamp_writes: None,
             occlusion_query_set: None,
+            multiview_mask: None,
         });
         pass.set_pipeline(&self.pipeline);
         pass.set_vertex_buffer(0, buffer.slice(..));

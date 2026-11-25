@@ -1,6 +1,7 @@
-//! `schemas/scene/living.toml` and `schemas/scene/wooze.toml` against the
+//! `packages/living/schemas/scene/living.toml` and `wooze.toml` against the
 //! types that read those tables (#686; flint-scene's `tests/table_schemas.rs`
-//! does the same for the tables it reads itself).
+//! does the same for the tables it reads itself, flint-render's
+//! `tests/panels_schema.rs` for `[panels]`).
 //!
 //! Both types refuse a key they don't know, so a table that writes every
 //! field its schema declares, and parses, shows the schema declares nothing
@@ -26,6 +27,7 @@ fn sample(field_type: &FieldType) -> toml::Value {
         FieldType::Fields { fields } => Value::Table(sample_table(fields)),
         FieldType::Enum { values } => values[0].clone().into(),
         FieldType::Array { element } => Value::Array(vec![sample(element)]),
+        FieldType::Any => Value::Float(0.5),
     }
 }
 
@@ -39,12 +41,14 @@ fn sample_table(fields: &HashMap<String, FieldSchema>) -> toml::Table {
 
 #[test]
 fn living_and_wooze_schemas_declare_only_what_is_read() {
-    let registry = SchemaRegistry::load_from_directory("../../schemas").unwrap();
+    // The engine's set as a game gets it, the living package's with it (#1332)
+    let dirs = flint_core::project::host_schema_dirs(&["../../schemas"], None).dirs;
+    let registry = SchemaRegistry::load_from_directories(&dirs).unwrap();
     let mut scene = SceneFile::new("s");
     for name in ["living", "wooze"] {
         let schema = registry
             .get_table(name)
-            .unwrap_or_else(|| panic!("schemas/scene/{name}.toml"));
+            .unwrap_or_else(|| panic!("packages/living/schemas/scene/{name}.toml"));
         scene
             .tables
             .insert(name.to_string(), sample_table(&schema.fields).into());
@@ -54,6 +58,8 @@ fn living_and_wooze_schemas_declare_only_what_is_read() {
     // Every field reached its type: none was dropped on the way
     let living = tables.living.expect("[living]");
     assert!(living.shadows.is_some() && living.stagger.is_some() && living.softness.is_some());
+    assert!(living.jitter_rate.is_some());
+    assert!(living.row_rate.is_some());
     let echoes = living.echoes.expect("echoes");
     assert!(echoes.count.is_some() && echoes.spread.is_some() && echoes.alpha.is_some());
     let variance = living.variance.expect("variance");
@@ -65,7 +71,7 @@ fn living_and_wooze_schemas_declare_only_what_is_read() {
     assert_eq!(wooze.zone.len(), 1);
     // ...and the count is the type's, so a field added to one is added to
     // the other
-    assert_eq!(registry.get_table("living").unwrap().fields.len(), 6);
+    assert_eq!(registry.get_table("living").unwrap().fields.len(), 8);
     assert_eq!(registry.get_table("wooze").unwrap().fields.len(), 6);
     // A zone's fields are the keys the field itself takes
     let FieldType::Array { element } = &registry

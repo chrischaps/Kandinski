@@ -1,36 +1,38 @@
 //! Main viewer application — combines wgpu scene rendering with egui panels.
 //! Supports an optional spline editor mode for interactive track editing.
 
+use crate::edits::FieldEdits;
+use crate::field_clocks::{field_of, FieldClocks, SceneField};
+use crate::host::{self, Editor, Flow, Gpu, HostOptions, InitCx, Target, Tick};
 use crate::panels::transform_gizmo::apply_gizmo_delta;
 use crate::panels::{
-    CameraView, EntityInspector, GizmoAction, GizmoMode, RenderStats, SceneTree, SplinePanelAction,
-    TransformGizmo, ViewGizmo,
+    CameraView, DiagnosticsPanel, EntityInspector, FrameStats, GizmoAction, GizmoMode, SceneTree,
+    SplinePanelAction, TransformGizmo, ViewGizmo,
 };
 use crate::picking::{build_pick_targets, pick_entity};
 use crate::spline_editor::{DragMode, SplineEditor, SplineEditorConfig};
 use crate::undo::{EditAction, UndoCommand, UndoStack};
+use crate::watch::StyleSources;
 use anyhow::{Context, Result};
 use flint_constraint::{ConstraintEvaluator, ConstraintRegistry};
 use flint_core::components as comp;
 use flint_ecs::FlintWorld;
 use flint_render::model_loader::{self, ModelLoadConfig};
 use flint_render::{
-    post_process_config_from_def, Camera, PostProcessConfig, RenderContext, RendererConfig,
-    SceneRenderer,
+    post_process_config_from_def, Camera, FrameInputs, OrbitCameraController, PostProcessConfig,
+    RendererConfig, SceneBinding, SceneRenderer,
 };
-use flint_scene::{load_scene, CameraDef, PostProcessDef, SceneDocument};
+use flint_runtime::{DebugKey, DebugKeyGroup};
+use flint_scene::{
+    load_failed, load_scene, load_scene_after, CameraDef, PostProcessDef, SceneDocument,
+};
 use flint_schema::{SchemaDirs, SchemaRegistry};
-use notify_debouncer_mini::{new_debouncer, notify::RecursiveMode};
-use std::path::Path;
-use std::sync::mpsc;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use winit::application::ApplicationHandler;
-use winit::dpi::PhysicalSize;
-use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
-use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
+use winit::event::{ElementState, MouseButton, WindowEvent};
 use winit::keyboard::{KeyCode, ModifiersState, PhysicalKey};
-use winit::window::{Window, WindowId};
+use winit::window::Window;
 
 struct ViewerState {
     world: FlintWorld,
@@ -44,13 +46,17 @@ struct ViewerState {
     /// F4's "Authored post" button toggles between it and the viewer's
     /// default config.
     scene_post: Option<PostProcessDef>,
-    /// The scene's wooze field, if it has a `[wooze]` table. The viewer reads it
-    /// for the shading boil only (#214); it doesn't run living props.
-    wooze: Option<flint_wooze::WoozeField>,
+    /// The scene's wooze field, if it has a `[wooze]` table (and the viewer has
+    /// `living`, #1330). The viewer reads it for the shading boil, shallow wooze
+    /// and woozy grass (#214); it doesn't run living props.
+    wooze: Option<SceneField>,
     /// The scene's authored `[camera]` block, if any — seeds the orbit camera
     /// on load (and on Space reset) so the viewer opens on the authored
     /// framing instead of the generic default.
     scene_camera: Option<CameraDef>,
+    /// The scene's `[environment]`, whose lighting levers binding the scene
+    /// sets (#739: the viewer never read it before).
+    environment: Option<flint_scene::EnvironmentDef>,
 }
 
 /// `flint edit scene.toml --style ... --style-time ...` (#328): style words
@@ -86,6 +92,19 @@ impl Default for ViewerWindow {
     }
 }
 
+impl ViewerWindow {
+    /// The host's options for this window: its size, the camera flags
+    /// left to the scene's framing.
+    pub fn host_options(&self) -> HostOptions {
+        HostOptions {
+            width: self.width,
+            height: self.height,
+            camera: Default::default(),
+            auto_orbit: false,
+        }
+    }
+}
+
 /// What the viewer loads for a scene: the schemas and constraints of every
 /// directory the one resolver names (ADR 0114: `--schemas` flags if given,
 /// else the project manifest's list, else `schemas/` in the working
@@ -97,7 +116,7 @@ pub fn load_schemas(
 ) -> Result<(SchemaRegistry, ConstraintRegistry, SchemaDirs)> {
     let (registry, dirs) = SchemaRegistry::resolve(Some(Path::new(scene_path)), schemas)?;
     if dirs.dirs.is_empty() {
-        println!("Warning: No schemas directories found");
+        tracing::warn!(target: "viewer", "No schemas directories found");
     }
     let mut constraints = ConstraintRegistry::new();
     for dir in &dirs.dirs {
@@ -107,7 +126,7 @@ pub fn load_schemas(
         // shows it in the status panel as an error
         match ConstraintRegistry::load_from_directory(dir) {
             Ok(loaded) => constraints.extend(loaded),
-            Err(e) => eprintln!("Warning: constraints not loaded: {e}"),
+            Err(e) => tracing::warn!(target: "viewer", "Constraints not loaded: {e}"),
         }
     }
     Ok((registry, constraints, dirs))
@@ -166,17 +185,41 @@ pub fn run(
     style: ViewerStyle,
     window: ViewerWindow,
 ) -> Result<()> {
+    let mut options = window.host_options();
+    options.auto_orbit = auto_orbit;
+    host::run(
+        viewer(
+            scene_path, watch, schemas, inspector, auto_orbit, style, window,
+        )?,
+        options,
+    )
+}
+
+/// The scene viewer on `scene_path`, for [`crate::host`] to open in a
+/// window or draw as a `--render` still (#712).
+pub fn viewer(
+    scene_path: &str,
+    watch: bool,
+    schemas: &[String],
+    inspector: bool,
+    auto_orbit: bool,
+    style: ViewerStyle,
+    window: ViewerWindow,
+) -> Result<ViewerApp> {
     let (registry, constraint_registry, schema_dirs) = load_schemas(scene_path, schemas)?;
 
-    load_user_styles(scene_path);
+    let binding = scene_binding(scene_path);
     // A word may name one of the scene's styles, registered just now
-    flint_render::stylize::check_style_specs(&style.specs).map_err(anyhow::Error::msg)?;
-    let (world, mut scene_file) = load_scene(scene_path, &registry)?;
+    flint_render::stylize::check_style_specs(&style.specs, binding.styles())
+        .map_err(anyhow::Error::msg)?;
+    // A failure names the file (#1044)
+    let (world, mut scene_file) =
+        load_scene(scene_path, &registry).with_context(|| load_failed(scene_path))?;
     // Living props' tables: checked, and the preset [wooze] names filled in (#686)
-    flint_procgen::settle_scene(&mut scene_file, std::path::Path::new(scene_path))?;
-
-    println!("Loaded scene: {}", scene_file.scene.name);
-    println!("Entities: {}", world.entity_count());
+    flint_procgen::settle_scene(&mut scene_file, std::path::Path::new(scene_path))
+        .with_context(|| load_failed(scene_path))?;
+    // Its entities and files are said in one line once its models are
+    // loaded too (`say_loaded`, at the end of `initialize`)
 
     // Parse the scene file as an editable document for structure-preserving saves
     let scene_doc = SceneDocument::from_file(scene_path).ok();
@@ -194,62 +237,23 @@ pub fn run(
             .map(|d| flint_render::look::resolve_scene(d, scene_path)),
         wooze: field_of(&scene_file),
         scene_camera: scene_file.camera.clone(),
+        environment: scene_file.environment.clone(),
     }));
 
-    let _watcher = if watch {
-        let state_clone = Arc::clone(&state);
-        let (tx, rx) = mpsc::channel();
-
-        let mut debouncer = new_debouncer(Duration::from_millis(500), tx)?;
-        let scene_file = Path::new(scene_path);
-        let scene_dir = scene_file.parent().unwrap_or_else(|| Path::new("."));
-
-        debouncer
-            .watcher()
-            .watch(scene_file, RecursiveMode::NonRecursive)?;
-        debouncer
-            .watcher()
-            .watch(scene_dir, RecursiveMode::Recursive)?;
-
-        for schemas_dir in &schema_dirs.dirs {
-            debouncer
-                .watcher()
-                .watch(schemas_dir, RecursiveMode::Recursive)?;
-        }
-
-        std::thread::spawn(move || {
-            for result in rx {
-                match result {
-                    Ok(_events) => {
-                        if let Ok(mut state) = state_clone.lock() {
-                            state.needs_reload = true;
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!("Watch error: {:?}", e);
-                    }
-                }
-            }
-        });
-
-        println!("Watching for changes in scene and related assets...");
-        Some(debouncer)
-    } else {
-        None
-    };
-
-    let event_loop = EventLoop::new()?;
-    event_loop.set_control_flow(ControlFlow::Poll);
+    let watch = watch.then(|| {
+        tracing::info!(target: "viewer", "Watching the scene and its files for changes");
+        SceneWatch::new(scene_path, &schema_dirs.dirs)
+    });
 
     let mut app = ViewerApp::new(state, inspector);
-    app.auto_orbit = auto_orbit;
+    app.orbit.auto_orbit = auto_orbit;
     app.style_specs = style.specs;
     app.style_time = style.time;
     app.motion_hold = style.motion_hold.map(|rate| rate.max(0.0));
     app.window_opts = window;
-    event_loop.run_app(&mut app)?;
-
-    Ok(())
+    app.scene_binding = Some(binding);
+    app.watch = watch;
+    Ok(app)
 }
 
 /// Run the viewer with a pre-built world (no file loading or hot-reload).
@@ -262,8 +266,6 @@ pub fn run_with_world(
 ) -> Result<()> {
     let constraint_registry = ConstraintRegistry::default();
 
-    println!("Entities: {}", world.entity_count());
-
     let state = Arc::new(Mutex::new(ViewerState {
         world,
         registry,
@@ -274,15 +276,11 @@ pub fn run_with_world(
         scene_post: None,
         wooze: None,
         scene_camera: None,
+        environment: None,
     }));
 
-    let event_loop = EventLoop::new()?;
-    event_loop.set_control_flow(ControlFlow::Poll);
-
-    let mut app = ViewerApp::new(state, inspector);
-    event_loop.run_app(&mut app)?;
-
-    Ok(())
+    let app = ViewerApp::new(state, inspector);
+    host::run(app, ViewerWindow::default().host_options())
 }
 
 /// Run the viewer in editor mode with a spline editor configuration.
@@ -294,14 +292,29 @@ pub fn run_editor(
     editor_config: SplineEditorConfig,
     window: ViewerWindow,
 ) -> Result<()> {
+    let options = window.host_options();
+    host::run(
+        track_editor(scene_path, watch, schemas, editor_config, window)?,
+        options,
+    )
+}
+
+/// The viewer in editor mode with a spline editor configuration, for
+/// [`crate::host`] (#712).
+pub fn track_editor(
+    scene_path: &str,
+    watch: bool,
+    schemas: &[String],
+    editor_config: SplineEditorConfig,
+    window: ViewerWindow,
+) -> Result<ViewerApp> {
     let (registry, constraint_registry, schema_dirs) = load_schemas(scene_path, schemas)?;
 
-    load_user_styles(scene_path);
-    let (world, mut scene_file) = load_scene(scene_path, &registry)?;
-    flint_procgen::settle_scene(&mut scene_file, std::path::Path::new(scene_path))?;
-
-    println!("Loaded scene: {}", scene_file.scene.name);
-    println!("Entities: {}", world.entity_count());
+    let binding = scene_binding(scene_path);
+    let (world, mut scene_file) =
+        load_scene(scene_path, &registry).with_context(|| load_failed(scene_path))?;
+    flint_procgen::settle_scene(&mut scene_file, std::path::Path::new(scene_path))
+        .with_context(|| load_failed(scene_path))?;
 
     let state = Arc::new(Mutex::new(ViewerState {
         world,
@@ -317,98 +330,66 @@ pub fn run_editor(
         wooze: field_of(&scene_file),
         // Editor mode overrides the camera with its birds-eye view; never seeded.
         scene_camera: None,
+        environment: scene_file.environment.clone(),
     }));
 
-    let _watcher = if watch {
-        let state_clone = Arc::clone(&state);
-        let (tx, rx) = mpsc::channel();
-
-        let mut debouncer = new_debouncer(Duration::from_millis(500), tx)?;
-        let scene_file_path = Path::new(scene_path);
-        let scene_dir = scene_file_path.parent().unwrap_or_else(|| Path::new("."));
-
-        debouncer
-            .watcher()
-            .watch(scene_file_path, RecursiveMode::NonRecursive)?;
-        debouncer
-            .watcher()
-            .watch(scene_dir, RecursiveMode::Recursive)?;
-
-        for schemas_dir in &schema_dirs.dirs {
-            debouncer
-                .watcher()
-                .watch(schemas_dir, RecursiveMode::Recursive)?;
-        }
-
-        std::thread::spawn(move || {
-            for result in rx {
-                match result {
-                    Ok(_events) => {
-                        if let Ok(mut state) = state_clone.lock() {
-                            state.needs_reload = true;
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!("Watch error: {:?}", e);
-                    }
-                }
-            }
-        });
-
-        println!("Watching for changes...");
-        Some(debouncer)
-    } else {
-        None
-    };
-
-    let event_loop = EventLoop::new()?;
-    event_loop.set_control_flow(ControlFlow::Poll);
+    let watch = watch.then(|| {
+        tracing::info!(target: "viewer", "Watching the scene and its files for changes");
+        SceneWatch::new(scene_path, &schema_dirs.dirs)
+    });
 
     let editor = SplineEditor::from_config(editor_config);
     let mut app = ViewerApp::new_editor(state, editor);
     app.window_opts = window;
-    event_loop.run_app(&mut app)?;
-
-    Ok(())
+    app.scene_binding = Some(binding);
+    app.watch = watch;
+    Ok(app)
 }
 
 /// The main viewer application
 pub struct ViewerApp {
     state: Arc<Mutex<ViewerState>>,
     window: Option<Arc<Window>>,
-    render_context: Option<RenderContext>,
+    /// The host's GPU (#712)
+    render_context: Option<Gpu>,
     scene_renderer: Option<SceneRenderer>,
     camera: Camera,
+    /// The host's orbit camera (#1153): the mouse, WASD/QE, the O
+    /// turntable and the view cube's snap, as in every other editor
+    orbit: OrbitCameraController,
+    /// Whether the last frame drew an orthographic view: a switch either
+    /// way starts the styles' history afresh
+    drawn_ortho: bool,
 
     // Input state
-    mouse_pressed: bool,
-    last_mouse_pos: Option<(f64, f64)>,
-    right_mouse_pressed: bool,
-    middle_mouse_pressed: bool,
+    /// Where the pointer is, for picking (entities, track points)
+    cursor: Option<(f64, f64)>,
+    /// Where a left press that may pick began; a release near it picks
+    click_from: Option<(f64, f64)>,
     modifiers: ModifiersState,
-    held_orbit_keys: std::collections::HashSet<KeyCode>,
 
     // egui state
     egui_ctx: egui::Context,
-    egui_winit: Option<egui_winit::State>,
-    egui_renderer: Option<egui_wgpu::Renderer>,
     show_inspector: bool,
 
     // Panel state
     scene_tree: SceneTree,
     entity_inspector: EntityInspector,
-    render_stats: RenderStats,
+    /// F2's frame history and graph, fed only while F2 is open (#1110)
+    frame_stats: FrameStats,
     show_stats: bool,
     view_gizmo: ViewGizmo,
     transform_gizmo: TransformGizmo,
 
-    // Camera snap animation
-    camera_snap_target: Option<(f32, f32)>,
+    /// The last frame's start, for `frame_dt`
     last_frame_time: Instant,
 
     // Constraint violations cache
     violation_count: usize,
     violation_messages: Vec<String>,
+
+    /// The scene's diagnostics, as `flint validate` lists them (#795)
+    diagnostics: DiagnosticsPanel,
 
     // Editor mode (None = standard viewer)
     editor: Option<SplineEditor>,
@@ -420,6 +401,10 @@ pub struct ViewerApp {
     dirty: bool,
     last_save_time: Option<Instant>,
     suppress_reload_until: Option<Instant>,
+    /// Until when the next reload is the one F4's Commit to scene caused
+    /// (#516): it leaves the post config on screen as it is, so tweaks
+    /// never written anywhere (bloom, fog, another style) survive it.
+    own_commit_until: Option<Instant>,
     /// Frames counted for the user style poll in `check_reload` (#275).
     user_style_polls: u32,
 
@@ -430,9 +415,12 @@ pub struct ViewerApp {
     // from the stored start transform to the current transform
     gizmo_drag_ended: bool,
 
-    // Dirty field tracking for structure-preserving saves
-    // Each entry is (entity_name, component, field)
-    dirty_fields: std::collections::HashSet<(String, String, String)>,
+    /// Every field edited since the file was read or saved, with the value
+    /// it had then (#679): `dirty` is whether the world differs from it
+    edits: FieldEdits,
+    /// Why the last save couldn't write some of those edits, shown in the
+    /// status bar while they're still unsaved
+    save_problems: Vec<String>,
 
     // Status message (e.g., "Saved!" in editor mode)
     status_message: Option<(String, Instant)>,
@@ -455,11 +443,6 @@ pub struct ViewerApp {
     // the egui Window can own a close button.
     render_panel: flint_debug_ui::RenderDebugPanel,
     render_panel_open: bool,
-
-    // Auto-orbit turntable (O toggles, [/] adjust speed, any manual orbit
-    // input cancels — same convention as the model/procgen previewers).
-    auto_orbit: bool,
-    auto_orbit_speed: f32,
 
     /// `--style name[:key=value,...]` words (#328), written over the
     /// config at load, at each hot reload and at the authored/default
@@ -489,10 +472,44 @@ pub struct ViewerApp {
     particle_speed: f32,
     particle_alive: usize,
     last_particle_tick: Instant,
-    /// The shading boil's clock (#214): beats, and seconds for the field's ramps.
-    boil_clock: flint_wooze::BoilClock,
-    boil_time: f64,
     last_boil_tick: Instant,
+    /// The shading boil's, shallow wooze's and woozy grass's clocks (#214,
+    /// #215, #252), on the scene's field, as the player's living subsystem
+    /// keeps them.
+    field_clocks: FieldClocks,
+    /// Seconds the last frame took, for styles whose history is a rate (#342).
+    frame_dt: f32,
+    /// The scene as the renderer binds it (#739): made when its user styles
+    /// were registered, bound at load and at each hot reload.
+    scene_binding: Option<SceneBinding>,
+    /// What `--watch` asks the host to watch
+    watch: Option<SceneWatch>,
+    /// How a load is counted and said (#1164)
+    load_summary: LoadSummary,
+}
+
+/// How the viewer says a scene came up (#1164). The viewer can't reach the
+/// player's log, so `flint edit` hands it the player's two calls
+/// (`flint_player::logging::begin_load_count` and `say_loaded`): one line
+/// for what the load read, how long it took and what went wrong on the way.
+/// The default says the entities alone.
+#[derive(Clone, Copy)]
+pub struct LoadSummary {
+    /// A load starts: count afresh (each hot reload)
+    pub begin: fn(),
+    /// The scene is up: say it, the scene as `flint_core::project::shown`
+    /// names its file
+    pub say: fn(scene: &str, entities: usize),
+}
+
+impl Default for LoadSummary {
+    fn default() -> Self {
+        fn begin() {}
+        fn say(scene: &str, entities: usize) {
+            tracing::info!(target: "load", scene = %scene, entities, "Loaded {scene}: {entities} entities");
+        }
+        Self { begin, say }
+    }
 }
 
 /// The style settings a scene authors: its `[post_process.styles]`, or
@@ -501,15 +518,120 @@ pub struct ViewerApp {
 fn scene_dir_of(scene_path: &str) -> &Path {
     Path::new(scene_path)
         .parent()
+        .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."))
 }
 
-/// Register the user-authored styles (`styles/*.shader.toml`, ADR 0112)
-/// the scene can see, before its `[post_process]` is read, so its tables
-/// for them aren't dropped as unknown (#275).
-fn load_user_styles(scene_path: &str) {
-    for message in flint_render::stylize::custom::load_dir(scene_dir_of(scene_path)) {
-        eprintln!("Warning: {message}");
+/// `--watch`: the scene file, its folder (recursively) and the schema
+/// folders, which the host watches (#1153). A batch that is only user
+/// styles' WGSL and descriptions reloads nothing (#429): the style's pass
+/// rebuilds its shader in place, and `check_reload`'s poll of the
+/// descriptions reloads the scene only when one changed.
+struct SceneWatch {
+    file: PathBuf,
+    folders: Vec<PathBuf>,
+    styles: StyleSources,
+}
+
+impl SceneWatch {
+    fn new(scene_path: &str, schema_dirs: &[PathBuf]) -> Self {
+        let scene_dir = scene_dir_of(scene_path);
+        let mut folders = vec![scene_dir.to_path_buf()];
+        folders.extend(schema_dirs.iter().cloned());
+        Self {
+            file: PathBuf::from(scene_path),
+            folders,
+            styles: StyleSources::for_scene_dir(scene_dir),
+        }
+    }
+
+    /// Whether a change to `path` reloads the scene: anything but a user
+    /// style's own source.
+    fn counts(&self, path: &Path) -> bool {
+        !self.styles.owns(path)
+    }
+}
+
+/// The renderer's share of the scene, at load and at each hot reload
+/// (#739), as the player and `flint render` take it: the scene bound (its
+/// project and folder, which glyph sets, palettes and papers are found
+/// from, #265, ADR 0114; nothing of a last load; its `[environment]`
+/// levers; its terrain, masked when styled, and its grass, a grass_ground's
+/// over a terrain's, #332), then its models. The viewer loaded no terrain
+/// and read no `[environment]` before.
+fn stage_scene(
+    renderer: &mut SceneRenderer,
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    state: &mut ViewerState,
+    binding: SceneBinding,
+    config: &ModelLoadConfig,
+) -> flint_render::BoundScene {
+    let binding = binding
+        .with_environment(state.environment.as_ref())
+        .with_archetypes(&state.registry);
+    let bound = renderer.bind_scene(device, queue, &state.world, &binding);
+    model_loader::load_models_from_world(&mut state.world, renderer, device, queue, config);
+    bound
+}
+
+/// The scene as the renderer binds it (#739), which registers the
+/// user-authored styles (`styles/*.shader.toml`, ADR 0112) the scene can
+/// see, before its `[post_process]` is read, so its tables for them aren't
+/// dropped as unknown (#275).
+fn scene_binding(scene_path: &str) -> SceneBinding {
+    let binding = SceneBinding::for_scene(Path::new(scene_path));
+    for message in binding.style_messages() {
+        tracing::warn!(target: "viewer", "{message}");
+    }
+    binding
+}
+
+/// How long after Commit to scene writes the file the reload is taken for
+/// its own (#516). The watcher reports a write after its half-second
+/// debounce; the window only stops a commit it missed from keeping the F4
+/// post over some later edit of the file.
+const OWN_COMMIT_RELOAD: Duration = Duration::from_secs(3);
+
+/// F4's Commit to scene just wrote the file through a document of its own
+/// (#1046): append each `[post_process]` key it changed to the change list,
+/// in a save's line shape, by comparing the file with the document the
+/// viewer holds, and hold that document anew, so a Ctrl+S before the
+/// watcher's reload doesn't write the old `[post_process]` back over it.
+fn log_commit(state: &mut ViewerState) {
+    let now_doc = match SceneDocument::from_file(&state.scene_path) {
+        Ok(doc) => doc,
+        Err(e) => {
+            tracing::warn!("Commit not logged: {e}");
+            return;
+        }
+    };
+    let before = state
+        .scene_doc
+        .as_ref()
+        .map(|d| d.to_string())
+        .unwrap_or_default();
+    let changes = crate::edits::post_process_changes(&before, &now_doc.to_string());
+    if !changes.is_empty() {
+        append_change_list(&state.scene_path, |scene, now| {
+            crate::edits::commit_log_lines(&changes, scene, now)
+        });
+    }
+    state.scene_doc = Some(now_doc);
+}
+
+/// Append lines to the project's change list, `.flint/viewer-edits.jsonl`
+/// (#679): `lines` is given the scene as the log names it and the time.
+fn append_change_list(scene_path: &str, lines: impl FnOnce(&str, u64) -> String) {
+    let path = crate::edits::edit_log_path(Path::new(scene_path));
+    #[allow(clippy::disallowed_methods)] // a wall-clock stamp for the log, native only
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let lines = lines(&crate::edits::scene_in_log(&path, scene_path), now);
+    if let Err(e) = crate::edits::append_log(&path, &lines) {
+        tracing::warn!("Couldn't append to {}: {e}", path.display());
     }
 }
 
@@ -519,9 +641,10 @@ fn with_flags(
     mut config: PostProcessConfig,
     specs: &[String],
     motion_hold: Option<f32>,
+    styles: &flint_render::stylize::StyleRegistry,
 ) -> PostProcessConfig {
-    for e in flint_render::stylize::apply_style_specs(&mut config, specs) {
-        eprintln!("Warning: {e}");
+    for e in flint_render::stylize::apply_style_specs(&mut config, specs, styles) {
+        tracing::warn!(target: "viewer", "{e}");
     }
     if let Some(rate) = motion_hold {
         config.motion_hold = rate;
@@ -543,14 +666,17 @@ fn with_look(
     match flint_render::look::resolve(&base, picked.as_deref(), scene_path) {
         Ok(out) => Some(out),
         Err(e) => {
-            eprintln!("look: {e}");
+            tracing::warn!(target: "viewer", "look: {e}");
             Some(flint_render::look::resolve_scene(&base, scene_path))
         }
     }
 }
 
-fn authored_styles(def: Option<&PostProcessDef>) -> flint_render::stylize::StyleSettings {
-    def.map(|d| post_process_config_from_def(d).styles)
+fn authored_styles(
+    def: Option<&PostProcessDef>,
+    styles: &flint_render::stylize::StyleRegistry,
+) -> flint_render::stylize::StyleSettings {
+    def.map(|d| post_process_config_from_def(d, styles).styles)
         .unwrap_or_default()
 }
 
@@ -575,35 +701,34 @@ impl ViewerApp {
             render_context: None,
             scene_renderer: None,
             camera: Camera::new(),
-            mouse_pressed: false,
-            last_mouse_pos: None,
-            right_mouse_pressed: false,
-            middle_mouse_pressed: false,
+            orbit: OrbitCameraController::new(),
+            drawn_ortho: false,
+            cursor: None,
+            click_from: None,
             modifiers: ModifiersState::empty(),
-            held_orbit_keys: std::collections::HashSet::new(),
             egui_ctx: egui::Context::default(),
-            egui_winit: None,
-            egui_renderer: None,
             show_inspector,
             scene_tree: SceneTree::new(),
             entity_inspector: EntityInspector::new(),
-            render_stats: RenderStats::new(),
+            frame_stats: FrameStats::new(),
             show_stats: false,
             view_gizmo: ViewGizmo::new(),
             transform_gizmo: TransformGizmo::new(),
-            camera_snap_target: None,
             last_frame_time: Instant::now(),
             violation_count: 0,
             violation_messages: Vec::new(),
+            diagnostics: DiagnosticsPanel::new(),
             editor: None,
             undo_stack: UndoStack::new(),
             dirty: false,
             last_save_time: None,
             suppress_reload_until: None,
+            own_commit_until: None,
             user_style_polls: 0,
             pending_edits: Vec::new(),
             gizmo_drag_ended: false,
-            dirty_fields: std::collections::HashSet::new(),
+            edits: FieldEdits::default(),
+            save_problems: Vec::new(),
             status_message: None,
             scene_post_enabled: true,
             picked_look: None,
@@ -612,8 +737,6 @@ impl ViewerApp {
             dof_focus_entity: None,
             render_panel: flint_debug_ui::RenderDebugPanel::new(false),
             render_panel_open: false,
-            auto_orbit: false,
-            auto_orbit_speed: 0.5,
             style_specs: Vec::new(),
             style_time: None,
             motion_hold: None,
@@ -625,73 +748,36 @@ impl ViewerApp {
             particle_speed: 1.0,
             particle_alive: 0,
             last_particle_tick: Instant::now(),
-            boil_clock: Default::default(),
-            boil_time: 0.0,
             last_boil_tick: Instant::now(),
+            field_clocks: Default::default(),
+            frame_dt: 1.0 / 60.0,
+            scene_binding: None,
+            watch: None,
+            load_summary: LoadSummary::default(),
         }
     }
 
+    /// Say each load's summary through `summary` (#1164): `flint edit`
+    /// hands over the player's, so the line is the one `flint play` says.
+    pub fn set_load_summary(&mut self, summary: LoadSummary) {
+        self.load_summary = summary;
+    }
+
+    /// The scene is up (a load or a hot reload): one `load` line
+    fn say_loaded(&self) {
+        let state = self.state.lock().unwrap();
+        let scene = flint_core::project::shown(Path::new(&state.scene_path));
+        (self.load_summary.say)(&scene, state.world.entity_count());
+    }
+
+    /// The track editor: the viewer with the inspector open and a spline
+    /// editor, whose left button picks and drags points, so the middle
+    /// button orbits.
     fn new_editor(state: Arc<Mutex<ViewerState>>, editor: SplineEditor) -> Self {
-        Self {
-            state,
-            window: None,
-            render_context: None,
-            scene_renderer: None,
-            camera: Camera::new(),
-            mouse_pressed: false,
-            last_mouse_pos: None,
-            right_mouse_pressed: false,
-            middle_mouse_pressed: false,
-            modifiers: ModifiersState::empty(),
-            held_orbit_keys: std::collections::HashSet::new(),
-            egui_ctx: egui::Context::default(),
-            egui_winit: None,
-            egui_renderer: None,
-            show_inspector: true,
-            scene_tree: SceneTree::new(),
-            entity_inspector: EntityInspector::new(),
-            render_stats: RenderStats::new(),
-            show_stats: false,
-            view_gizmo: ViewGizmo::new(),
-            transform_gizmo: TransformGizmo::new(),
-            camera_snap_target: None,
-            last_frame_time: Instant::now(),
-            violation_count: 0,
-            violation_messages: Vec::new(),
-            editor: Some(editor),
-            undo_stack: UndoStack::new(),
-            dirty: false,
-            last_save_time: None,
-            suppress_reload_until: None,
-            user_style_polls: 0,
-            pending_edits: Vec::new(),
-            gizmo_drag_ended: false,
-            dirty_fields: std::collections::HashSet::new(),
-            status_message: None,
-            scene_post_enabled: true,
-            picked_look: None,
-            default_post_config: None,
-            dof_follow: false,
-            dof_focus_entity: None,
-            render_panel: flint_debug_ui::RenderDebugPanel::new(false),
-            render_panel_open: false,
-            auto_orbit: false,
-            auto_orbit_speed: 0.5,
-            style_specs: Vec::new(),
-            style_time: None,
-            motion_hold: None,
-            motion_clock: Instant::now(),
-            window_opts: ViewerWindow::default(),
-            particles: flint_particles::ParticleSystem::new(),
-            show_particles: true,
-            particles_paused: false,
-            particle_speed: 1.0,
-            particle_alive: 0,
-            last_particle_tick: Instant::now(),
-            boil_clock: Default::default(),
-            boil_time: 0.0,
-            last_boil_tick: Instant::now(),
-        }
+        let mut app = Self::new(state, true);
+        app.editor = Some(editor);
+        app.orbit.orbit_button = MouseButton::Middle;
+        app
     }
 
     /// Seed the orbit camera from the scene's authored `[camera]` block so
@@ -726,31 +812,13 @@ impl ViewerApp {
         }
     }
 
-    fn initialize(&mut self, event_loop: &ActiveEventLoop) -> Result<()> {
-        let title = if self.editor.is_some() {
-            "Flint Track Editor"
-        } else {
-            "Flint Viewer"
-        };
-
-        let window_attrs = Window::default_attributes()
-            .with_title(title)
-            .with_inner_size(PhysicalSize::new(
-                self.window_opts.width.max(1),
-                self.window_opts.height.max(1),
-            ));
-
-        let window = Arc::new(
-            event_loop
-                .create_window(window_attrs)
-                .context("Failed to create viewer window")?,
-        );
-        self.window = Some(window.clone());
-
-        let render_context = pollster::block_on(RenderContext::new(window.clone()))
-            .context("Failed to initialize viewer render context")?;
-
-        self.camera.aspect = render_context.aspect_ratio();
+    /// The window's or the still's GPU is here (#712): the scene staged on
+    /// it, the authored post-processing applied.
+    fn initialize(&mut self, cx: InitCx) -> Result<()> {
+        let render_context = cx.gpu.clone();
+        self.window = cx.window;
+        self.egui_ctx = cx.egui.clone();
+        self.camera.aspect = render_context.aspect();
 
         // Standard viewer: open on the scene's authored [camera] framing
         if self.editor.is_none() {
@@ -785,50 +853,23 @@ impl ViewerApp {
 
         self.camera.update_orbit();
 
-        // Initialize egui
-        let egui_winit = egui_winit::State::new(
-            self.egui_ctx.clone(),
-            egui::ViewportId::ROOT,
-            &window,
-            Some(window.scale_factor() as f32),
-            None,
-            None,
-        );
-
-        let egui_renderer = egui_wgpu::Renderer::new(
-            &render_context.device,
-            render_context.config.format,
-            None,
-            1,
-            false,
-        );
-
-        let mut scene_renderer = SceneRenderer::new(
-            &render_context,
-            RendererConfig {
-                show_grid: self.window_opts.grid,
-                ..Default::default()
-            },
-        );
+        let mut scene_renderer = render_context.scene_renderer(RendererConfig {
+            show_grid: self.window_opts.grid,
+            ..Default::default()
+        });
 
         // Load models and update meshes from world
         {
             let mut state = self.state.lock().unwrap();
             let config = ModelLoadConfig::from_scene_path(&state.scene_path);
-            // Glyph sets, palettes and papers (ASCII's `font`, #265) are
-            // found from the scene's project and folder (ADR 0114)
-            scene_renderer.set_asset_scope(flint_core::project::AssetScope::new(
-                config.project.clone(),
-                config.scene_dir.clone(),
-            ));
-            model_loader::load_models_from_world(
-                &mut state.world,
+            stage_scene(
                 &mut scene_renderer,
                 &render_context.device,
                 &render_context.queue,
+                &mut state,
+                self.bound_scene(&config),
                 &config,
             );
-            scene_renderer.update_from_world(&state.world, &render_context.device);
 
             // Particles (ADR 0068): effects next to the scene, then textures.
             let project = &config.project;
@@ -846,17 +887,6 @@ impl ViewerApp {
                 project,
                 scene_dir_of(&state.scene_path),
             );
-
-            // Grass on a mesh ground (ADR 0089), as the player and
-            // `flint render` load it (#332)
-            flint_render::load_grass_ground_in(
-                &state.world,
-                project,
-                scene_dir_of(&state.scene_path),
-                &render_context.device,
-                &render_context.queue,
-                &mut scene_renderer,
-            );
         }
 
         // Apply the scene's authored [post_process] block (DoF, vignette,
@@ -867,31 +897,38 @@ impl ViewerApp {
             let state = self.state.lock().unwrap();
             if let Some(def) = &state.scene_post {
                 scene_renderer.set_post_process_config(with_flags(
-                    post_process_config_from_def(def),
+                    post_process_config_from_def(def, scene_renderer.styles()),
                     &self.style_specs,
                     self.motion_hold,
+                    scene_renderer.styles(),
                 ));
-                println!("Scene [post_process] applied (F4 > Authored post toggles scene/default)");
+                tracing::info!(
+                    target: "viewer",
+                    "Scene [post_process] applied (F4 > Authored post toggles scene/default)"
+                );
             } else if !self.style_specs.is_empty() || self.motion_hold.is_some() {
                 let config = scene_renderer.post_process_config().clone();
                 scene_renderer.set_post_process_config(with_flags(
                     config,
                     &self.style_specs,
                     self.motion_hold,
+                    scene_renderer.styles(),
                 ));
             }
             if !self.style_specs.is_empty() {
-                println!("--style applied: {}", self.style_specs.join(" "));
+                tracing::info!(target: "viewer", "--style applied: {}", self.style_specs.join(" "));
             }
             if let Some(rate) = self.motion_hold {
-                println!("--motion-hold applied: the whole frame drawn {rate} times a second");
-            }
-            if let Some(t) = self.style_time {
-                scene_renderer.ocean_time = t as f64;
+                tracing::info!(
+                    target: "viewer",
+                    "--motion-hold applied: the whole frame drawn {rate} times a second"
+                );
             }
             // The F4 style editor marks edits against these (#268)
-            self.render_panel
-                .set_authored_styles(Some(authored_styles(state.scene_post.as_ref())));
+            self.render_panel.set_authored_styles(Some(authored_styles(
+                state.scene_post.as_ref(),
+                scene_renderer.styles(),
+            )));
             // ...and offers the scene's own palettes and glyph sets (#322)
             self.render_panel
                 .set_scene_dir(Some(scene_dir_of(&state.scene_path).to_path_buf()));
@@ -901,7 +938,7 @@ impl ViewerApp {
                 state.scene_post.as_ref().and_then(|d| d.look.as_deref()),
             );
             if let Some(look) = state.scene_post.as_ref().and_then(|d| d.look.as_deref()) {
-                println!("Scene look: {look} (F4 -> Look switches it)");
+                tracing::info!(target: "viewer", "Scene look: {look} (F4 -> Look switches it)");
             }
             // ...and writes a style back into the file (#364)
             self.render_panel.set_scene_file(
@@ -912,8 +949,9 @@ impl ViewerApp {
             );
         }
 
-        // Run initial constraint evaluation
+        // Run initial constraint evaluation, and say what is wrong with the scene
         self.update_constraints();
+        self.update_diagnostics();
 
         // Build initial scene tree
         {
@@ -923,10 +961,21 @@ impl ViewerApp {
 
         self.render_context = Some(render_context);
         self.scene_renderer = Some(scene_renderer);
-        self.egui_winit = Some(egui_winit);
-        self.egui_renderer = Some(egui_renderer);
+
+        // Its models, textures and particles are in: the load's one line
+        self.say_loaded();
 
         Ok(())
+    }
+
+    /// The diagnostics panel for the scene as the file now stands. A viewer
+    /// given a world and no file (`run_with_world`) has nothing to diagnose.
+    fn update_diagnostics(&mut self) {
+        let state = self.state.lock().unwrap();
+        let scene = Path::new(&state.scene_path);
+        if flint_core::vfs::is_file(scene) {
+            self.diagnostics.refresh(scene, &state.registry);
+        }
     }
 
     fn update_constraints(&mut self) {
@@ -936,34 +985,15 @@ impl ViewerApp {
         self.violation_count = self.violation_messages.len();
     }
 
-    fn render(&mut self) {
-        if self.render_context.is_none() || self.scene_renderer.is_none() || self.window.is_none() {
+    /// The frame before it is drawn: the camera's snap, the panels' last
+    /// edits, the boil, the particles, then the frame's inputs (#739).
+    fn frame_update(&mut self) {
+        if self.render_context.is_none() || self.scene_renderer.is_none() {
             return;
         }
 
         // Animate camera snap transitions
         self.animate_camera();
-
-        let output = match self
-            .render_context
-            .as_ref()
-            .unwrap()
-            .surface
-            .get_current_texture()
-        {
-            Ok(output) => output,
-            Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => return,
-            Err(e) => {
-                tracing::warn!("Surface error: {:?}", e);
-                return;
-            }
-        };
-
-        let view = output
-            .texture
-            .create_view(&wgpu::TextureViewDescriptor::default());
-
-        self.render_stats.record_frame();
 
         // Track the last selected entity so DoF follow keeps its target
         // after a deselect, and drive the focus plane while F12 is on.
@@ -984,23 +1014,14 @@ impl ViewerApp {
         // Particles: step, pack, upload (ADR 0068)
         self.tick_particles();
 
-        // Motion on twos: the clock held drawings turn on (#871)
-        self.tick_motion_hold();
+        // The frame's inputs and the world (#739)
+        self.prepare_frame();
+    }
 
-        // Render the 3D scene
-        {
-            let context = self.render_context.as_ref().unwrap();
-            let renderer = self.scene_renderer.as_mut().unwrap();
-            renderer.set_selected_entity(self.scene_tree.selected_entity());
-            // Styles sized in points (ASCII cells, #265) follow the window
-            if let Some(window) = &self.window {
-                renderer.pixels_per_point = window.scale_factor() as f32;
-            }
-            renderer.render(context, &self.camera, &view).ok();
-        }
-
-        // Always render egui overlay (gizmo is always visible, panels are conditional)
-        let (gizmo_action, menu_actions) = self.render_egui(&view);
+    /// The panels over the frame (the gizmo is always drawn), then what
+    /// they asked for.
+    fn frame_ui(&mut self, ui: &mut egui::Ui) {
+        let (gizmo_action, menu_actions) = self.render_egui(ui);
 
         // Rendering & Effects menu actions that need &mut self (deferred out
         // of the egui closure's disjoint field borrows)
@@ -1026,19 +1047,15 @@ impl ViewerApp {
         // Process gizmo interaction
         if let Some(action) = gizmo_action {
             match action {
+                // The turn eases in, but the projection switches at once
                 GizmoAction::SnapToView { yaw, pitch } => {
-                    self.camera_snap_target = Some((yaw, pitch));
-                    self.camera.orthographic = true;
+                    self.orbit.snap_to(&mut self.camera, yaw, pitch);
                 }
                 GizmoAction::OrbitDelta { dyaw, dpitch } => {
-                    self.auto_orbit = false;
-                    self.camera.orbit_horizontal(dyaw);
-                    self.camera.orbit_vertical(dpitch);
-                    self.camera_snap_target = None;
-                    self.camera.orthographic = false;
+                    self.orbit.orbit_by(&mut self.camera, dyaw, dpitch);
                 }
                 GizmoAction::SwitchToPerspective => {
-                    self.camera.orthographic = false;
+                    self.orbit.perspective(&mut self.camera);
                 }
             }
         }
@@ -1051,40 +1068,70 @@ impl ViewerApp {
             self.gizmo_drag_ended = false;
             self.finalize_gizmo_undo();
         }
-
-        output.present();
+        // A gizmo drag's frames edit the world as it moves
+        self.refresh_dirty();
     }
 
-    /// Stamp the hold's clock (#871), and while anything is drawn on ticks
-    /// re-read the world every frame. The viewer otherwise re-reads it only
-    /// on an edit, so a held entity dragged with the gizmo would be left
-    /// drawn where the last tick of the drag caught it, not where it was
-    /// dropped. A scene with no hold re-reads nothing more than it did.
-    fn tick_motion_hold(&mut self) {
+    /// The scene as the renderer binds it: the one made when its user styles
+    /// were registered, or, for a world with no scene file, one for the
+    /// models' project and folder.
+    fn bound_scene(&self, config: &ModelLoadConfig) -> SceneBinding {
+        self.scene_binding.clone().unwrap_or_else(|| {
+            SceneBinding::new(flint_core::project::AssetScope::new(
+                config.project.clone(),
+                config.scene_dir.clone(),
+            ))
+        })
+    }
+
+    /// Hand the renderer this frame's inputs and the world (#739), as the
+    /// player does once a frame: the clock motion on twos ticks by (#871),
+    /// the viewer's own wall clock, which the grass's wind and the shallow
+    /// wooze also run on; the post time held where it stands (0, or
+    /// `--style-time`); the boil, shallow wooze and woozy grass from the
+    /// field's clock; the particles; the window's scale. The world is read
+    /// every frame, so an edit, a drag or a held entity's tick shows on the
+    /// next frame without asking.
+    fn prepare_frame(&mut self) {
         let (Some(context), Some(renderer)) = (&self.render_context, &mut self.scene_renderer)
         else {
             return;
         };
-        renderer.set_motion_time(self.motion_clock.elapsed().as_secs_f64());
-        if renderer.motion_held() {
-            let state = self.state.lock().unwrap();
-            renderer.update_from_world(&state.world, &context.device);
-        }
+        renderer.set_selected_entity(self.scene_tree.selected_entity());
+        let state = self.state.lock().unwrap();
+        let woozy = state.wooze.is_some();
+        let inputs = FrameInputs {
+            time: self.motion_clock.elapsed().as_secs_f64(),
+            // History styles decay by the frame's time (#342)
+            dt: self.frame_dt,
+            look_time: Some(self.style_time.map_or(0.0, f64::from)),
+            grass_time: self.field_clocks.grass_time(),
+            grass_wooze: self.field_clocks.grass_comb(),
+            shallow_wooze: if woozy {
+                self.field_clocks.shallow_draws()
+            } else {
+                &[]
+            },
+            boil: self.field_clocks.boil(),
+            // Styles sized in points (ASCII cells, #265) follow the window
+            pixels_per_point: self
+                .window
+                .as_ref()
+                .map_or(1.0, |w| w.scale_factor() as f32),
+            particles: self.show_particles.then_some(&self.particles.sync),
+            ..Default::default()
+        };
+        renderer.prepare(&context.device, &context.queue, &state.world, &inputs);
     }
 
-    /// Advance the particle simulation by real time (scaled), then pack and
-    /// upload. Runs every frame so inspector edits show live; paused keeps
-    /// the last frame on screen.
+    /// Advance the particle simulation by real time (scaled), then pack it
+    /// for the frame's inputs. Runs every frame so inspector edits show
+    /// live; paused keeps the last frame on screen.
     fn tick_particles(&mut self) {
         let now = Instant::now();
         let dt = (now - self.last_particle_tick).as_secs_f32().min(0.1);
         self.last_particle_tick = now;
-        let (Some(context), Some(renderer)) = (&self.render_context, &mut self.scene_renderer)
-        else {
-            return;
-        };
-        if !self.show_particles {
-            renderer.update_particles(&context.device, &context.queue, &[]);
+        if self.scene_renderer.is_none() || !self.show_particles {
             return;
         }
         {
@@ -1098,7 +1145,6 @@ impl ViewerApp {
         }
         self.particle_alive = self.particles.sync.total_alive();
         self.particles.pack(Some(self.camera.position_array()));
-        renderer.update_particles_from(&context.device, &context.queue, &self.particles.sync);
     }
 
     /// View depth of the DoF focus entity along the camera forward axis, as
@@ -1157,42 +1203,44 @@ impl ViewerApp {
         renderer.set_post_process_config(config);
     }
 
-    /// Advance the shading boil and tell the renderer which drawing it's on.
-    /// The post passes' resources (styles, FXAA) follow the config by
-    /// themselves: the renderer builds them each frame (#262, #297), however
-    /// the viewer set it (load, scene/default toggle, hot reload, F4).
+    /// Advance the field's clocks: the shading boil's drawing (#214), and
+    /// shallow wooze's and woozy grass's (#215, #252), which the viewer
+    /// skipped before #739. The post passes' resources (styles, FXAA) follow
+    /// the config by themselves: the renderer builds them each frame (#262,
+    /// #297), however the viewer set it (load, scene/default toggle, hot
+    /// reload, F4).
     fn tick_boil(&mut self) {
         let now = Instant::now();
         let dt = (now - self.last_boil_tick).as_secs_f64().min(0.1);
         self.last_boil_tick = now;
-        let Some(renderer) = &mut self.scene_renderer else {
+        let Some(renderer) = &self.scene_renderer else {
             return;
         };
 
         let eye = self.camera.position_array();
         let state = self.state.lock().unwrap();
-        let boil = match &state.wooze {
-            Some(field) => {
-                self.boil_time += dt;
-                let sample = field.sample(eye, self.boil_time);
-                self.boil_clock.tick(dt, &sample);
-                self.boil_clock
-                    .frame(&sample, renderer.post_process_config().boil_on)
-            }
-            None => Default::default(),
-        };
-        renderer.set_boil(boil);
+        self.field_clocks.tick(
+            state.wooze.as_ref(),
+            &state.world,
+            eye,
+            renderer.grass_config().and_then(|c| c.wooze_comb()),
+            renderer.post_process_config().boil_on,
+            dt,
+        );
     }
 
     /// Restore DoF params to the active base config (authored scene post if
     /// enabled, else the viewer default) when F12 follow is switched off.
     fn restore_base_dof(&mut self) {
         let scene_post = self.state.lock().unwrap().scene_post.clone();
+        let Some(renderer) = self.scene_renderer.as_mut() else {
+            return;
+        };
         let base = match (&scene_post, self.scene_post_enabled) {
-            (Some(def), true) => Some(post_process_config_from_def(def)),
+            (Some(def), true) => Some(post_process_config_from_def(def, renderer.styles())),
             _ => self.default_post_config.clone(),
         };
-        let (Some(base), Some(renderer)) = (base, self.scene_renderer.as_mut()) else {
+        let Some(base) = base else {
             return;
         };
         let mut config = renderer.post_process_config().clone();
@@ -1211,15 +1259,18 @@ impl ViewerApp {
         };
         let scene_post = self.state.lock().unwrap().scene_post.clone();
         match scene_post {
-            None => println!("Scene has no [post_process] block — nothing to toggle"),
+            None => {
+                tracing::info!(target: "viewer", "Scene has no [post_process] block — nothing to toggle")
+            }
             Some(def) if !self.scene_post_enabled => {
                 renderer.set_post_process_config(with_flags(
-                    post_process_config_from_def(&def),
+                    post_process_config_from_def(&def, renderer.styles()),
                     &self.style_specs,
                     self.motion_hold,
+                    renderer.styles(),
                 ));
                 self.scene_post_enabled = true;
-                println!("Scene post-process: ON (authored)");
+                tracing::info!(target: "viewer", "Scene post-process: ON (authored)");
             }
             Some(_) => {
                 if let Some(default) = &self.default_post_config {
@@ -1227,10 +1278,11 @@ impl ViewerApp {
                         default.clone(),
                         &self.style_specs,
                         self.motion_hold,
+                        renderer.styles(),
                     ));
                 }
                 self.scene_post_enabled = false;
-                println!("Scene post-process: OFF (viewer default)");
+                tracing::info!(target: "viewer", "Scene post-process: OFF (viewer default)");
             }
         }
     }
@@ -1249,15 +1301,18 @@ impl ViewerApp {
                 self.render_panel.pp.dof_strength = 0.5;
             }
             match self.dof_focus_entity {
-                Some(_) => println!(
+                Some(_) => tracing::info!(
+                    target: "viewer",
                     "DoF follow: ON — focus tracks the last selected entity \
                      (tune strength/range in the Rendering & Effects menu)"
                 ),
-                None => println!("DoF follow: ON — select an entity to set the focus target"),
+                None => {
+                    tracing::info!(target: "viewer", "DoF follow: ON — select an entity to set the focus target")
+                }
             }
         } else {
             self.restore_base_dof();
-            println!("DoF follow: OFF (base post-process DoF restored)");
+            tracing::info!(target: "viewer", "DoF follow: OFF (base post-process DoF restored)");
         }
     }
 
@@ -1295,20 +1350,29 @@ impl ViewerApp {
                 }) {
                     Some(Ok(def)) => {
                         renderer.set_post_process_config(with_flags(
-                            post_process_config_from_def(&def),
+                            post_process_config_from_def(&def, renderer.styles()),
                             &self.style_specs,
                             self.motion_hold,
+                            renderer.styles(),
                         ));
                         renderer.ensure_style_resources(&context.device);
                         renderer.ensure_fxaa_resources(&context.device);
-                        rp.set_authored_styles(Some(authored_styles(Some(&def))));
-                        println!("Look: {}", rp.look.as_deref().unwrap_or("none"));
+                        rp.set_authored_styles(Some(authored_styles(
+                            Some(&def),
+                            renderer.styles(),
+                        )));
+                        tracing::info!(target: "viewer", "Look: {}", rp.look.as_deref().unwrap_or("none"));
                         state.scene_post = Some(def);
                         self.scene_post_enabled = true;
                     }
-                    Some(Err(e)) => eprintln!("look: {e}"),
+                    Some(Err(e)) => tracing::warn!(target: "viewer", "look: {e}"),
                     None => {}
                 }
+            }
+            if flags.styles_committed {
+                // The watcher is about to reload the file just written
+                self.own_commit_until = Some(Instant::now() + OWN_COMMIT_RELOAD);
+                log_commit(&mut self.state.lock().unwrap());
             }
             if flags.pp_changed {
                 renderer.set_post_process_config(rp.pp.clone());
@@ -1335,8 +1399,6 @@ impl ViewerApp {
             }
             if flags.mode_changed {
                 renderer.set_debug_mode(rp.debug_mode);
-                let state = self.state.lock().unwrap();
-                renderer.update_from_world(&state.world, &context.device);
             }
             if flags.fov_changed {
                 self.camera.fov = rp.fov_deg;
@@ -1355,93 +1417,41 @@ impl ViewerApp {
         rp.set_style_ids(renderer.style_ids());
     }
 
+    /// The frame's dt, and while the host's turntable turns, the orbit
+    /// centre eased onto the selected entity, so the thing picked stays
+    /// framed instead of drifting out.
     fn animate_camera(&mut self) {
         let now = Instant::now();
         let dt = (now - self.last_frame_time).as_secs_f32().min(0.1);
         self.last_frame_time = now;
         // ASCII's smoothing is per 60 Hz frame of this (#342)
-        if let Some(renderer) = self.scene_renderer.as_mut() {
-            renderer.style_dt = dt;
-        }
+        self.frame_dt = dt;
 
-        // Keyboard orbit: WASD to orbit, Q/E to zoom
-        {
-            let speed = 2.0f32;
-            let zoom_speed = 2.0f32;
-            let mut yaw_delta = 0.0f32;
-            let mut pitch_delta = 0.0f32;
-            let mut zoom_factor = 1.0f32;
-
-            // Auto-orbit turntable: continuous yaw until manual orbit input.
-            // While it runs, the orbit centre eases onto the selected entity
-            // so the thing you picked stays framed instead of drifting out.
-            if self.auto_orbit {
-                yaw_delta += self.auto_orbit_speed * dt;
-                if let Some(id) = self.scene_tree.selected_entity() {
-                    let focus = self
-                        .state
-                        .lock()
-                        .ok()
-                        .and_then(|st| st.world.get_world_position(id));
-                    if let Some(p) = focus {
-                        let t = 1.0 - (-6.0 * dt).exp();
-                        self.camera.target.x = lerp(self.camera.target.x, p.x, t);
-                        self.camera.target.y = lerp(self.camera.target.y, p.y, t);
-                        self.camera.target.z = lerp(self.camera.target.z, p.z, t);
-                        self.camera.update_orbit();
-                    }
+        if self.orbit.auto_orbit {
+            if let Some(id) = self.scene_tree.selected_entity() {
+                let focus = self
+                    .state
+                    .lock()
+                    .ok()
+                    .and_then(|st| st.world.get_world_position(id));
+                if let Some(p) = focus {
+                    let t = 1.0 - (-6.0 * dt).exp();
+                    self.camera.target.x = lerp(self.camera.target.x, p.x, t);
+                    self.camera.target.y = lerp(self.camera.target.y, p.y, t);
+                    self.camera.target.z = lerp(self.camera.target.z, p.z, t);
+                    self.camera.update_orbit();
                 }
             }
-
-            if self.held_orbit_keys.contains(&KeyCode::KeyA) {
-                yaw_delta += speed * dt;
-            }
-            if self.held_orbit_keys.contains(&KeyCode::KeyD) {
-                yaw_delta -= speed * dt;
-            }
-            if self.held_orbit_keys.contains(&KeyCode::KeyW) {
-                pitch_delta += speed * dt;
-            }
-            if self.held_orbit_keys.contains(&KeyCode::KeyS) {
-                pitch_delta -= speed * dt;
-            }
-            if self.held_orbit_keys.contains(&KeyCode::KeyQ) {
-                zoom_factor *= 1.0 + zoom_speed * dt;
-            }
-            if self.held_orbit_keys.contains(&KeyCode::KeyE) {
-                zoom_factor *= 1.0 - zoom_speed * dt;
-            }
-
-            if yaw_delta != 0.0 || pitch_delta != 0.0 || zoom_factor != 1.0 {
-                self.camera.yaw += yaw_delta;
-                self.camera.pitch = (self.camera.pitch + pitch_delta).clamp(-1.4, 1.4);
-                self.camera.distance = (self.camera.distance * zoom_factor).max(0.1);
-                self.camera.update_orbit();
-                self.camera_snap_target = None;
-            }
         }
 
-        if let Some((target_yaw, target_pitch)) = self.camera_snap_target {
-            let t = 1.0 - (-12.0 * dt).exp();
-            self.camera.yaw = lerp_angle(self.camera.yaw, target_yaw, t);
-            self.camera.pitch = lerp(self.camera.pitch, target_pitch, t);
-            self.camera.update_orbit();
-
-            let remaining = shortest_angle_diff(self.camera.yaw, target_yaw).abs()
-                + (self.camera.pitch - target_pitch).abs();
-            if remaining < 0.002 {
-                self.camera.yaw = target_yaw;
-                self.camera.pitch = target_pitch;
-                self.camera.update_orbit();
-                self.camera_snap_target = None;
-            }
+        // A switch of projection (the view cube's snap, an orbit off it)
+        if self.camera.orthographic != self.drawn_ortho {
+            self.drawn_ortho = self.camera.orthographic;
+            self.reset_style_history();
         }
     }
 
-    fn render_egui(
-        &mut self,
-        target_view: &wgpu::TextureView,
-    ) -> (Option<GizmoAction>, RenderMenuActions) {
+    fn render_egui(&mut self, ui: &mut egui::Ui) -> (Option<GizmoAction>, RenderMenuActions) {
         // DoF follow readout for the Rendering & Effects menu: computed up
         // front — it borrows all of self, which must end before the field
         // borrows below.
@@ -1478,31 +1488,16 @@ impl ViewerApp {
                 .collect()
         };
 
-        // Extract references to disjoint fields to satisfy the borrow checker
-        let window = match &self.window {
-            Some(w) => w.clone(),
-            None => return (None, RenderMenuActions::default()),
-        };
-        let context = match &self.render_context {
-            Some(c) => c,
-            None => return (None, RenderMenuActions::default()),
-        };
-        let egui_winit = match &mut self.egui_winit {
-            Some(e) => e,
-            None => return (None, RenderMenuActions::default()),
-        };
-
-        let raw_input = egui_winit.take_egui_input(&window);
-
         // Snapshot camera state for gizmo (avoids holding &self.camera across the closure)
         let cam_view = CameraView::from_camera(&self.camera);
 
         // Build the UI — we need to collect data for the closure without borrowing self
         let scene_tree = &mut self.scene_tree;
         let entity_inspector = &mut self.entity_inspector;
-        let render_stats = &self.render_stats;
+        let frame_stats = &mut self.frame_stats;
         let violation_count = self.violation_count;
         let violation_messages = &self.violation_messages;
+        let diagnostics = &self.diagnostics;
         let state = &self.state;
         let view_gizmo = &mut self.view_gizmo;
         let transform_gizmo = &mut self.transform_gizmo;
@@ -1510,6 +1505,7 @@ impl ViewerApp {
         let editor = &mut self.editor;
         let camera = &self.camera;
         let dirty = self.dirty;
+        let save_problems = &self.save_problems;
         let undo_stack = &self.undo_stack;
         let status_message = &self.status_message;
         let render_panel = &mut self.render_panel;
@@ -1519,10 +1515,9 @@ impl ViewerApp {
         let overlay_stats: Option<flint_render::RenderStats> = if self.show_stats {
             self.scene_renderer.as_ref().map(|r| {
                 let mut s = r.collect_stats();
-                s.fps = render_stats.fps();
-                s.frame_time_ms = if s.fps > 0.0 { 1000.0 / s.fps } else { 0.0 };
+                (s.fps, s.frame_time_ms) = frame_stats.fps();
                 if let Some(ctx) = &self.render_context {
-                    s.resolution = [ctx.config.width, ctx.config.height];
+                    s.resolution = [ctx.width, ctx.height];
                 }
                 s
             })
@@ -1530,34 +1525,47 @@ impl ViewerApp {
             None
         };
 
-        let mut gizmo_action = None;
+        let gizmo_action;
         let mut menu_actions = RenderMenuActions::default();
         let mut panel_actions: Vec<SplinePanelAction> = Vec::new();
         let mut inspector_edits: Vec<EditAction> = Vec::new();
         let mut gizmo_edits: Vec<EditAction> = Vec::new();
         let mut gizmo_drag_just_ended = false;
 
-        // User styles that don't compile (#275), and built-in shaders read
-        // from FLINT_STYLE_SHADER_DIR that don't (#418), shown until they do
-        let mut style_errors = flint_render::stylize::custom::errors();
+        // User styles that don't compile (#275) or don't load (#425), and
+        // built-in shaders read from FLINT_STYLE_SHADER_DIR that don't
+        // compile (#418), shown until they do
+        let styles = self
+            .scene_renderer
+            .as_ref()
+            .map(|r| r.styles().clone())
+            .unwrap_or_default();
+        let mut style_errors = styles.errors();
         style_errors.extend(flint_render::stylize::dev_shader::errors());
 
-        let full_output = self.egui_ctx.run(raw_input, |ctx| {
-            flint_debug_ui::paint_style_errors(ctx, &style_errors, 0.0);
+        {
+            let ctx = &ui.ctx().clone();
+            let errors = flint_debug_ui::paint_style_errors(ctx, &style_errors, &styles, 0.0);
+            // What a style's cap left out since the scene loaded (#1246)
+            flint_debug_ui::paint_style_drops(
+                ctx,
+                &flint_render::stylize::variant_table::dropped(),
+                errors,
+            );
             if show_panels {
                 // Left side panel: scene tree
-                egui::SidePanel::left("scene_tree_panel")
-                    .default_width(220.0)
+                egui::Panel::left("scene_tree_panel")
+                    .default_size(220.0)
                     .resizable(true)
-                    .show(ctx, |ui| {
+                    .show(ui, |ui| {
                         scene_tree.ui(ui);
                     });
 
                 // Right side panel: spline editor (in editor mode) or entity inspector
-                egui::SidePanel::right("inspector_panel")
-                    .default_width(300.0)
+                egui::Panel::right("inspector_panel")
+                    .default_size(300.0)
                     .resizable(true)
-                    .show(ctx, |ui| {
+                    .show(ui, |ui| {
                         if let Some(ed) = editor.as_mut() {
                             panel_actions =
                                 crate::panels::spline_panel::spline_editor_panel(ui, ed);
@@ -1579,12 +1587,15 @@ impl ViewerApp {
                         }
                     });
 
-                // Bottom panel: stats + constraint violations + mode indicator + undo info
-                egui::TopBottomPanel::bottom("status_panel")
-                    .default_height(100.0)
+                // Bottom panel: the scene's diagnostics + constraint
+                // violations + mode indicator + undo info
+                egui::Panel::bottom("status_panel")
+                    .default_size(150.0)
                     .resizable(true)
-                    .show(ctx, |ui| {
+                    .show(ui, |ui| {
                         ui.horizontal(|ui| {
+                            diagnostics.summary_ui(ui);
+                            ui.separator();
                             if violation_count == 0 {
                                 ui.colored_label(
                                     egui::Color32::from_rgb(100, 200, 100),
@@ -1602,6 +1613,20 @@ impl ViewerApp {
                             // Dirty indicator
                             if dirty {
                                 ui.colored_label(egui::Color32::from_rgb(255, 200, 80), "Modified");
+                            }
+                            // Edits the last save couldn't write (#679): shown
+                            // until they're saved or put back
+                            if let Some(first) = save_problems.first() {
+                                ui.separator();
+                                let more = match save_problems.len() {
+                                    1 => String::new(),
+                                    n => format!(" (+{} more)", n - 1),
+                                };
+                                ui.colored_label(
+                                    egui::Color32::from_rgb(255, 100, 100),
+                                    format!("Not saved: {first}{more}"),
+                                )
+                                .on_hover_text(save_problems.join(", "));
                             }
 
                             // Gizmo mode indicator (non-editor mode)
@@ -1641,6 +1666,14 @@ impl ViewerApp {
                                 }
                             }
                         });
+
+                        if !diagnostics.diagnostics().is_empty() {
+                            ui.separator();
+                            if let Some(name) = diagnostics.ui(ui, 110.0) {
+                                let id = state.lock().unwrap().world.get_id(&name);
+                                scene_tree.select(id);
+                            }
+                        }
 
                         if !violation_messages.is_empty() {
                             ui.separator();
@@ -1779,8 +1812,8 @@ impl ViewerApp {
                         .unwrap_or(pos);
                     drop(st); // Release lock before gizmo draw (it reads ctx.input)
 
-                    let render_rect = ctx.screen_rect();
-                    let clip_rect = ctx.available_rect();
+                    let render_rect = ctx.content_rect();
+                    let clip_rect = ui.available_rect_before_wrap();
 
                     if let Some(delta) = transform_gizmo.draw(
                         ctx,
@@ -1806,27 +1839,16 @@ impl ViewerApp {
             }
 
             // View orientation gizmo (always visible)
-            gizmo_action = view_gizmo.draw(ctx, &cam_view);
+            gizmo_action = view_gizmo.draw(ctx, &cam_view, ui.available_rect_before_wrap());
 
-            // Draw spline overlay on the central area (editor mode)
-            if let Some(ed) = editor.as_ref() {
-                let screen_rect = ctx.screen_rect();
-                let painter = ctx.layer_painter(egui::LayerId::new(
-                    egui::Order::Foreground,
-                    egui::Id::new("spline_overlay"),
-                ));
-                ed.draw_overlay(
-                    &painter,
-                    camera,
-                    [screen_rect.width(), screen_rect.height()],
-                );
-            }
+            // The track editor's spline is the host's overlay (`overlay`,
+            // #1154), so a --render still shows it too
 
             // Render stats overlay (F2 toggle)
             if let Some(ref s) = overlay_stats {
-                render_stats_overlay(ctx, s);
+                render_stats_overlay(ctx, s, frame_stats);
             }
-        });
+        }
 
         // Process spline panel actions outside the egui closure
         for action in panel_actions {
@@ -1860,79 +1882,20 @@ impl ViewerApp {
         if !gizmo_edits.is_empty() {
             let mut st = self.state.lock().unwrap();
             for edit in &gizmo_edits {
-                if let Some(components) = st.world.get_components_mut(edit.entity_id) {
-                    components.set_field(&edit.component, &edit.field, edit.new_value.clone());
-                }
+                self.edits.set(
+                    &mut st.world,
+                    edit.entity_id,
+                    &edit.component,
+                    &edit.field,
+                    edit.new_value.clone(),
+                );
             }
-            // Update renderer
-            if let (Some(ctx), Some(renderer)) = (&self.render_context, &mut self.scene_renderer) {
-                renderer.update_from_world(&st.world, &ctx.device);
-            }
-            self.dirty = true;
+            // `dirty` is refreshed once the frame is drawn
         }
 
         if gizmo_drag_just_ended {
             self.gizmo_drag_ended = true;
         }
-
-        egui_winit.handle_platform_output(&window, full_output.platform_output);
-
-        let paint_jobs = self
-            .egui_ctx
-            .tessellate(full_output.shapes, full_output.pixels_per_point);
-
-        let screen_descriptor = egui_wgpu::ScreenDescriptor {
-            size_in_pixels: [context.config.width, context.config.height],
-            pixels_per_point: full_output.pixels_per_point,
-        };
-
-        let mut egui_renderer = self.egui_renderer.take().unwrap();
-
-        let mut encoder = context
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("egui Encoder"),
-            });
-
-        for (id, image_delta) in &full_output.textures_delta.set {
-            egui_renderer.update_texture(&context.device, &context.queue, *id, image_delta);
-        }
-
-        egui_renderer.update_buffers(
-            &context.device,
-            &context.queue,
-            &mut encoder,
-            &paint_jobs,
-            &screen_descriptor,
-        );
-
-        {
-            let render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("egui Render Pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: target_view,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Load,
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-            });
-
-            let mut render_pass = render_pass.forget_lifetime();
-            egui_renderer.render(&mut render_pass, &paint_jobs, &screen_descriptor);
-        }
-
-        context.queue.submit(std::iter::once(encoder.finish()));
-
-        for id in &full_output.textures_delta.free {
-            egui_renderer.free_texture(id);
-        }
-
-        self.egui_renderer = Some(egui_renderer);
 
         (gizmo_action, menu_actions)
     }
@@ -1948,25 +1911,13 @@ impl ViewerApp {
         {
             let mut st = self.state.lock().unwrap();
             for edit in &edits {
-                // Track dirty fields for structure-preserving save
-                if let Some(name) = st.world.get_name(edit.entity_id) {
-                    self.dirty_fields.insert((
-                        name.to_string(),
-                        edit.component.clone(),
-                        edit.field.clone(),
-                    ));
-                }
-                if let Some(components) = st.world.get_components_mut(edit.entity_id) {
-                    components.set_field(&edit.component, &edit.field, edit.new_value.clone());
-                }
-            }
-        }
-
-        // Update renderer
-        {
-            let st = self.state.lock().unwrap();
-            if let (Some(ctx), Some(renderer)) = (&self.render_context, &mut self.scene_renderer) {
-                renderer.update_from_world(&st.world, &ctx.device);
+                self.edits.set(
+                    &mut st.world,
+                    edit.entity_id,
+                    &edit.component,
+                    &edit.field,
+                    edit.new_value.clone(),
+                );
             }
         }
 
@@ -1980,7 +1931,7 @@ impl ViewerApp {
             actions: edits,
             description: desc,
         });
-        self.dirty = true;
+        self.refresh_dirty();
     }
 
     /// Finalize a gizmo drag into a single undo command
@@ -1994,7 +1945,6 @@ impl ViewerApp {
             let cur_pos = [current.position.x, current.position.y, current.position.z];
             let cur_rot = [current.rotation.x, current.rotation.y, current.rotation.z];
             let cur_scl = [current.scale.x, current.scale.y, current.scale.z];
-            let entity_name = st.world.get_name(eid).map(|n| n.to_string());
             drop(st);
 
             let mut actions = Vec::new();
@@ -2028,17 +1978,6 @@ impl ViewerApp {
             }
 
             if !actions.is_empty() {
-                // Track dirty fields for patcher
-                if let Some(name) = &entity_name {
-                    for action in &actions {
-                        self.dirty_fields.insert((
-                            name.clone(),
-                            action.component.clone(),
-                            action.field.clone(),
-                        ));
-                    }
-                }
-
                 let mode_name = match self.transform_gizmo.mode {
                     GizmoMode::Translate => "Move",
                     GizmoMode::Rotate => "Rotate",
@@ -2054,22 +1993,24 @@ impl ViewerApp {
         self.transform_gizmo.clear_drag_start();
     }
 
-    /// Undo the last edit
+    /// Undo the last edit. It goes through the edit path like any other
+    /// (#679), so undo after a save leaves the scene dirty and the next save
+    /// writes the value it put back.
     fn undo(&mut self) {
         if let Some(cmd) = self.undo_stack.undo() {
             let mut st = self.state.lock().unwrap();
             for action in &cmd.actions {
-                if let Some(components) = st.world.get_components_mut(action.entity_id) {
-                    components.set_field(
-                        &action.component,
-                        &action.field,
-                        action.old_value.clone(),
-                    );
-                }
+                self.edits.set(
+                    &mut st.world,
+                    action.entity_id,
+                    &action.component,
+                    &action.field,
+                    action.old_value.clone(),
+                );
             }
             drop(st);
-            self.refresh_renderer();
-            println!("Undo: {}", cmd.description);
+            self.refresh_dirty();
+            tracing::info!(target: "viewer", "Undo: {}", cmd.description);
         }
     }
 
@@ -2078,56 +2019,43 @@ impl ViewerApp {
         if let Some(cmd) = self.undo_stack.redo() {
             let mut st = self.state.lock().unwrap();
             for action in &cmd.actions {
-                if let Some(components) = st.world.get_components_mut(action.entity_id) {
-                    components.set_field(
-                        &action.component,
-                        &action.field,
-                        action.new_value.clone(),
-                    );
-                }
+                self.edits.set(
+                    &mut st.world,
+                    action.entity_id,
+                    &action.component,
+                    &action.field,
+                    action.new_value.clone(),
+                );
             }
             drop(st);
-            self.refresh_renderer();
-            println!("Redo: {}", cmd.description);
+            self.refresh_dirty();
+            tracing::info!(target: "viewer", "Redo: {}", cmd.description);
         }
     }
 
-    /// Save the scene: write the edited fields into the file through its
-    /// `SceneDocument`, leaving everything else as written (#677). With
-    /// nothing edited this does nothing, so Ctrl+S on an untouched scene, or
-    /// a second Ctrl+S, leaves the file byte for byte as it was.
+    /// Save the scene: write each field that differs from the file into it
+    /// through its `SceneDocument`, leaving everything else as written
+    /// (#677). An entity a prefab instance makes goes into the instance's
+    /// overrides. A field that can't be written is named in the status bar
+    /// and keeps the scene dirty; "Saved!" means every edit is in the file
+    /// (#679). Each field written is a line appended to the project's
+    /// `.flint/viewer-edits.jsonl`. With nothing changed this does nothing,
+    /// so Ctrl+S on an untouched scene leaves the file byte for byte as it was.
     fn save(&mut self) {
-        if self.dirty_fields.is_empty() {
-            self.dirty = false;
-            self.update_window_title();
+        let mut guard = self.state.lock().unwrap();
+        if !self.edits.is_dirty(&guard.world) {
+            drop(guard);
+            self.refresh_dirty();
             self.status_message = Some(("Nothing to save".to_string(), Instant::now()));
             return;
         }
-        let mut st = self.state.lock().unwrap();
+        let st = &mut *guard;
         let scene_path = st.scene_path.clone();
-
-        // Collect patch data from world first (immutable borrow of world)
-        let patches: Vec<(String, String, String, toml::Value)> = self
-            .dirty_fields
-            .iter()
-            .filter_map(|(entity_name, component, field)| {
-                let eid = st.world.get_id(entity_name)?;
-                let components = st.world.get_components(eid)?;
-                let value = components.get_field(component, field)?;
-                Some((
-                    entity_name.clone(),
-                    component.clone(),
-                    field.clone(),
-                    value.clone(),
-                ))
-            })
-            .collect();
-
         // No document means the file didn't parse when it was read. The world
         // alone would write a scene without its look, camera, wooze field and
         // prefabs, so the viewer doesn't write it at all.
         let Some(doc) = st.scene_doc.as_mut() else {
-            drop(st);
+            drop(guard);
             tracing::error!("Not saving {scene_path}: it didn't parse as TOML when it was read");
             self.status_message = Some((
                 "Save refused: the scene file didn't parse; reload it".to_string(),
@@ -2135,38 +2063,61 @@ impl ViewerApp {
             ));
             return;
         };
-        let mut skipped = Vec::new();
-        for (entity_name, component, field, value) in &patches {
-            if let Err(e) = doc.patch_field(entity_name, component, field, value) {
-                tracing::warn!("Not saved: {}", e);
-                skipped.push(e);
-            }
+        let plan = self.edits.plan(&st.world, doc);
+        for (_, why) in &plan.failed {
+            tracing::warn!("Not saved: {why}");
         }
-
-        match doc.save(&scene_path) {
+        let written = if plan.written.is_empty() {
+            Ok(())
+        } else {
+            doc.save(&scene_path)
+        };
+        drop(guard);
+        match written {
             Ok(()) => {
-                drop(st);
-                self.dirty = false;
-                self.dirty_fields.clear();
-                self.last_save_time = Some(Instant::now());
-                self.suppress_reload_until = Some(Instant::now() + Duration::from_millis(1500));
-                self.update_window_title();
-                let message = match skipped.first() {
-                    None => "Saved!".to_string(),
-                    // An entity a prefab instance expands into isn't in the file
-                    Some(first) => format!(
-                        "Saved, but {} edit(s) had nowhere to go: {first}",
-                        skipped.len()
+                self.edits.saved(&plan);
+                if !plan.written.is_empty() {
+                    self.last_save_time = Some(Instant::now());
+                    self.suppress_reload_until = Some(Instant::now() + Duration::from_millis(1500));
+                    tracing::info!(target: "viewer", "Saved scene to {}", scene_path);
+                    self.log_edits(&plan, &scene_path);
+                }
+                let message = match plan.failed.first() {
+                    None => format!("Saved! ({} field(s))", plan.written.len()),
+                    Some((_, why)) => format!(
+                        "Not saved: {} of {} edit(s): {why}",
+                        plan.failed.len(),
+                        plan.failed.len() + plan.written.len()
                     ),
                 };
                 self.status_message = Some((message, Instant::now()));
-                println!("Saved scene to {}", scene_path);
             }
             Err(e) => {
                 tracing::error!("Failed to save scene: {}", e);
-                drop(st);
                 self.status_message = Some((format!("Save failed: {}", e), Instant::now()));
             }
+        }
+        self.refresh_dirty();
+    }
+
+    /// Append what a save wrote to the project's change list, for an agent
+    /// to read what the human changed (#679).
+    fn log_edits(&self, plan: &crate::edits::SavePlan, scene_path: &str) {
+        append_change_list(scene_path, |scene, now| {
+            crate::edits::log_lines(plan, scene, now)
+        });
+    }
+
+    /// `dirty` is whether the world differs from the file: set it, and the
+    /// title's marker and the status bar's unsaved-edit notes with it.
+    fn refresh_dirty(&mut self) {
+        let st = self.state.lock().unwrap();
+        let dirty = self.edits.is_dirty(&st.world);
+        self.save_problems = self.edits.problems(&st.world);
+        drop(st);
+        if dirty != self.dirty {
+            self.dirty = dirty;
+            self.update_window_title();
         }
     }
 
@@ -2188,10 +2139,15 @@ impl ViewerApp {
     }
 
     /// Refresh renderer from current world state
-    fn refresh_renderer(&mut self) {
-        let st = self.state.lock().unwrap();
-        if let (Some(ctx), Some(renderer)) = (&self.render_context, &mut self.scene_renderer) {
-            renderer.update_from_world(&st.world, &ctx.device);
+    /// A camera jump of the viewer's own (Space back to the authored
+    /// framing, a switch between perspective and orthographic) or a hot
+    /// reload: styles that remember earlier frames (ASCII's steady glyphs,
+    /// #277) start over instead of carrying the old view into the new one
+    /// (#474). The viewer knows each of its jumps, so it runs no detector:
+    /// orbits, wheel zooms and view snaps ease, and keep their history.
+    fn reset_style_history(&mut self) {
+        if let Some(renderer) = &mut self.scene_renderer {
+            renderer.reset_style_history();
         }
     }
 
@@ -2203,7 +2159,7 @@ impl ViewerApp {
         };
 
         // Check if pointer is over egui panels
-        if self.egui_ctx.is_pointer_over_area() {
+        if self.egui_ctx.is_pointer_over_egui() {
             return;
         }
 
@@ -2216,8 +2172,8 @@ impl ViewerApp {
         let targets = build_pick_targets(&st.world);
         drop(st);
 
-        let vw = context.config.width as f32;
-        let vh = context.config.height as f32;
+        let vw = context.width as f32;
+        let vh = context.height as f32;
 
         if let Some((entity_id, _dist)) =
             pick_entity(x as f32, y as f32, vw, vh, &self.camera, &targets)
@@ -2254,12 +2210,16 @@ impl ViewerApp {
         self.user_style_polls = self.user_style_polls.wrapping_add(1);
         if needs_reload || self.user_style_polls % 15 == 0 {
             // From the project the renderer was given at load, not found anew
-            let reload = match self.scene_renderer.as_ref().map(|r| r.asset_scope()) {
-                Some(scope) => flint_render::stylize::custom::reload_changed_for(&scope),
-                None => flint_render::stylize::custom::reload_changed(scene_dir_of(&scene_path)),
+            // into the registry the renderer draws with (#742)
+            let reload = match self.scene_renderer.as_mut() {
+                Some(renderer) => {
+                    let scope = renderer.asset_scope();
+                    renderer.styles_mut().reload_changed_for(&scope)
+                }
+                None => Default::default(),
             };
             for message in &reload.messages {
-                eprintln!("Warning: {message}");
+                tracing::warn!(target: "viewer", "{message}");
             }
             needs_reload |= reload.changed();
         }
@@ -2269,19 +2229,31 @@ impl ViewerApp {
                 let mut state = self.state.lock().unwrap();
                 state.needs_reload = false;
             }
+            // The reload's summary holds what it read and raised alone
+            (self.load_summary.begin)();
+            // The first reload after a Commit to scene is its own (#516)
+            let own_commit = self
+                .own_commit_until
+                .take()
+                .is_some_and(|until| Instant::now() < until);
 
             let reload_result = {
                 let state = self.state.lock().unwrap();
-                load_scene(&scene_path, &state.registry).and_then(|(world, mut scene_file)| {
-                    let path = std::path::Path::new(&scene_path);
-                    flint_procgen::settle_scene(&mut scene_file, path)?;
-                    Ok((world, scene_file))
-                })
+                // New ids, past the old world's (#688): the renderer's caches
+                // keyed by entity must not take a reloaded entity for an old one
+                load_scene_after(&scene_path, &state.registry, &state.world).and_then(
+                    |(world, mut scene_file)| {
+                        let path = std::path::Path::new(&scene_path);
+                        flint_procgen::settle_scene(&mut scene_file, path)?;
+                        Ok((world, scene_file))
+                    },
+                )
             };
 
             match reload_result {
                 Ok((new_world, scene_file)) => {
-                    println!("Reloaded scene: {}", scene_file.scene.name);
+                    // Its entities are new: the field's clocks start over
+                    self.field_clocks.restart_meshes();
 
                     {
                         let mut state = self.state.lock().unwrap();
@@ -2292,6 +2264,16 @@ impl ViewerApp {
                             .selected_entity()
                             .and_then(|id| state.world.get_name(id))
                             .map(str::to_owned);
+                        // The undo history follows the entities by name
+                        // (#1046): an agent's edit to the file leaves the
+                        // human's steps elsewhere to undo
+                        let dropped = self.undo_stack.carry_over(&state.world, &new_world);
+                        if dropped > 0 {
+                            tracing::info!(
+                                target: "viewer",
+                                "Undo: {dropped} step(s) dropped, the reloaded file changed what they edited"
+                            );
+                        }
                         state.world = new_world;
                         self.scene_tree
                             .select(selected_name.and_then(|name| state.world.get_id(&name)));
@@ -2301,6 +2283,7 @@ impl ViewerApp {
                             self.picked_look.as_ref(),
                         );
                         state.wooze = field_of(&scene_file);
+                        state.environment = scene_file.environment.clone();
                         // Refresh authored camera too; applied on the next
                         // Space reset (the live camera is never yanked).
                         state.scene_camera = scene_file.camera.clone();
@@ -2311,14 +2294,28 @@ impl ViewerApp {
                     {
                         let mut state = self.state.lock().unwrap();
                         let config = ModelLoadConfig::from_scene_path(&state.scene_path);
-                        model_loader::load_models_from_world(
-                            &mut state.world,
+                        // Bound again (#739): no style history (the picture
+                        // no longer follows on from the last one, #474), no
+                        // bones or levers of the last load, and its terrain
+                        // and grass, which may have changed or gone
+                        // over the styles it draws with now, so a reload
+                        // since the last load is kept and an unchanged
+                        // style keeps its pass (#742)
+                        let binding = match self.scene_binding.clone() {
+                            Some(binding) => binding.restyled(renderer.styles()),
+                            None => SceneBinding::over(
+                                (*renderer.asset_scope()).clone(),
+                                renderer.styles(),
+                            ),
+                        };
+                        stage_scene(
                             renderer,
                             &context.device,
                             &context.queue,
+                            &mut state,
+                            binding,
                             &config,
                         );
-                        renderer.update_from_world(&state.world, &context.device);
 
                         // Particles: effects may have changed on disk too
                         // (the watcher covers the scene dir recursively).
@@ -2339,32 +2336,30 @@ impl ViewerApp {
                             scene_dir_of(&state.scene_path),
                         );
 
-                        // Grass: the scene's grass_ground (or its mask) may
-                        // have changed, or gone; drop the old field first
-                        renderer.unload_grass();
-                        flint_render::load_grass_ground_in(
-                            &state.world,
-                            project,
-                            scene_dir_of(&state.scene_path),
-                            &context.device,
-                            &context.queue,
-                            renderer,
-                        );
-
                         // Re-derive the authored post-process so [post_process]
-                        // edits hot-reload like the rest of the scene.
-                        if self.scene_post_enabled {
+                        // edits hot-reload like the rest of the scene. Not
+                        // after the viewer's own Commit to scene (#516): the
+                        // config on screen already says what the file now
+                        // says of the committed style, and taking the file's
+                        // would throw away every F4 tweak never written
+                        // anywhere (bloom, fog, SSAO, another style's).
+                        if own_commit {
+                            tracing::info!(target: "viewer", "Kept the F4 post-process: the reload was its own commit's");
+                        } else if self.scene_post_enabled {
                             // --style keeps winning over the reloaded file (#328)
                             if let Some(def) = &state.scene_post {
                                 renderer.set_post_process_config(with_flags(
-                                    post_process_config_from_def(def),
+                                    post_process_config_from_def(def, renderer.styles()),
                                     &self.style_specs,
                                     self.motion_hold,
+                                    renderer.styles(),
                                 ));
                             }
                         }
-                        self.render_panel
-                            .set_authored_styles(Some(authored_styles(state.scene_post.as_ref())));
+                        self.render_panel.set_authored_styles(Some(authored_styles(
+                            state.scene_post.as_ref(),
+                            renderer.styles(),
+                        )));
                         self.render_panel
                             .set_scene_dir(Some(scene_dir_of(&state.scene_path).to_path_buf()));
                         // A look file may be new, changed or gone (#356)
@@ -2379,11 +2374,14 @@ impl ViewerApp {
                         self.scene_tree.update(&state.world);
                     }
                     self.update_constraints();
+                    self.update_diagnostics();
 
-                    // External reload clears undo and dirty state
-                    self.undo_stack.clear();
+                    // The world is the file's now: nothing is edited. The
+                    // undo stack was carried over above, so an undo after
+                    // this is an edit like any other, and dirty
+                    self.edits.clear();
+                    self.save_problems.clear();
                     self.dirty = false;
-                    self.dirty_fields.clear();
                     self.update_window_title();
 
                     // Re-parse scene document for patcher
@@ -2391,9 +2389,17 @@ impl ViewerApp {
                         let mut state = self.state.lock().unwrap();
                         state.scene_doc = SceneDocument::from_file(&scene_path).ok();
                     }
+                    self.say_loaded();
                 }
                 Err(e) => {
-                    tracing::error!("Failed to reload scene: {:?}", e);
+                    tracing::error!(
+                        "Failed to reload scene {}: {:?}",
+                        flint_core::project::shown(std::path::Path::new(&scene_path)),
+                        e
+                    );
+                    // The last world stays on screen; the panel says why
+                    // the file no longer loads
+                    self.update_diagnostics();
                 }
             }
         }
@@ -2402,7 +2408,7 @@ impl ViewerApp {
     /// Get screen size from render context.
     fn screen_size(&self) -> [f32; 2] {
         if let Some(ctx) = &self.render_context {
-            [ctx.config.width as f32, ctx.config.height as f32]
+            [ctx.width as f32, ctx.height as f32]
         } else {
             [
                 self.window_opts.width as f32,
@@ -2413,94 +2419,49 @@ impl ViewerApp {
 
     // --- Editor-specific input handlers ---
 
+    /// A left press picks a control point to drag; middle-drag orbits and
+    /// right-drag pans through the host's orbit.
     fn handle_editor_mouse_press(&mut self, button: MouseButton) {
-        match button {
-            MouseButton::Left => {
-                self.mouse_pressed = true;
-                let screen = self.screen_size();
-                let alt_held = self.modifiers.alt_key();
-                // Try to pick a control point
-                if let (Some(editor), Some((mx, my))) = (&mut self.editor, self.last_mouse_pos) {
-                    if let Some(idx) = editor.pick(&self.camera, screen, mx as f32, my as f32) {
-                        editor.selected = Some(idx);
-                        editor.dragging = true;
-                        editor.drag_start_pos = editor.control_points[idx].position;
-                        editor.push_undo();
-                        editor.drag_mode = if alt_held {
-                            DragMode::VerticalY
-                        } else {
-                            DragMode::HorizontalXZ
-                        };
-                    } else {
-                        // Click on empty space: deselect
-                        editor.selected = None;
-                    }
-                }
+        if button != MouseButton::Left {
+            return;
+        }
+        let screen = self.screen_size();
+        let alt_held = self.modifiers.alt_key();
+        if let (Some(editor), Some((mx, my))) = (&mut self.editor, self.cursor) {
+            if let Some(idx) = editor.pick(&self.camera, screen, mx as f32, my as f32) {
+                editor.selected = Some(idx);
+                editor.dragging = true;
+                editor.drag_start_pos = editor.control_points[idx].position;
+                editor.push_undo();
+                editor.drag_mode = if alt_held {
+                    DragMode::VerticalY
+                } else {
+                    DragMode::HorizontalXZ
+                };
+            } else {
+                // Click on empty space: deselect
+                editor.selected = None;
             }
-            MouseButton::Middle => {
-                self.middle_mouse_pressed = true;
-            }
-            MouseButton::Right => {
-                self.right_mouse_pressed = true;
-            }
-            _ => {}
         }
     }
 
     fn handle_editor_mouse_release(&mut self, button: MouseButton) {
-        match button {
-            MouseButton::Left => {
-                self.mouse_pressed = false;
-                if let Some(editor) = &mut self.editor {
-                    editor.dragging = false;
-                }
+        if button == MouseButton::Left {
+            if let Some(editor) = &mut self.editor {
+                editor.dragging = false;
             }
-            MouseButton::Middle => {
-                self.middle_mouse_pressed = false;
-            }
-            MouseButton::Right => {
-                self.right_mouse_pressed = false;
-            }
-            _ => {}
         }
     }
 
     fn handle_editor_cursor_moved(&mut self, position: winit::dpi::PhysicalPosition<f64>) {
-        if let Some((last_x, last_y)) = self.last_mouse_pos {
-            let dx = (position.x - last_x) as f32;
-            let dy = (position.y - last_y) as f32;
-
-            // Middle-drag = orbit (replaces left-drag in standard mode)
-            if self.middle_mouse_pressed {
-                self.camera.orbit_horizontal(-dx * 0.01);
-                self.camera.orbit_vertical(-dy * 0.01);
-                self.camera_snap_target = None;
-                self.camera.orthographic = false;
-            }
-
-            // Right-drag = pan (same as standard mode)
-            if self.right_mouse_pressed {
-                self.camera.pan(-dx * 0.02, dy * 0.02);
-                self.camera_snap_target = None;
-            }
-
-            // Left-drag with dragging = move control point
-            if self.mouse_pressed {
-                let screen = self.screen_size();
-                if let Some(editor) = &mut self.editor {
-                    if editor.dragging {
-                        editor.handle_drag(
-                            &self.camera,
-                            screen,
-                            position.x as f32,
-                            position.y as f32,
-                        );
-                    }
-                }
+        // Left-drag with a point picked moves it
+        let screen = self.screen_size();
+        if let Some(editor) = &mut self.editor {
+            if editor.dragging {
+                editor.handle_drag(&self.camera, screen, position.x as f32, position.y as f32);
             }
         }
-
-        self.last_mouse_pos = Some((position.x, position.y));
+        self.cursor = Some((position.x, position.y));
 
         // Update hover state
         let screen = self.screen_size();
@@ -2580,48 +2541,111 @@ impl ViewerApp {
     }
 }
 
-impl ApplicationHandler for ViewerApp {
-    fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        if self.window.is_none() {
-            // The user style and glyph set polls ask a watcher thread from
-            // here on, never the disk in a frame (#633)
-            flint_core::file_watch::start();
-            if let Err(e) = self.initialize(event_loop) {
-                tracing::error!("Failed to initialize viewer: {e:#}");
-                event_loop.exit();
-            }
+/// The scene viewer's debug keys (#1170), by action name. The player's F2
+/// and F4 are the same actions; its F3 (the scene's panels) is not.
+const STATS: &str = "stats";
+const NORMAL_ARROWS: &str = "normal_arrows";
+const RENDER_PANEL: &str = "render_panel";
+
+/// The scene viewer's debug keys: F1 (the list) is the host's.
+pub const VIEWER_KEYS: DebugKeyGroup = DebugKeyGroup {
+    owner: "viewer",
+    when: "always",
+    keys: &[
+        DebugKey {
+            action: STATS,
+            key: "F2",
+            does: "Render stats, with the frame-time graph and its hitch counters",
+        },
+        DebugKey {
+            action: NORMAL_ARROWS,
+            key: "F3",
+            does: "Normal arrows on every face",
+        },
+        DebugKey {
+            action: RENDER_PANEL,
+            key: "F4",
+            does: "The Rendering & Effects menu",
+        },
+    ],
+};
+
+impl Editor for ViewerApp {
+    fn title(&self) -> String {
+        if self.editor.is_some() {
+            "Flint Track Editor".into()
+        } else {
+            "Flint Viewer".into()
         }
     }
 
-    fn window_event(
-        &mut self,
-        event_loop: &ActiveEventLoop,
-        _window_id: WindowId,
-        event: WindowEvent,
-    ) {
+    fn init(&mut self, cx: InitCx) -> Result<()> {
+        self.initialize(cx)
+    }
+
+    /// The host's orbit camera (#1153). The transform gizmo takes the
+    /// presses it's under (`event` says so before each), the track editor's
+    /// left button picks points (it orbits with the middle), and the view
+    /// cube's snap and drag go through it too.
+    fn orbit(&mut self) -> Option<(&mut Camera, &mut OrbitCameraController)> {
+        Some((&mut self.camera, &mut self.orbit))
+    }
+
+    fn watched_files(&self) -> Vec<PathBuf> {
+        self.watch.iter().map(|w| w.file.clone()).collect()
+    }
+
+    fn watched_folders(&self) -> Vec<PathBuf> {
+        self.watch
+            .as_ref()
+            .map(|w| w.folders.clone())
+            .unwrap_or_default()
+    }
+
+    fn file_change_counts(&self, path: &Path) -> bool {
+        self.watch.as_ref().is_none_or(|w| w.counts(path))
+    }
+
+    fn on_file_changed(&mut self) {
+        if let Ok(mut state) = self.state.lock() {
+            state.needs_reload = true;
+        }
+    }
+
+    /// Shortcuts that win over a focused panel.
+    fn early_event(&mut self, event: &WindowEvent) -> Flow {
         let is_editor = self.editor.is_some();
 
         // Track modifier keys
-        if let WindowEvent::ModifiersChanged(mods) = &event {
+        if let WindowEvent::ModifiersChanged(mods) = event {
             self.modifiers = mods.state();
         }
 
-        // Handle gizmo input priority: if gizmo is hovered/dragging, suppress camera orbit
-        // but still let egui process the event for gizmo interaction
-        let gizmo_active = self.transform_gizmo.is_dragging() || self.transform_gizmo.is_hovered();
-
         // Handle Tab and other global shortcuts before egui can consume them.
         if let WindowEvent::KeyboardInput {
-            event: ref key_event,
-            ..
+            event: key_event, ..
         } = event
         {
+            // W/E double as gizmo modes while an entity is selected: the
+            // host's orbit mustn't take their key repeats as orbit keys
+            if key_event.state == ElementState::Pressed
+                && key_event.repeat
+                && !is_editor
+                && self.modifiers.is_empty()
+                && self.scene_tree.selected_entity().is_some()
+                && matches!(
+                    key_event.physical_key,
+                    PhysicalKey::Code(KeyCode::KeyW | KeyCode::KeyE)
+                )
+            {
+                return Flow::Handled;
+            }
             if key_event.state == ElementState::Pressed && !key_event.repeat {
                 if is_editor {
                     // In editor mode, handle editor-specific keys first
                     if let PhysicalKey::Code(code) = key_event.physical_key {
                         if self.handle_editor_key(code) {
-                            return;
+                            return Flow::Handled;
                         }
                     }
                 } else {
@@ -2630,33 +2654,34 @@ impl ApplicationHandler for ViewerApp {
                         match code {
                             KeyCode::Tab if self.modifiers.is_empty() => {
                                 self.show_inspector = !self.show_inspector;
-                                println!(
+                                tracing::info!(
+                                    target: "viewer",
                                     "Inspector: {}",
                                     if self.show_inspector { "ON" } else { "OFF" }
                                 );
-                                return;
+                                return Flow::Handled;
                             }
                             KeyCode::KeyZ
                                 if self.modifiers.control_key() && self.modifiers.shift_key() =>
                             {
                                 // Ctrl+Shift+Z = redo
                                 self.redo();
-                                return;
+                                return Flow::Handled;
                             }
                             KeyCode::KeyZ if self.modifiers.control_key() => {
                                 // Ctrl+Z = undo
                                 self.undo();
-                                return;
+                                return Flow::Handled;
                             }
                             KeyCode::KeyY if self.modifiers.control_key() => {
                                 // Ctrl+Y = redo
                                 self.redo();
-                                return;
+                                return Flow::Handled;
                             }
                             KeyCode::KeyS if self.modifiers.control_key() => {
                                 // Ctrl+S = save scene
                                 self.save();
-                                return;
+                                return Flow::Handled;
                             }
                             // W/E/R = gizmo mode shortcuts, but ONLY while an
                             // entity is selected (the gizmo doesn't exist
@@ -2670,28 +2695,28 @@ impl ApplicationHandler for ViewerApp {
                                     && self.scene_tree.selected_entity().is_some() =>
                             {
                                 self.transform_gizmo.mode = GizmoMode::Translate;
-                                return;
+                                return Flow::Handled;
                             }
                             KeyCode::KeyE
                                 if self.modifiers.is_empty()
                                     && self.scene_tree.selected_entity().is_some() =>
                             {
                                 self.transform_gizmo.mode = GizmoMode::Rotate;
-                                return;
+                                return Flow::Handled;
                             }
                             KeyCode::KeyR
                                 if self.modifiers.is_empty()
                                     && self.scene_tree.selected_entity().is_some() =>
                             {
                                 self.transform_gizmo.mode = GizmoMode::Scale;
-                                return;
+                                return Flow::Handled;
                             }
                             // Ctrl+R = Reload
                             KeyCode::KeyR if self.modifiers.control_key() => {
                                 if let Ok(mut state) = self.state.lock() {
                                     state.needs_reload = true;
                                 }
-                                return;
+                                return Flow::Handled;
                             }
                             _ => {}
                         }
@@ -2700,212 +2725,148 @@ impl ApplicationHandler for ViewerApp {
             }
         }
 
-        // Let egui handle the event first
-        if let Some(egui_winit) = &mut self.egui_winit {
-            if let Some(window) = &self.window {
-                let response = egui_winit.on_window_event(window, &event);
-                if response.consumed {
-                    return;
-                }
-            }
-        }
+        Flow::Pass
+    }
 
+    /// The viewer's own keys and picking. Mouse events, WASD/QE and O,
+    /// `[` and `]` go on to the host's orbit.
+    fn event(&mut self, event: &WindowEvent) -> Flow {
+        let is_editor = self.editor.is_some();
+        // The transform gizmo is under the pointer or dragging: a press
+        // there is the gizmo's, never an orbit or a pick
+        let gizmo_active = self.transform_gizmo.is_dragging() || self.transform_gizmo.is_hovered();
         match event {
-            WindowEvent::CloseRequested => {
-                event_loop.exit();
+            WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
+                match event.physical_key {
+                    PhysicalKey::Code(KeyCode::Escape) if !self.transform_gizmo.is_dragging() => {
+                        return Flow::Exit;
+                    }
+                    PhysicalKey::Code(KeyCode::Space) if !is_editor => {
+                        self.camera = Camera::new();
+                        if let Some(context) = &self.render_context {
+                            self.camera.aspect = context.aspect();
+                        }
+                        // Back to the authored framing (viewer default if
+                        // the scene has no [camera] block)
+                        self.seed_camera_from_scene();
+                        self.camera.update_orbit();
+                        self.orbit.cancel_snap();
+                        self.reset_style_history();
+                    }
+                    // F2-F4 are debug keys: the host's table hands them to
+                    // `on_debug_key` (#1170)
+                    _ => return Flow::Pass,
+                }
+                return Flow::Handled;
             }
 
-            WindowEvent::Resized(new_size) => {
-                if let Some(context) = &mut self.render_context {
-                    context.resize(new_size);
-                    self.camera.aspect = context.aspect_ratio();
-                    if let Some(renderer) = &mut self.scene_renderer {
-                        renderer.resize_postprocess(
-                            &context.device,
-                            new_size.width,
-                            new_size.height,
-                        );
-                    }
-                }
-            }
-
-            WindowEvent::KeyboardInput { event, .. } => {
-                // Track WASD/QE held state for keyboard orbit
-                if let PhysicalKey::Code(code) = event.physical_key {
-                    match code {
-                        KeyCode::KeyW
-                        | KeyCode::KeyA
-                        | KeyCode::KeyS
-                        | KeyCode::KeyD
-                        | KeyCode::KeyQ
-                        | KeyCode::KeyE => {
-                            if event.state == ElementState::Pressed {
-                                // W/E double as gizmo-mode shortcuts while an
-                                // entity is selected; keep key-repeat events
-                                // from leaking them into orbit in that state.
-                                let gizmo_key = matches!(code, KeyCode::KeyW | KeyCode::KeyE);
-                                let gizmo_owns = gizmo_key
-                                    && !is_editor
-                                    && self.scene_tree.selected_entity().is_some();
-                                if !gizmo_owns {
-                                    self.held_orbit_keys.insert(code);
-                                    self.auto_orbit = false;
-                                }
-                            } else {
-                                self.held_orbit_keys.remove(&code);
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-
-                if event.state == ElementState::Pressed {
-                    match event.physical_key {
-                        PhysicalKey::Code(KeyCode::Escape)
-                            if !self.transform_gizmo.is_dragging() =>
-                        {
-                            event_loop.exit();
-                        }
-
-                        PhysicalKey::Code(KeyCode::Space) if !is_editor => {
-                            self.camera = Camera::new();
-                            if let Some(context) = &self.render_context {
-                                self.camera.aspect = context.aspect_ratio();
-                            }
-                            // Back to the authored framing (viewer default if
-                            // the scene has no [camera] block)
-                            self.seed_camera_from_scene();
-                            self.camera.update_orbit();
-                        }
-                        PhysicalKey::Code(KeyCode::KeyO) if !is_editor => {
-                            self.auto_orbit = !self.auto_orbit;
-                            println!("Auto-orbit: {}", if self.auto_orbit { "ON" } else { "OFF" });
-                        }
-                        PhysicalKey::Code(KeyCode::BracketRight) if !is_editor => {
-                            self.auto_orbit_speed = (self.auto_orbit_speed * 1.5).clamp(0.1, 5.0);
-                            println!("Auto-orbit speed: {:.2} rad/s", self.auto_orbit_speed);
-                        }
-                        PhysicalKey::Code(KeyCode::BracketLeft) if !is_editor => {
-                            self.auto_orbit_speed = (self.auto_orbit_speed / 1.5).clamp(0.1, 5.0);
-                            println!("Auto-orbit speed: {:.2} rad/s", self.auto_orbit_speed);
-                        }
-                        PhysicalKey::Code(KeyCode::F2) => {
-                            self.show_stats = !self.show_stats;
-                        }
-                        PhysicalKey::Code(KeyCode::F3) => {
-                            if let Some(renderer) = &mut self.scene_renderer {
-                                let on = renderer.toggle_normal_arrows();
-                                println!("Normal arrows: {}", if on { "ON" } else { "OFF" });
-
-                                if let Some(context) = &self.render_context {
-                                    let state = self.state.lock().unwrap();
-                                    renderer.update_from_world(&state.world, &context.device);
-                                }
-                            }
-                        }
-                        // Rendering & Effects menu (ADR 0053): the one home
-                        // for every render/post debug control the old
-                        // F1/F4-F12 keys used to flip blindly, plus their
-                        // non-binary parameters, the authored-post toggle,
-                        // and DoF follow.
-                        PhysicalKey::Code(KeyCode::F4) => {
-                            self.render_panel_open = !self.render_panel_open;
-                        }
-                        _ => {}
-                    }
-                }
-            }
-
-            WindowEvent::MouseInput { state, button, .. } => {
+            &WindowEvent::MouseInput { state, button, .. } => {
+                let pressed = state == ElementState::Pressed;
                 if is_editor {
-                    if state == ElementState::Pressed {
+                    if pressed {
                         self.handle_editor_mouse_press(button);
                     } else {
                         self.handle_editor_mouse_release(button);
                     }
-                } else {
-                    match button {
-                        MouseButton::Left => {
-                            let was_pressed = self.mouse_pressed;
-                            self.mouse_pressed = state == ElementState::Pressed;
-
-                            // On click release (not drag), try picking
-                            if state == ElementState::Released && was_pressed && !gizmo_active {
-                                if let Some((x, y)) = self.last_mouse_pos {
-                                    self.try_pick_entity(x, y);
-                                }
-                            }
+                } else if button == MouseButton::Left {
+                    self.orbit.set_tool_under_pointer(gizmo_active);
+                    if pressed {
+                        self.click_from = self.cursor.filter(|_| !gizmo_active);
+                    } else if let (Some(from), Some(at)) = (self.click_from.take(), self.cursor) {
+                        // A click, not a drag that orbited, picks
+                        if !gizmo_active && is_click(from, at) {
+                            self.try_pick_entity(at.0, at.1);
                         }
-                        MouseButton::Right => {
-                            self.right_mouse_pressed = state == ElementState::Pressed;
-                        }
-                        _ => {}
                     }
                 }
             }
 
-            WindowEvent::CursorMoved { position, .. } => {
+            &WindowEvent::CursorMoved { position, .. } => {
                 if is_editor {
                     self.handle_editor_cursor_moved(position);
                 } else {
-                    if let Some((last_x, last_y)) = self.last_mouse_pos {
-                        let dx = (position.x - last_x) as f32;
-                        let dy = (position.y - last_y) as f32;
-
-                        // Only orbit if gizmo is not active
-                        if self.mouse_pressed && !gizmo_active {
-                            self.camera.orbit_horizontal(-dx * 0.01);
-                            self.camera.orbit_vertical(-dy * 0.01);
-                            self.camera_snap_target = None;
-                            self.camera.orthographic = false;
-                            self.auto_orbit = false;
-                        }
-
-                        if self.right_mouse_pressed {
-                            self.camera.pan(-dx * 0.02, dy * 0.02);
-                            self.camera_snap_target = None;
-                        }
-                    }
-
-                    self.last_mouse_pos = Some((position.x, position.y));
+                    self.cursor = Some((position.x, position.y));
                 }
-            }
-
-            WindowEvent::MouseWheel { delta, .. } => {
-                let scroll = match delta {
-                    MouseScrollDelta::LineDelta(_, y) => y,
-                    MouseScrollDelta::PixelDelta(pos) => pos.y as f32 / 100.0,
-                };
-                self.camera.zoom(scroll);
-            }
-
-            WindowEvent::RedrawRequested => {
-                self.check_reload();
-                self.render();
             }
 
             _ => {}
         }
+        Flow::Pass
     }
 
-    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
-        if let Some(window) = &self.window {
-            window.request_redraw();
+    fn resized(&mut self, gpu: &Gpu) {
+        if let Some(renderer) = &mut self.scene_renderer {
+            renderer.resize_postprocess(&gpu.device, gpu.width, gpu.height);
+        }
+        self.render_context = Some(gpu.clone());
+    }
+
+    fn update(&mut self, _tick: Tick) {
+        self.check_reload();
+        self.frame_update();
+    }
+
+    /// The host times frames only while F2 shows the graph.
+    fn times_frames(&self) -> bool {
+        self.show_stats
+    }
+
+    fn frame_timed(&mut self, times: &host::FrameTimes) {
+        self.frame_stats.record(times);
+    }
+
+    fn debug_keys(&self) -> Option<DebugKeyGroup> {
+        Some(VIEWER_KEYS)
+    }
+
+    fn on_debug_key(&mut self, action: &str) {
+        match action {
+            STATS => {
+                self.show_stats = !self.show_stats;
+                if self.show_stats {
+                    self.frame_stats.reset();
+                }
+            }
+            NORMAL_ARROWS => {
+                if let Some(renderer) = &mut self.scene_renderer {
+                    let on = renderer.toggle_normal_arrows();
+                    tracing::info!(target: "viewer", "Normal arrows: {}", if on { "ON" } else { "OFF" });
+                }
+            }
+            // Rendering & Effects menu (ADR 0053): the one home for every
+            // render/post debug control the old F1/F4-F12 keys used to flip
+            // blindly, plus their non-binary parameters, the authored-post
+            // toggle, and DoF follow.
+            RENDER_PANEL => self.render_panel_open = !self.render_panel_open,
+            _ => {}
+        }
+    }
+
+    fn draw(&mut self, target: &Target) {
+        if let Some(renderer) = &mut self.scene_renderer {
+            target.render(renderer, &self.camera);
+        }
+    }
+
+    fn ui(&mut self, ui: &mut egui::Ui) {
+        self.frame_ui(ui);
+    }
+
+    /// The track editor's spline, its control polygon and its points, over
+    /// the view in the window and in a `--render` still alike (#1154).
+    fn overlay(&mut self, ctx: &egui::Context) {
+        if let Some(ed) = &self.editor {
+            let screen = ctx.content_rect();
+            let painter = ctx.layer_painter(egui::LayerId::new(
+                egui::Order::Foreground,
+                egui::Id::new("spline_overlay"),
+            ));
+            ed.draw_overlay(&painter, &self.camera, [screen.width(), screen.height()]);
         }
     }
 }
 
 // --- Helpers ---
-
-/// The wooze field a scene describes, naming what's wrong with it and going on
-/// without that part, as the player does.
-fn field_of(scene: &flint_scene::SceneFile) -> Option<flint_wooze::WoozeField> {
-    let (field, issues) = flint_procgen::LivingTables::or_warn(scene).wooze?.field();
-    for issue in issues {
-        tracing::warn!("{issue}; going without it");
-    }
-    Some(field)
-}
 
 fn vec3_to_toml(v: [f32; 3]) -> toml::Value {
     toml::Value::Array(vec![
@@ -2919,37 +2880,37 @@ fn lerp(a: f32, b: f32, t: f32) -> f32 {
     a + (b - a) * t
 }
 
-fn shortest_angle_diff(from: f32, to: f32) -> f32 {
-    use std::f32::consts::PI;
-    let mut diff = to - from;
-    while diff > PI {
-        diff -= 2.0 * PI;
-    }
-    while diff < -PI {
-        diff += 2.0 * PI;
-    }
-    diff
+/// How far, in pixels, a press may move and still be a click (a pick)
+/// rather than a drag (an orbit).
+const CLICK_SLOP: f64 = 4.0;
+
+/// Whether a press at `from` released at `to` is a click.
+fn is_click(from: (f64, f64), to: (f64, f64)) -> bool {
+    (to.0 - from.0).hypot(to.1 - from.1) <= CLICK_SLOP
 }
 
-fn lerp_angle(from: f32, to: f32, t: f32) -> f32 {
-    from + shortest_angle_diff(from, to) * t
-}
-
-fn render_stats_overlay(ctx: &egui::Context, stats: &flint_render::RenderStats) {
+/// F2: the frame-time graph (#1110) above the rendering stats.
+fn render_stats_overlay(
+    ctx: &egui::Context,
+    stats: &flint_render::RenderStats,
+    frames: &mut FrameStats,
+) {
     use flint_render::format_count;
 
     egui::Area::new(egui::Id::new("render_stats_overlay"))
         .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-8.0, 8.0))
         .order(egui::Order::Foreground)
+        // A readout: clicks go through to the inspector under it
+        .interactable(false)
         .show(ctx, |ui| {
-            egui::Frame::none()
+            egui::Frame::NONE
                 .fill(egui::Color32::from_rgba_unmultiplied(0, 0, 0, 209))
                 .stroke(egui::Stroke::new(
                     1.0f32,
                     egui::Color32::from_rgba_unmultiplied(255, 255, 255, 38),
                 ))
-                .rounding(egui::Rounding::same(4.0))
-                .inner_margin(egui::Margin::same(10.0))
+                .corner_radius(egui::CornerRadius::same(4))
+                .inner_margin(egui::Margin::same(10))
                 .show(ui, |ui| {
                     ui.style_mut().override_font_id = Some(egui::FontId::monospace(11.0));
                     ui.set_min_width(180.0);
@@ -2958,6 +2919,9 @@ fn render_stats_overlay(ctx: &egui::Context, stats: &flint_render::RenderStats) 
                         egui::Color32::from_gray(136),
                         egui::RichText::new("RENDERING STATS").size(9.0),
                     );
+                    ui.separator();
+
+                    frames.ui(ui);
                     ui.separator();
 
                     ui.horizontal(|ui| {
@@ -3024,3 +2988,15 @@ fn render_stats_overlay(ctx: &egui::Context, stats: &flint_render::RenderStats) 
                 });
         });
 }
+
+#[cfg(test)]
+#[path = "app_binding_tests.rs"]
+mod binding_tests;
+
+#[cfg(test)]
+#[path = "app_commit_tests.rs"]
+mod commit_tests;
+
+#[cfg(test)]
+#[path = "app_orbit_tests.rs"]
+mod orbit_tests;

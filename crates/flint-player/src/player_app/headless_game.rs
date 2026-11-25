@@ -4,8 +4,9 @@
 //! A [`HeadlessGame`] is a [`GameCore`] and a capture's part in its frame.
 //! A step is [`game_core::step`], the player's own frame order, run with a
 //! capture as its host ([`CaptureFrame`]): the same stages and subsystems
-//! (living props and the wooze field, an expression timeline), the same
-//! scripts, and their commands through the same dispatcher. What differs is
+//! (every scene subsystem the player's files build, from the same generated
+//! list, and an expression timeline), the same scripts, and their commands
+//! through the same dispatcher. What differs is
 //! the host's: the clock is the caller's fixed step, there is no window, no
 //! sound and no physics, and animation (`--anim-time`) and particles step on
 //! fixed steps of their own.
@@ -21,29 +22,31 @@
 //! or on that list. Of those, sound and the window's pointer and touch have
 //! nothing to show and are dropped quietly; the rest is named once in
 //! [`HeadlessGame::notes`], so a review of the capture knows what it isn't
-//! showing.
+//! showing. So is a scene subsystem that is the window's alone
+//! ([`Subsystem::presentation_only`](super::subsystem::Subsystem::presentation_only)).
 
 use std::collections::BTreeSet;
 
 use flint_core::project::Project;
 use flint_core::quality::QualitySettings;
 use flint_ecs::FlintWorld;
-use flint_particles::ParticleSystem;
 #[cfg(feature = "living")]
-use flint_procgen::LivingProps;
-use flint_render::{Camera, PostProcessConfig, SceneRenderer};
+use flint_living::LivingProps;
+use flint_particles::ParticleSystem;
+use flint_render::{Camera, FrameInputs, PostProcessConfig, SceneRenderer};
 use flint_runtime::{InputState, RuntimeSystem};
 use flint_script::context::ScriptCommand;
 use flint_script::{PostProcessOverrides, ScriptHost};
 #[cfg(feature = "living")]
-use flint_wooze::{BoilFrame, WoozeField};
+#[cfg(feature = "living")]
+use flint_wooze::WoozeField;
 
 use super::expression_feed::{ExpressionFeed, ExpressionSubsystem, ExpressionTimeline};
 use super::game_core::{self, FrameHost, GameCore, Lent};
 use super::headless_animation::HeadlessAnimation;
-#[cfg(feature = "living")]
-use super::living_subsystem::LivingSubsystem;
 use super::style_commands::SceneStyles;
+use super::subsystem::{FrameCtx, SceneCtx};
+use super::{LaunchOptions, SceneSettings};
 
 /// The seed of `random()` in a headless run. One fixed value, so that every
 /// render of a scene draws the same numbers.
@@ -78,10 +81,17 @@ pub const PRESENTATION_ONLY: &[Skipped] = &[
     quiet("play_sound"),
     quiet("play_sound_at"),
     quiet("stop_sound"),
+    quiet("set_sound_volume"),
+    quiet("set_bus_volume"),
+    quiet("set_user_bus_volume"),
+    quiet("set_bus_lowpass"),
     quiet("set_audio_lowpass"),
     quiet("set_touch_controls"),
     quiet("set_cursor_captured"),
     quiet("rumble"),
+    // A capture builds what it draws before it draws it: no frame to keep
+    // from stopping
+    quiet("prepare_look"),
     noted(
         "set_time_scale",
         "the capture's clock is its own fixed step",
@@ -115,11 +125,28 @@ const PARTICLE_COMMANDS: &[&str] = &[
     "set_effect_param",
 ];
 
+/// What a capture asks of its scene's subsystems (#1252), handed to each
+/// file's `for_scene` as [`SceneCtx::capture`]: a builder that builds
+/// otherwise in a capture reads it, and one that doesn't never looks.
+#[derive(Debug, Default)]
+pub struct CaptureStart {
+    /// The scene's wooze field, with any sweep's knobs over it: the living
+    /// subsystem takes it.
+    #[cfg(feature = "living")]
+    pub wooze: Option<WoozeField>,
+    /// A capture of a moment, which draws shallow wooze.
+    pub moment: bool,
+    /// Whether the scene's scripts run: the music and the declared fields
+    /// are only the scripts' to read, and are built only for them.
+    pub scripts: bool,
+}
+
 /// What the scripts have asked of the picture so far.
-#[derive(Debug, Clone, Copy, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct ScriptLook {
+    /// The `[post_process]` keys scripts set (`set_post`, #853), fog
+    /// colour among them.
     pub post: PostProcessOverrides,
-    pub fog_color: Option<[f32; 3]>,
     /// The render mode of the last step: shown only while asked for.
     pub render_mode: Option<(u32, f32)>,
     pub mode_params: Option<[f32; 4]>,
@@ -127,7 +154,15 @@ pub struct ScriptLook {
 
 /// One scene's game, stepped on a clock someone else keeps.
 pub struct HeadlessGame {
-    core: GameCore,
+    /// The subsystems' own files reach it for what a capture reads of them
+    /// (the grove's blends, the wooze field's clock).
+    pub(super) core: GameCore,
+    /// What the scene's file says, as the subsystems' builders read it: its
+    /// tables (the rest is the player's window and stays the default).
+    scene: SceneSettings,
+    /// The launch a subsystem may take its share of: a capture's is the
+    /// default.
+    launch: LaunchOptions,
     /// Nobody presses anything in a capture.
     input: InputState,
     screen: (f32, f32),
@@ -145,15 +180,30 @@ pub struct HeadlessGame {
     /// Post-processing as the scripts last left it. The renderer's config is
     /// sticky in the player, so only the last write of each value matters.
     look: ScriptLook,
-    /// `set_look` / `clear_look` since the stage last asked.
-    look_request: Option<Option<String>>,
+    /// Every `set_look` / `clear_look` since the stage last asked, in the
+    /// order asked: a fade starts from the look an earlier one left (#1157).
+    look_requests: Vec<LookRequest>,
     /// What a debug key would say (#367): nobody presses one in a capture.
     key_note: super::key_note::KeyNote,
+    /// What scripts are told the capture draws at (`--pixels-per-point`).
+    pixels_per_point: f32,
+    /// The last step's HUD (#731): what `on_draw_ui` drew and the UI
+    /// documents, for a capture to paint ([`HeadlessHud`](super::headless_hud::HeadlessHud)).
+    hud: Vec<flint_script::context::DrawItem>,
+    /// The last step's screen field (#859), for the capture's frame inputs.
+    style_field: flint_core::style_field::StyleField,
     #[cfg(feature = "debug-hud")]
     panels: Vec<Box<dyn flint_debug_ui::DebugPanel>>,
 }
 
 impl HeadlessGame {
+    /// The styles the capture draws with (#742), the registry its scene's
+    /// `[post_process]` was read against: what scripts' style commands
+    /// name. Set it before [`start_scripts`](Self::start_scripts).
+    pub fn set_styles(&mut self, styles: flint_render::stylize::StyleRegistry) {
+        self.core.styles = styles;
+    }
+
     /// The game of `world`, the scene at `scene_path` in `project`, with
     /// nothing started.
     pub fn new(world: FlintWorld, scene_path: &str, project: Project) -> Self {
@@ -161,6 +211,8 @@ impl HeadlessGame {
         core.script.make_deterministic(SCRIPT_SEED);
         Self {
             core,
+            scene: SceneSettings::default(),
+            launch: LaunchOptions::default(),
             input: InputState::new(),
             screen: (1.0, 1.0),
             authored: PostProcessConfig::default(),
@@ -169,11 +221,32 @@ impl HeadlessGame {
             notes: BTreeSet::new(),
             skipped: BTreeSet::new(),
             look: ScriptLook::default(),
-            look_request: None,
+            look_requests: Vec::new(),
             key_note: Default::default(),
+            pixels_per_point: 1.0,
+            hud: Vec::new(),
+            style_field: Default::default(),
             #[cfg(feature = "debug-hud")]
             panels: Vec::new(),
         }
+    }
+
+    /// What the last step's HUD draws: `on_draw_ui`'s draw calls, then the
+    /// UI documents, in points. Empty before the first step.
+    pub fn hud(&self) -> &[flint_script::context::DrawItem] {
+        &self.hud
+    }
+
+    /// Lay text out for scripts and UI documents as the capture's HUD
+    /// painter draws it ([`HeadlessHud::measurer`](super::headless_hud::HeadlessHud::measurer)).
+    pub fn set_text_measurer(&mut self, measurer: flint_script::context::TextMeasurer) {
+        self.core.script.set_text_measurer(Some(measurer));
+    }
+
+    /// The loaded UI documents (#731), to show an element or give one focus
+    /// before a capture, as a player's input would.
+    pub fn with_ui<R>(&mut self, f: impl FnOnce(&mut flint_script::ui::UiSystem) -> R) -> R {
+        self.core.script.with_ui(f)
     }
 
     pub fn world(&self) -> &FlintWorld {
@@ -189,6 +262,24 @@ impl HeadlessGame {
         self.core.clock.total_time
     }
 
+    /// The look the capture draws with before any script asks for another
+    /// (#497): the scene's own, the `--look` over it, or a `look=` sweep's
+    /// column. Scripts' `get_look()` reads it, from `on_init` on, so call it
+    /// before [`start_scripts`](Self::start_scripts).
+    pub fn set_scene_look(&mut self, look: Option<&str>) {
+        self.core.script.set_current_look(look);
+    }
+
+    /// The scene's project and folder, which its looks are searched from.
+    fn asset_scope(&self) -> flint_core::project::AssetScope {
+        let scene = std::path::Path::new(&self.core.scene_path);
+        let dir = scene.parent().filter(|p| !p.as_os_str().is_empty());
+        flint_core::project::AssetScope::new(
+            self.core.project.clone(),
+            dir.unwrap_or_else(|| std::path::Path::new(".")),
+        )
+    }
+
     /// Resolve the scene's procgen assets as the player does at load, before
     /// the model loader, every one at once, with every living prop's lineage
     /// built and ring full. `living` is the scene's `[living]`.
@@ -200,14 +291,12 @@ impl HeadlessGame {
     ) {
         let core = &mut self.core;
         #[cfg(feature = "living")]
-        core.procgen_resolver
-            .set_living_defaults(super::living_props::defaults_of(living));
+        core.living_props
+            .set_defaults(super::living_props::defaults_of(living));
         #[cfg(not(feature = "living"))]
         let _ = living;
         super::procgen_assets::resolve_scene(
-            &core.scene_path,
-            &mut core.world,
-            &mut core.procgen_resolver,
+            core,
             super::procgen_assets::ProcGenMode::Immediate,
             sink,
         );
@@ -216,39 +305,70 @@ impl HeadlessGame {
     /// The living props, if the scene grew any.
     #[cfg(feature = "living")]
     pub fn living_props(&self) -> Option<&LivingProps> {
-        let props = self.core.procgen_resolver.living_props();
+        let props = &self.core.living_props;
         (!props.is_empty()).then_some(props)
     }
 
     /// The living props, to lay a preset over.
     #[cfg(feature = "living")]
     pub fn living_props_mut(&mut self) -> &mut LivingProps {
-        self.core.procgen_resolver.living_props_mut()
+        &mut self.core.living_props
     }
 
-    /// Start the living subsystem, the player's, if the scene has living
-    /// props or a wooze `field` (its `[wooze]` with any sweep's knobs over
-    /// it): it runs the props' clock and the field's, the boil's beats,
-    /// woozy grass, shallow wooze in a capture of a `moment`, and the
-    /// scripts' tunes. As the player's first frame, the props read the field
-    /// without moving.
-    #[cfg(feature = "living")]
-    pub fn start_living(&mut self, field: Option<WoozeField>, moment: bool) {
+    /// Build the scene's subsystems as the player does at its entry (#1252):
+    /// every file in `player_app/subsystems/`, from the same generated list,
+    /// each only if the scene uses it, with the modules they own enabled.
+    /// `tables` are the scene file's top-level tables as written
+    /// (`SceneFile::scene_tables`); `start` what the capture asks of them.
+    /// A subsystem that is the window's alone is left out and named once in
+    /// [`notes`](Self::notes). Call it once, before the models load (a grove
+    /// is posed by its first frame) and before
+    /// [`start_scripts`](Self::start_scripts), whose `on_init` may call the
+    /// modules.
+    pub fn start_subsystems(&mut self, tables: toml::Table, mut start: CaptureStart) {
+        self.scene.tables = tables;
         let core = &mut self.core;
-        if core.procgen_resolver.living_props().is_empty() && field.is_none() {
-            return;
+        let built = super::subsystem::build_for_scene(&mut SceneCtx {
+            world: &mut core.world,
+            scene_path: &core.scene_path,
+            tables: &self.scene.tables,
+            scene: &self.scene,
+            launch: &mut self.launch,
+            project: &core.project,
+            styles: &core.styles,
+            script: &mut core.script,
+            #[cfg(feature = "procgen")]
+            resolver: &mut core.procgen_resolver,
+            #[cfg(feature = "living")]
+            living: &mut core.living_props,
+            renderer: None,
+            audio: None,
+            pads: None,
+            capture: Some(&mut start),
+        });
+        let mut left_out = Vec::new();
+        for subsystem in built {
+            match subsystem.presentation_only() {
+                Some(why) => left_out.push(format!(
+                    "{}: a headless capture doesn't run this subsystem ({why})",
+                    subsystem.name()
+                )),
+                None => core.subsystems.push(subsystem),
+            }
         }
-        core.procgen_resolver
-            .step_living_now(0.0, field.as_ref().map(|field| (field, 0.0)));
-        core.subsystems
-            .push(Box::new(LivingSubsystem::for_capture(field, moment)));
+        // The modules the capture's subsystems own (#698), as the player
+        // enables them before its scripts load
         core.enable_script_modules();
+        for line in left_out {
+            self.note(&line);
+        }
     }
 
     /// Load the scene's scripts, found in its project as the player finds
     /// them, and run their `on_init`, as the player does once its models
-    /// are loaded, with the scene's music on the game clock for their
-    /// `music_beat()`; and feed `timeline` to their `expression()`. With neither
+    /// are loaded, with the subsystems [`start_subsystems`](Self::start_subsystems)
+    /// built (the scene's music on the game clock for their `music_beat()`);
+    /// and feed `timeline` to their `expression()`. With neither
     /// (no `--scripts`), the scene's scripts stay unloaded. `screen` is the
     /// capture's size, for `screen_width()` and the like; `post` the
     /// post-processing it draws with, for `on_init`'s style reads (each
@@ -265,7 +385,10 @@ impl HeadlessGame {
         self.authored = post.clone();
         let core = &mut self.core;
         core.script
-            .set_style_reader(std::sync::Arc::new(SceneStyles::new(post.clone())));
+            .set_style_reader(std::sync::Arc::new(SceneStyles::new(
+                post.clone(),
+                core.styles.clone(),
+            )));
         if let Some(timeline) = timeline {
             // The run's, as the player's feed is
             core.subsystems
@@ -277,16 +400,17 @@ impl HeadlessGame {
         if !scripts {
             return;
         }
-        // The scene's music, for the scripts' beat: on the game clock, with
-        // no sound (#745)
-        #[cfg(feature = "music")]
-        if let Some(music) = crate::music::for_capture(&core.world, &core.project, &core.scene_path)
-        {
-            core.subsystems.push(music);
-        }
-        // The modules the capture's subsystems own (#698), as the player
-        // enables them before its scripts load
+        // The modules the capture's subsystems own (#698), the timeline's
+        // among them, as the player enables them before its scripts load
         core.enable_script_modules();
+        // The looks the scene can see, for list_looks() (#497), as the
+        // player lists them at the scene's entry
+        let looks = flint_render::look::list_in(&self.asset_scope())
+            .into_iter()
+            .map(|look| look.name)
+            .collect();
+        let core = &mut self.core;
+        core.script.set_looks(looks);
         core.script
             .load_scripts_from_scene(&core.scene_path, &core.project);
         core.script
@@ -302,6 +426,10 @@ impl HeadlessGame {
 
     /// The particles the scripts' commands reach, to load and step. Until
     /// [`Self::set_particles_drawn`], what scripts emit is dropped with a note.
+    pub fn particles(&self) -> &ParticleSystem {
+        &self.core.particles
+    }
+
     pub fn particles_mut(&mut self) -> &mut ParticleSystem {
         &mut self.core.particles
     }
@@ -357,73 +485,38 @@ impl HeadlessGame {
         game_core::dispatch_commands(&mut frame, commands);
     }
 
-    #[cfg(feature = "living")]
-    fn living(&self) -> Option<&LivingSubsystem> {
-        self.core.subsystems.find::<LivingSubsystem>()
+    /// The game's share of a capture's renderer inputs (#739), as the
+    /// player's subsystems give theirs: the shading boil's drawing where
+    /// the field's clock stands for a viewer at `camera` (#214), shallow
+    /// wooze's drift in a capture of a moment (#215), and woozy grass's
+    /// clock and comb (#252), and the screen field the last step's scripts
+    /// filled (#859). What the game has none of is left as it is.
+    pub fn frame_inputs<'s>(&'s self, camera: &Camera, boil_on: u32, inputs: &mut FrameInputs<'s>) {
+        let frame = FrameCtx { camera, boil_on };
+        self.core.subsystems.frame_inputs(&frame, inputs);
+        // The screen field the last step's scripts filled (#859)
+        inputs.style_field = self.style_field.shapes();
     }
 
-    /// The wooze field and the time its clock has reached, with one.
-    #[cfg(feature = "living")]
-    pub fn wooze(&self) -> Option<(&WoozeField, f64)> {
-        let living = self.living()?;
-        Some((living.wooze.as_ref()?, living.wooze_time))
+    /// The physical pixels per logical point scripts are told the capture
+    /// draws at (`--pixels-per-point`; 1 by default).
+    pub fn set_pixels_per_point(&mut self, pixels_per_point: f32) {
+        self.pixels_per_point = pixels_per_point;
     }
 
-    /// The shading boil's drawing where the field's clock stands, for a
-    /// viewer at `viewer`, with a field (#214).
-    #[cfg(feature = "living")]
-    pub fn boil(&self, viewer: [f32; 3], on: u32) -> Option<BoilFrame> {
-        let living = self.living()?;
-        let field = living.wooze.as_ref()?;
-        let sample = field.sample(viewer, living.wooze_time);
-        Some(living.boil_clock.frame(&sample, on))
-    }
-
-    /// The grass's clock at `t`: the field's, for grass that woozes (#252),
-    /// else the wall clock's.
-    pub fn apply_grass(&self, renderer: &mut SceneRenderer, t: f64) {
-        #[cfg(not(feature = "living"))]
-        {
-            renderer.grass_time = t as f32;
-        }
-        #[cfg(feature = "living")]
-        match self.living().filter(|living| living.wooze.is_some()) {
-            Some(living) => living.grass_wooze.apply(renderer, t),
-            None => renderer.grass_time = t as f32,
-        }
-    }
-
-    /// Blend every prop where its clock stands and write what moved, as a
-    /// frame of the player does.
-    #[cfg(feature = "living")]
-    pub fn upload_living(
-        &mut self,
-        renderer: &mut SceneRenderer,
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-    ) {
-        let core = &mut self.core;
-        if let Some(living) = core.subsystems.find_mut::<LivingSubsystem>() {
-            super::living_props::upload_blends(
-                &mut core.procgen_resolver,
-                &mut living.blend,
-                renderer,
-                device,
-                queue,
-            );
-        }
-    }
-
-    /// A look the scripts asked for since the last call (`Some(None)`:
-    /// none), to lay under the scene's keys before the next draw.
-    pub fn take_look_request(&mut self) -> Option<Option<String>> {
-        self.look_request.take()
+    /// The looks the scripts asked for since the last call (a `name` of
+    /// `None`: none), oldest first, each to lay under the scene's keys or to
+    /// fade to from the game time it was asked at (#496). A capture lays
+    /// them all in order (#1157): a fade asked after a cut starts from the
+    /// cut's look, not from what the last capture drew.
+    pub fn take_look_requests(&mut self) -> Vec<LookRequest> {
+        std::mem::take(&mut self.look_requests)
     }
 
     /// Post-processing and fog as the scripts have left them, and the last
     /// step's render mode.
     pub fn look(&self) -> ScriptLook {
-        self.look
+        self.look.clone()
     }
 
     /// What the scripts asked for that a headless capture doesn't do, once each.
@@ -439,6 +532,12 @@ impl HeadlessGame {
     /// The expression state scripts see now.
     pub fn expression(&self) -> rhai::Map {
         self.core.script.expression()
+    }
+
+    /// Every script error so far, counted (#693): what `flint render`
+    /// reports and `--strict-scripts` fails on.
+    pub fn script_errors(&self) -> &flint_script::ScriptErrors {
+        self.core.script.errors()
     }
 
     fn note(&mut self, what: &str) {
@@ -457,25 +556,10 @@ struct CaptureFrame<'a> {
     gpu: Option<(&'a wgpu::Device, &'a wgpu::Queue)>,
 }
 
-/// The script function a command is, as [`ScriptHost`] names it to
-/// `unsupported`.
-fn command_name(command: &ScriptCommand) -> Option<&'static str> {
-    #[derive(Default)]
-    struct Name(Option<&'static str>);
-    impl ScriptHost for Name {
-        fn unsupported(&mut self, command: &'static str) {
-            self.0 = Some(command);
-        }
-    }
-    let mut name = Name::default();
-    flint_script::host::apply(&mut name, command.clone());
-    name.0
-}
-
 impl FrameHost for CaptureFrame<'_> {
     fn lend(&mut self) -> (&mut GameCore, Lent<'_>) {
         let game = &mut *self.game;
-        let pixels_per_point = self.renderer.as_ref().map_or(1.0, |r| r.pixels_per_point);
+        let pixels_per_point = game.pixels_per_point;
         (
             &mut game.core,
             Lent {
@@ -519,7 +603,8 @@ impl FrameHost for CaptureFrame<'_> {
                 return true;
             }
         }
-        let Some(name) = command_name(command) else {
+        // The name from a table, never by carrying the command out (#1013)
+        let Some(name) = flint_script::host::command_name(command) else {
             return false;
         };
         let game = &mut *self.game;
@@ -546,9 +631,14 @@ impl FrameHost for CaptureFrame<'_> {
 
     fn script_ui_drawn(&mut self) {
         let game = &mut *self.game;
-        if !game.core.script.drain_draw_commands().is_empty() {
-            game.note("on_draw_ui: the HUD isn't drawn in a headless capture");
-        }
+        // The HUD, as the player collects it: the draw calls, then the UI
+        // documents (#731); the capture paints the last step's
+        let mut hud = game.core.script.drain_draw_commands();
+        let (w, h) = game.screen;
+        hud.extend(game.core.script.generate_ui_draw_commands(w, h));
+        game.hud = hud;
+        // The style field (#859): the step's, as the player hands it over
+        game.style_field = game.core.script.drain_style_field();
         if !game.core.script.drain_world_lines().is_empty() {
             game.note("draw_world_line: world lines aren't drawn in a headless capture");
         }
@@ -571,9 +661,6 @@ impl FrameHost for CaptureFrame<'_> {
         // (a render mode lasts the step that asks)
         let requests = &mut game.core.script_requests;
         game.look.post.merge(std::mem::take(&mut requests.post));
-        if let Some(color) = requests.fog_color.take() {
-            game.look.fog_color = Some(color);
-        }
         game.look.render_mode = requests.render_mode.take();
         if let Some(params) = requests.mode_params.take() {
             game.look.mode_params = Some(params);
@@ -588,6 +675,8 @@ impl FrameHost for CaptureFrame<'_> {
                 s.draw_distance_scale = draw.unwrap_or(s.draw_distance_scale);
                 renderer.set_lod_settings(s);
                 s = renderer.lod_settings();
+                // The quality keys they are (#1149), for get_quality()
+                game.core.script.set_quality_state(*renderer.quality());
             }
             game.core
                 .script
@@ -614,8 +703,22 @@ impl ScriptHost for CaptureFrame<'_> {
         // transition_complete: a capture has no transition to end
     }
 
-    fn set_look(&mut self, name: Option<String>) {
-        self.game.look_request = Some(name);
+    fn set_look(&mut self, name: Option<String>, seconds: f64) {
+        // A look the search can't find changes nothing, as in the player:
+        // neither what get_look() reads (#497) nor the requests the capture
+        // lays (a fade after it starts from the look before it)
+        if let Some(n) = name.as_deref() {
+            if let Err(e) = flint_render::look::find_in(n, &self.game.asset_scope()) {
+                tracing::warn!("set_look: {e}");
+                return;
+            }
+        }
+        self.game.core.script.set_current_look(name.as_deref());
+        self.game.look_requests.push(LookRequest {
+            name,
+            seconds,
+            at: self.game.core.clock.total_time,
+        });
     }
 
     fn set_quality(&mut self, settings: QualitySettings) {
@@ -643,65 +746,47 @@ impl ScriptHost for CaptureFrame<'_> {
     }
 }
 
+/// A script's `set_look` / `clear_look` in a capture (#356, #496).
+#[derive(Debug, Clone, PartialEq)]
+pub struct LookRequest {
+    /// The look, `None` for the scene's keys alone.
+    pub name: Option<String>,
+    /// The cross-fade's length; 0 is a cut.
+    pub seconds: f64,
+    /// The game time the script asked at, which the fade runs from.
+    pub at: f64,
+}
+
 /// Lay `look` over a post-process config, as the player's frame does with its
-/// scripts' overrides. `before` is the look laid last time, so a render mode
-/// that has stopped being asked for is taken off, as the player's is.
-pub fn apply_look(config: &mut PostProcessConfig, look: &ScriptLook, before: &ScriptLook) {
-    let post = &look.post;
-    if let Some(v) = post.vignette {
-        config.vignette_enabled = v > 0.001;
-        config.vignette_intensity = v;
-    }
-    if let Some(b) = post.bloom {
-        config.bloom_intensity = b;
-    }
-    if let Some(e) = post.exposure {
-        config.exposure = e;
-    }
-    if let Some(ca) = post.chromatic_aberration {
-        config.chromatic_aberration = ca;
-    }
-    if let Some(rb) = post.radial_blur {
-        config.radial_blur = rb;
-    }
-    if let Some(si) = post.ssao_intensity {
-        config.ssao_intensity = si;
-    }
-    if let Some(fd) = post.fog_density {
-        config.fog_density = fd;
-    }
-    if let Some(d) = post.desaturation {
-        config.desaturate = d;
-    }
-    if let Some(s) = post.dof_strength {
-        config.dof_strength = s;
-    }
-    if let Some(fd) = post.dof_focus_distance {
-        config.dof_focus_distance = fd;
-    }
-    if let Some(fr) = post.dof_focus_range {
-        config.dof_focus_range = fr;
-    }
-    if let Some(fc) = look.fog_color {
-        config.fog_color = fc;
-    }
-    // A reality tear: transient, unlike the sticky overrides above
-    match look.render_mode {
-        Some((mode, mix)) => {
-            config.render_mode = mode;
-            config.mode_mix = mix;
-        }
-        None if before
-            .render_mode
-            .is_some_and(|(mode, mix)| mode != 0 && mix > 0.0) =>
-        {
-            config.render_mode = 0;
-            config.mode_mix = 0.0;
-        }
-        None => {}
-    }
-    if let Some(mp) = look.mode_params {
-        config.mode_params = mp;
+/// scripts' overrides. `shim` keeps what the deprecated render mode (#746)
+/// overwrote, so one that has stopped being asked for is taken off, as the
+/// player's is; a config replaced whole (a look) goes with `shim.forget()`.
+pub fn apply_look(
+    config: &mut PostProcessConfig,
+    look: &ScriptLook,
+    shim: &mut flint_render::render_mode::RenderModeShim,
+) {
+    stamp_post(config, &look.post);
+    // The deprecated render mode: transient, unlike the sticky overrides
+    // above (#746)
+    let mode = look
+        .render_mode
+        .map(|(mode, mix)| flint_render::render_mode::RenderMode {
+            mode,
+            mix,
+            params: look.mode_params.unwrap_or_default(),
+        });
+    shim.stamp(config, mode);
+}
+
+/// Write each `[post_process]` key scripts set over `config` (#853): the
+/// player's frame and a headless capture both stamp through this. Every key
+/// was checked against the effect descriptors when it was set, which the
+/// config's fields are made from, so each lands.
+pub fn stamp_post(config: &mut PostProcessConfig, post: &PostProcessOverrides) {
+    for (key, value) in post.iter() {
+        let landed = config.param_mut(key).is_some_and(|slot| slot.put(value));
+        debug_assert!(landed, "set_post checked {key}={value}");
     }
 }
 

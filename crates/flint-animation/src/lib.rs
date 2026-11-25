@@ -6,10 +6,12 @@
 //! - **Tier 3**: Node animation — per-node transform animation for scene graphs
 //! - **Tier 4**: Sprite sheet animation — frame-based sprite animation from `.sprite.toml` clips
 
+pub mod animator;
 pub mod blend;
 pub mod clip;
+#[cfg(test)]
+mod clip_rules_tests;
 pub mod ik_pass;
-pub mod layer_edit;
 pub mod loader;
 pub mod node_clip;
 pub mod node_sync;
@@ -25,6 +27,7 @@ pub mod sprite_clip;
 pub mod sprite_sync;
 pub mod sync;
 
+pub use animator::{Animator, LAYER_MODES};
 pub use ik_pass::IkPass;
 pub use playback_state::{AnimLayer, ClipPlaybackState, LayerMode};
 pub use sequence::{
@@ -95,6 +98,7 @@ impl AnimationSystem {
     /// (ADR 0070). Call after scripts, physics and `update` have written their
     /// transforms and before the renderer reads them.
     pub fn run_ik(&mut self, world: &mut FlintWorld) {
+        flint_core::scope!("animation::ik");
         self.ik.run(world);
     }
 
@@ -401,7 +405,7 @@ impl RuntimeSystem for AnimationSystem {
         self.node_sync.sync_from_world(world);
         self.sprite_sync.sync_from_world(world);
         self.sequence_sync.sync_from_world(world);
-        println!(
+        log::debug!(target: "load",
             "Animation system initialized ({} property clips, {} skeletal clips, {} node clips, {} sprite clips, {} sequences, {} property entities, {} skeletal entities, {} node entities, {} sprite entities, {} sequence entities)",
             self.player.clip_count(),
             self.skeletal_sync.clip_count(),
@@ -418,28 +422,44 @@ impl RuntimeSystem for AnimationSystem {
     }
 
     fn update(&mut self, world: &mut FlintWorld, dt: f64) -> Result<()> {
+        flint_core::scope!("animation::update");
         // Tier 1: Property animation
-        self.sync.sync_from_world(world, &self.player);
-        self.sync.advance_and_write(world, &self.player, dt);
+        {
+            flint_core::scope!("animation::property");
+            self.sync.sync_from_world(world, &self.player);
+            self.sync.advance_and_write(world, &self.player, dt);
+        }
 
         // Sequences write animator fields; run them first so Tier 2 sees
         // the writes this frame.
-        self.sequence_sync.sync_from_world(world);
-        self.sequence_sync.advance(world, dt);
+        {
+            flint_core::scope!("animation::sequences");
+            self.sequence_sync.sync_from_world(world);
+            self.sequence_sync.advance(world, dt);
+        }
 
         // Tier 2: Skeletal animation
-        self.skeletal_sync.sync_from_world(world);
-        self.skeletal_sync.advance_and_compute(dt);
-        // Retire finished crossfades in the ECS, or they re-arm forever.
-        self.skeletal_sync.write_back(world);
+        {
+            flint_core::scope!("animation::skeletal");
+            self.skeletal_sync.sync_from_world(world);
+            self.skeletal_sync.advance_and_compute(dt);
+            // Retire finished crossfades in the ECS, or they re-arm forever.
+            self.skeletal_sync.write_back(world);
+        }
 
         // Tier 3: Node transform animation
-        self.node_sync.sync_from_world(world);
-        self.node_sync.advance_and_apply(world, dt);
+        {
+            flint_core::scope!("animation::node");
+            self.node_sync.sync_from_world(world);
+            self.node_sync.advance_and_apply(world, dt);
+        }
 
         // Tier 4: Sprite sheet animation
-        self.sprite_sync.sync_from_world(world);
-        self.sprite_sync.advance_and_write(world, dt);
+        {
+            flint_core::scope!("animation::sprite");
+            self.sprite_sync.sync_from_world(world);
+            self.sprite_sync.advance_and_write(world, dt);
+        }
 
         Ok(())
     }

@@ -147,6 +147,41 @@ impl Look {
     pub fn is_builtin(&self) -> bool {
         self.source == "built-in"
     }
+
+    /// What `seen` says of this look's tables for styles that aren't built
+    /// in (#1272): a style none of them holds, or a key or value the style
+    /// doesn't take. A look carries no registry (#742), so [`Look::parse`]
+    /// judges only the built-ins' tables; the rest are judged here against
+    /// the registries of the scenes that can take the look: a scene's own,
+    /// or each folder of a project (`flint check`). The first registry
+    /// holding a style judges its table.
+    pub fn style_warnings(&self, seen: &[&crate::stylize::StyleRegistry]) -> Vec<String> {
+        // Parsing laid it once already, so this can't fail on a parsed look
+        let Ok(def) = self.apply(None) else {
+            return Vec::new();
+        };
+        let mut warnings = Vec::new();
+        for (name, table) in def.style_tables() {
+            if crate::stylize::is_builtin(&name) {
+                continue;
+            }
+            let Some(judge) = seen.iter().find(|styles| styles.find(&name).is_some()) else {
+                let known: std::collections::BTreeSet<&str> =
+                    seen.iter().flat_map(|styles| styles.names()).collect();
+                let near = flint_core::diagnostic::did_you_mean(&name, known.iter().copied())
+                    .map(|hint| format!("; {hint}"))
+                    .unwrap_or_default();
+                warnings.push(format!(
+                    "unknown style '{name}' in [post_process.styles]: not built in, and no \
+                     styles/ folder a scene taking the look can see has it{near}"
+                ));
+                continue;
+            };
+            let one = std::collections::BTreeMap::from([(name, table)]);
+            warnings.extend(crate::stylize::StyleSettings::from_tables(&one, judge).1);
+        }
+        warnings
+    }
 }
 
 /// `base` with `over` merged into it, checked by deserializing the result.
@@ -154,6 +189,30 @@ impl Look {
 pub fn overlay(
     base: Option<&PostProcessDef>,
     over: &toml::Table,
+) -> Result<PostProcessDef, String> {
+    lay(base, over, Keys::Look)
+}
+
+/// Whose keys [`lay`] puts down.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Keys {
+    /// A look file's (or a sweep's): each mistake is refused, so a typo
+    /// in a look can't vanish into a default.
+    Look,
+    /// A scene's authored `[post_process]`, laid back over a look
+    /// ([`resolve`]). The loader has already read these and warned about
+    /// each mistake (`warning[unknown-field]`, `post-range`, a style
+    /// table's), so they are laid as the loader drew them: an unknown key
+    /// is left out, a value past its range and a style table's warning
+    /// stand. Refusing them here made every look fail in play on a key
+    /// the scene had been warned about and drawn without (#896).
+    Scene,
+}
+
+fn lay(
+    base: Option<&PostProcessDef>,
+    over: &toml::Table,
+    keys: Keys,
 ) -> Result<PostProcessDef, String> {
     let mut table = match base {
         Some(def) => toml::Table::try_from(def)
@@ -166,18 +225,53 @@ pub fn overlay(
     flint_scene::fold_legacy_style_keys(&mut table);
     let mut over = over.clone();
     flint_scene::fold_legacy_style_keys(&mut over);
-    if let Some((key, near)) = PostProcessDef::unknown_fields(&over).into_iter().next() {
-        return Err(format!(
-            "[post_process] has no field '{key}'{}",
-            did_you_mean(near)
-        ));
+    let unknown = PostProcessDef::unknown_fields(&over);
+    match keys {
+        Keys::Scene => {
+            for (key, _) in unknown {
+                over.remove(&key);
+            }
+        }
+        Keys::Look => {
+            if let Some((key, near)) = unknown.into_iter().next() {
+                return Err(format!(
+                    "[post_process] has no field '{key}'{}",
+                    did_you_mean(near)
+                ));
+            }
+            // A built-in effect's value past what it is tuned for is
+            // refused, as a style value in a look is (#355, #741); a
+            // scene's only warns
+            if let Some(first) = flint_schema::post_effects::range_warnings(&over)
+                .into_iter()
+                .next()
+            {
+                return Err(format!("[post_process] {first}"));
+            }
+        }
     }
     merge(&mut table, &over);
     let def: PostProcessDef = toml::Value::Table(table)
         .try_into()
         .map_err(|e| format!("[post_process]: {e}"))?;
-    // The style tables are checked against the registry, as a scene's are.
-    let (_, warnings) = crate::stylize::StyleSettings::from_tables(&def.styles);
+    if keys == Keys::Scene {
+        // The look under these keys was checked whole when it was read
+        // (`found.apply(None)`); what the scene adds the loader judged
+        return Ok(def);
+    }
+    // A built-in style's table is checked as a scene's is. A look carries
+    // no registry: a table naming a game's or a user style is read, and
+    // warned about, against the registry of the scene it is laid on (#742);
+    // `flint check` judges it against its project's (`Look::style_warnings`,
+    // #1272)
+    let builtin: std::collections::BTreeMap<String, toml::Table> = def
+        .styles
+        .iter()
+        .filter(|(name, _)| crate::stylize::is_builtin(name))
+        .map(|(name, table)| (name.clone(), table.clone()))
+        .collect();
+    let (_, warnings) =
+        crate::stylize::StyleSettings::from_tables(&builtin, &crate::stylize::StyleRegistry::new());
     if let Some(first) = warnings.into_iter().next() {
         return Err(first);
     }
@@ -236,6 +330,23 @@ pub fn resolve_in(
     resolve_with(def, look, &mut |name| find_in(name, scope))
 }
 
+/// [`resolve_in`], with a look in `read` (by the name asked) taken from
+/// there instead of searched for and read again (#1159): the player keeps
+/// a scene's `preload_looks` as read at its entry, so the cut to one asks
+/// nothing of the disk (that search stalled a cut 68 ms, measured). A
+/// name `read` doesn't hold is found as `resolve_in` finds it.
+pub fn resolve_read(
+    def: &PostProcessDef,
+    look: Option<&str>,
+    scope: &AssetScope,
+    read: &std::collections::HashMap<String, Look>,
+) -> Result<PostProcessDef, String> {
+    resolve_with(def, look, &mut |name| match read.get(name) {
+        Some(found) => Ok(found.clone()),
+        None => find_in(name, scope),
+    })
+}
+
 fn resolve_with(
     def: &PostProcessDef,
     look: Option<&str>,
@@ -248,11 +359,13 @@ fn resolve_with(
     });
     let look = look.filter(|name| !name.trim().is_empty());
     let mut out = match (look, &authored) {
-        (None, Some(keys)) => overlay(None, keys)?,
+        (None, Some(keys)) => lay(None, keys, Keys::Scene)?,
         (None, None) => def.clone(),
         (Some(name), Some(keys)) => {
             let found = find(name)?;
-            overlay(Some(&found.apply(None)?), keys)?
+            // `find` read the look whole (`Look::parse`), refusing its own
+            // mistakes and naming it; only the scene's keys go on leniently
+            lay(Some(&found.apply(None)?), keys, Keys::Scene)?
         }
         (Some(name), None) => {
             let found = find(name)?;
@@ -437,6 +550,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::disallowed_methods)] // a test reads its own files off the disk
     fn the_shipped_files_are_the_builtins() {
         // A new styles/*.look.toml is compiled in, or a game repo (or the
         // web) can't find it.
@@ -452,6 +566,35 @@ mod tests {
         let mut builtin: Vec<String> = builtin_names().map(str::to_string).collect();
         builtin.sort();
         assert_eq!(on_disk, builtin);
+    }
+
+    /// #1159: a look already read is laid from what was read, and the
+    /// search isn't asked: here there is no file to find.
+    #[test]
+    fn a_look_already_read_is_not_searched_for_again() {
+        let mut files = MemorySource::new();
+        files.insert("game/flint.toml", "");
+        flint_core::vfs::scoped(Arc::new(files), || {
+            let scope = AssetScope::for_scene(Path::new("game/scenes/a.scene.toml"));
+            let def =
+                PostProcessDef::from_authored(toml::from_str("exposure = 2.5").unwrap()).unwrap();
+            assert!(resolve_in(&def, Some("dusk"), &scope).is_err(), "no file");
+            let dusk = Look::parse(
+                "dusk",
+                "[post_process]\nexposure = 0.5\nbloom_intensity = 0.4",
+                "read at the scene's entry",
+            )
+            .unwrap();
+            let read = std::collections::HashMap::from([("dusk".to_string(), dusk)]);
+            let laid = resolve_read(&def, Some("dusk"), &scope, &read).unwrap();
+            assert_eq!(laid.exposure, 2.5, "the scene's own key over the look");
+            assert_eq!(laid.bloom_intensity, 0.4, "the look's");
+            assert_eq!(laid.look.as_deref(), Some("dusk"));
+            // A name it doesn't hold is found as resolve_in finds it
+            let built_in = resolve_read(&def, Some("graphite"), &scope, &read).unwrap();
+            let searched = resolve_in(&def, Some("graphite"), &scope).unwrap();
+            assert_eq!(format!("{built_in:?}"), format!("{searched:?}"));
+        });
     }
 
     #[test]
@@ -487,15 +630,58 @@ mod tests {
         assert!(err.contains("bloom_intensity"), "{err}");
     }
 
+    /// A look carries no registry (#742): a style it names that isn't
+    /// built in may be a user or game style of the scene it is laid on, so
+    /// the look reads, and the scene's registry says what it doesn't hold.
+    /// A built-in style's table is still checked when the look is read.
     #[test]
-    fn an_unknown_style_is_refused() {
-        let err = Look::parse(
+    fn a_style_the_engine_lacks_is_the_scenes_to_judge() {
+        let look = Look::parse(
             "t",
             "[post_process.styles.watercolour]\nenabled = true",
             "test",
         )
-        .unwrap_err();
-        assert!(err.contains("watercolour"), "{err}");
+        .unwrap();
+        let def = look.apply(None).unwrap();
+        let styles = crate::stylize::StyleRegistry::new();
+        let tables = def.style_tables();
+        let (_, warnings) = crate::stylize::StyleSettings::from_tables(&tables, &styles);
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("unknown style 'watercolour'")),
+            "{warnings:?}"
+        );
+        let err = Look::parse("t", "[post_process.styles.ascii]\ncell = 400", "test").unwrap_err();
+        assert!(err.contains("cell=400"), "{err}");
+    }
+
+    /// #1272: what a registry says of a look's tables for styles that
+    /// aren't built in. One that holds no such style names it, with the
+    /// nearest it does hold; the built-ins' tables were judged at parse.
+    #[test]
+    fn a_looks_user_style_tables_are_judged_against_the_registries_given() {
+        let look = Look::parse(
+            "t",
+            "[post_process.styles.watercolour]\nenabled = true\n\
+             [post_process.styles.invert]\nenabled = true",
+            "test",
+        )
+        .unwrap();
+        let styles = crate::stylize::StyleRegistry::new();
+        let warnings = look.style_warnings(&[&styles]);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].contains("unknown style 'watercolour'")
+                && warnings[0].contains("did you mean `watercolor`?"),
+            "{warnings:?}"
+        );
+        // No registry at all: still named
+        assert_eq!(look.style_warnings(&[]).len(), 1);
+        // A look naming built-ins alone has nothing to say
+        let plain =
+            Look::parse("p", "[post_process.styles.invert]\nenabled = true", "test").unwrap();
+        assert!(plain.style_warnings(&[&styles]).is_empty());
     }
 
     #[test]
@@ -567,6 +753,69 @@ mod tests {
         assert_eq!(none.look, None);
     }
 
+    /// Done when #896: Float's scenes carried `enabled = true` and
+    /// `vignette = 0.18`, neither a field. The loader warns and ignores
+    /// them; laying the scene's keys back over a look (what `set_look` and
+    /// F4's Look picker do in play) left them out too, rather than failing
+    /// every look on the first.
+    #[test]
+    fn a_scenes_unknown_key_doesnt_stop_a_look() {
+        let scene = authored("enabled = true\nvignette = 0.18\nexposure = 1.3");
+        for look in [Some("graphite"), Some("ink_wash"), None] {
+            let out =
+                resolve(&scene, look, "x.scene.toml").unwrap_or_else(|e| panic!("{look:?}: {e}"));
+            assert_eq!(out.exposure, 1.3, "{look:?}: the scene's own key stays");
+            assert_eq!(out.look.as_deref(), look);
+            assert_eq!(
+                out.authored, scene.authored,
+                "the authored record is kept whole, so the next look starts from the scene"
+            );
+        }
+        let graphite = resolve(&scene, Some("graphite"), "x.scene.toml").unwrap();
+        assert!(graphite.styles.contains_key("pencil"), "the look is drawn");
+        // The scene's look, as the player and `flint render` read it
+        let named = authored("look = \"graphite\"\nenabled = true");
+        assert_eq!(
+            resolve_scene(&named, "x.scene.toml").look.as_deref(),
+            Some("graphite")
+        );
+    }
+
+    /// A scene's value past its tuned range only warns at load (#741), so
+    /// it doesn't stop a look either; it is drawn as the scene asked.
+    #[test]
+    fn a_scenes_out_of_range_value_doesnt_stop_a_look() {
+        let scene = authored("bloom_intensity = 3.0");
+        let out = resolve(&scene, Some("graphite"), "x.scene.toml").unwrap();
+        assert_eq!(out.bloom_intensity, 3.0);
+    }
+
+    /// The other half of #896: a look file's own mistake is still refused,
+    /// naming the look, whether a scene's keys go over it or not.
+    #[test]
+    fn a_look_files_misspelt_key_is_still_refused_naming_the_look() {
+        let source: MemorySource = [
+            (
+                "game/styles/dusk.look.toml",
+                b"[post_process]\nexposure = 0.6\nbloom_intensty = 0.2\n".to_vec(),
+            ),
+            ("game/a.scene.toml", b"[scene]\nname = \"a\"\n".to_vec()),
+        ]
+        .into_iter()
+        .collect();
+        vfs::scoped(Arc::new(source), || {
+            let path = "game/a.scene.toml";
+            for scene in [authored("enabled = true\nexposure = 1.3"), authored("")] {
+                let err = resolve(&scene, Some("dusk"), path).unwrap_err();
+                assert!(err.contains("look 'dusk'"), "names the look: {err}");
+                assert!(err.contains("'bloom_intensty'"), "names the key: {err}");
+                assert!(err.contains("did you mean 'bloom_intensity'"), "{err}");
+            }
+        });
+        let ranged = Look::parse("t", "[post_process]\nbloom_intensity = 3.0", "test").unwrap_err();
+        assert!(ranged.contains("look 't'"), "{ranged}");
+    }
+
     #[test]
     fn an_unknown_scene_look_draws_without_it() {
         let scene = authored("look = \"nope\"\nexposure = 1.4");
@@ -581,6 +830,7 @@ mod tests {
     /// Looks are found through the vfs (the web's bundle), nearest
     /// folder first, and a file shadows a built-in of its name.
     #[test]
+    #[allow(clippy::disallowed_methods)] // a test asserts on the TOML exactly as written
     fn looks_are_found_through_the_vfs() {
         let source: MemorySource = [
             (
@@ -620,6 +870,7 @@ mod tests {
     /// mounted engine's; the nearest of a name wins, a file before a
     /// built-in; and a miss lists the paths tried.
     #[test]
+    #[allow(clippy::disallowed_methods)] // a test asserts on the TOML exactly as written
     fn a_nested_scene_finds_the_projects_looks_by_the_one_rule() {
         let look = |exposure: f32| format!("[post_process]\nexposure = {exposure}\n").into_bytes();
         let source: MemorySource = [

@@ -3,10 +3,10 @@
 //! nearest-neighbour zooms of a region of every variant (`--zoom`).
 //!
 //! ```text
-//! flint render examples/ascii_entities.scene.toml -o cmp.png \
+//! flint render flint-examples/ascii_entities.scene.toml -o cmp.png \
 //!     --variant "as authored:" \
-//!     --variant "full screen: --ascii-scope screen" \
-//!     --variant "object grid: --ascii-grid object" \
+//!     --variant "full screen: --style ascii:scope=screen" \
+//!     --variant "object grid: --style ascii:grid=object" \
 //!     --zoom 800,380,1120,560@3
 //! ```
 //!
@@ -267,7 +267,7 @@ impl Zoom {
 ///
 /// [[variant]]
 /// label = "full screen"
-/// flags = "--ascii-scope screen"                    # or ["--ascii-scope", "screen"]
+/// flags = "--style ascii:scope=screen"             # or ["--style", "ascii:scope=screen"]
 /// ```
 #[derive(Debug, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -405,9 +405,12 @@ fn parse_render(words: Vec<OsString>) -> Result<RenderArgs> {
     use clap::{Args, FromArgMatches};
     let command =
         RenderArgs::augment_args(clap::Command::new("flint render")).args_override_self(true);
+    let words: Vec<OsString> = std::iter::once(OsString::from("flint render"))
+        .chain(words)
+        .collect();
     let matches = command
-        .try_get_matches_from(std::iter::once(OsString::from("flint render")).chain(words))
-        .map_err(|e| anyhow!("{e}"))?;
+        .try_get_matches_from(&words)
+        .map_err(|e| anyhow!("{}", super::render_retired::explained(e, &words)))?;
     RenderArgs::from_arg_matches(&matches).map_err(|e| anyhow!("{e}"))
 }
 
@@ -490,12 +493,12 @@ impl Outputs {
 
 /// The labelled sheet of every variant, and a sheet of each zoom.
 pub fn run(args: &RenderArgs, host: &mut RenderHost) -> Result<()> {
-    let mut loaded = match &args.variants {
+    let mut loaded = match &args.sweeps.variants {
         Some(path) => load_file(Path::new(path))?,
         None => Loaded::default(),
     };
-    loaded.variants.extend(args.variant.iter().cloned());
-    loaded.zooms.extend(args.zoom.iter().copied());
+    loaded.variants.extend(args.sweeps.variant.iter().cloned());
+    loaded.zooms.extend(args.sweeps.zoom.iter().copied());
     let Loaded {
         title,
         zooms,
@@ -504,7 +507,7 @@ pub fn run(args: &RenderArgs, host: &mut RenderHost) -> Result<()> {
     if variants.is_empty() {
         bail!(
             "--variants {}: the file lists no [[variant]]",
-            args.variants.as_deref().unwrap_or("")
+            args.sweeps.variants.as_deref().unwrap_or("")
         );
     }
     if variants.len() > MAX_VARIANTS {
@@ -532,7 +535,10 @@ pub fn run(args: &RenderArgs, host: &mut RenderHost) -> Result<()> {
         words.push(path.clone().into_os_string());
         let mut render = parse_render(words)
             .with_context(|| format!("variant '{}' ({})", variant.label, variant.flags_text()))?;
-        if render.variants.is_some() || !render.variant.is_empty() || !render.zoom.is_empty() {
+        if render.sweeps.variants.is_some()
+            || !render.sweeps.variant.is_empty()
+            || !render.sweeps.zoom.is_empty()
+        {
             bail!(
                 "variant '{}': a variant's flags can't hold --variant, --variants or --zoom",
                 variant.label
@@ -645,7 +651,7 @@ pub fn run(args: &RenderArgs, host: &mut RenderHost) -> Result<()> {
     sheet
         .save(&args.output)
         .with_context(|| format!("writing {}", args.output))?;
-    println!(
+    crate::output::say!(
         "Wrote {} variants as one {}x{} sheet to {} (each variant's frame beside it as {})",
         variants.len(),
         sheet.width(),
@@ -654,6 +660,10 @@ pub fn run(args: &RenderArgs, host: &mut RenderHost) -> Result<()> {
         outputs.file("<label>").display()
     );
 
+    let mut written = vec![args.output.replace('\\', "/")];
+    for slug in &slugs {
+        written.push(path_text(&outputs.file(slug)));
+    }
     for (k, zoom) in zooms.iter().enumerate() {
         let suffix = Outputs::zoom_suffix(k);
         let crops: Vec<RgbaImage> = frames.iter().map(|f| zoom.crop(f)).collect();
@@ -680,15 +690,29 @@ pub fn run(args: &RenderArgs, host: &mut RenderHost) -> Result<()> {
         sheet
             .save(&path)
             .with_context(|| format!("writing {}", path.display()))?;
-        println!(
+        crate::output::say!(
             "Wrote zoom {} as a {}x{} sheet to {}",
             zoom.describe(),
             sheet.width(),
             sheet.height(),
             path.display()
         );
+        written.push(path_text(&path));
     }
+    crate::output::when_json(|| {
+        serde_json::json!({
+            "scene": scene_name,
+            "output": args.output,
+            "variants": variants.iter().map(|v| v.label.clone()).collect::<Vec<_>>(),
+            "written": written,
+        })
+    });
     Ok(())
+}
+
+/// A path as the JSON spells it: `/` on every platform.
+fn path_text(path: &Path) -> String {
+    path.display().to_string().replace('\\', "/")
 }
 
 /// Render each variant on `host`'s GPU and read its frame back.
@@ -700,7 +724,7 @@ fn draw_all(
     let n = variants.len();
     let mut frames = Vec::with_capacity(n);
     for (i, ((render, path), variant)) in parsed.into_iter().zip(variants).enumerate() {
-        println!(
+        crate::output::say!(
             "[{}/{n}] {}: {}",
             i + 1,
             variant.label,
@@ -761,11 +785,12 @@ mod tests {
 
     #[test]
     fn a_variant_is_a_label_and_its_flags() {
-        let v = parse_variant("full screen: --ascii-scope screen --style ascii:cell=12").unwrap();
+        let v =
+            parse_variant("full screen: --style ascii:scope=screen --set ascii.cell=12").unwrap();
         assert_eq!(v.label, "full screen");
         assert_eq!(
             v.flags,
-            ["--ascii-scope", "screen", "--style", "ascii:cell=12"]
+            ["--style", "ascii:scope=screen", "--set", "ascii.cell=12"]
         );
         // Flags alone label themselves; a bare label is the base command
         let v = parse_variant("--no-shadows").unwrap();
@@ -774,7 +799,7 @@ mod tests {
         assert_eq!((v.label.as_str(), v.flags.len()), ("as authored", 0));
         let v = parse_variant("as authored:").unwrap();
         assert!(v.flags.is_empty());
-        assert!(parse_variant("x: examples/other.scene.toml").is_err());
+        assert!(parse_variant("x: levels/other.scene.toml").is_err());
         assert!(parse_variant("  ").is_err());
     }
 
@@ -782,12 +807,12 @@ mod tests {
     fn words_split_on_spaces_outside_quotes_and_keep_backslashes() {
         assert_eq!(
             split_words(
-                r#"--ascii-palette palettes\warm.palette.toml --look 'a b' --x "say \"hi\"""#
+                r#"--style ascii:palette=palettes\warm.palette.toml --look 'a b' --x "say \"hi\"""#
             )
             .unwrap(),
             [
-                "--ascii-palette",
-                r"palettes\warm.palette.toml",
+                "--style",
+                r"ascii:palette=palettes\warm.palette.toml",
                 "--look",
                 "a b",
                 "--x",
@@ -827,28 +852,25 @@ mod tests {
     #[test]
     fn the_base_command_drops_this_commands_own_flags() {
         let base = base_words(&words(
-            "examples/a.scene.toml --variant 'x: --ascii' -o out.png --zoom 0,0,9,9 \
+            "levels/a.scene.toml --variant 'x: --style ascii' -o out.png --zoom 0,0,9,9 \
              --variants=v.toml --width 640 -oother.png --output=o.png --distance 5",
         ));
-        assert_eq!(
-            base,
-            words("examples/a.scene.toml --width 640 --distance 5")
-        );
+        assert_eq!(base, words("levels/a.scene.toml --width 640 --distance 5"));
     }
 
     #[test]
     fn the_subcommand_words_skip_the_global_project() {
         let argv =
-            words("flint --project ../game render examples/a.scene.toml --project=x --ascii");
+            words("flint --project ../game render levels/a.scene.toml --project=x --no-grid");
         assert_eq!(
             subcommand_words(argv),
-            words("examples/a.scene.toml --ascii")
+            words("levels/a.scene.toml --no-grid")
         );
     }
 
     #[test]
     fn a_variant_overrides_the_base_and_adds_to_repeatable_flags() {
-        let mut w = words("examples/a.scene.toml --width 640 --style ascii:cell=8");
+        let mut w = words("levels/a.scene.toml --width 640 --style ascii:cell=8");
         w.extend(words(
             "--width 800 --style ascii:ramp=blocks --output x.png",
         ));
@@ -856,7 +878,7 @@ mod tests {
         assert_eq!(args.width, Some(800));
         assert_eq!(args.style.styles.len(), 2);
         assert_eq!(args.output, "x.png");
-        assert_eq!(args.scene, "examples/a.scene.toml");
+        assert_eq!(args.scene, "levels/a.scene.toml");
     }
 
     #[test]
@@ -881,7 +903,7 @@ mod tests {
             label = "authored"
             [[variant]]
             label = "full"
-            flags = "--ascii-scope screen"
+            flags = "--style ascii:scope=screen"
             [[variant]]
             label = "cells"
             flags = ["--style", "ascii:cell=12"]
@@ -892,9 +914,9 @@ mod tests {
         assert_eq!(loaded.zooms.len(), 1);
         assert_eq!(loaded.variants.len(), 3);
         assert!(loaded.variants[0].flags.is_empty());
-        assert_eq!(loaded.variants[1].flags, ["--ascii-scope", "screen"]);
+        assert_eq!(loaded.variants[1].flags, ["--style", "ascii:scope=screen"]);
         assert_eq!(loaded.variants[2].flags, ["--style", "ascii:cell=12"]);
-        assert!(parse_file("[[variant]]\nlabel = \"x\"\nflag = \"--ascii\"").is_err());
+        assert!(parse_file("[[variant]]\nlabel = \"x\"\nflag = \"--no-grid\"").is_err());
         assert!(parse_file("[[variant]]\nlabel = \"x\"\nflags = \"scene.toml\"").is_err());
     }
 

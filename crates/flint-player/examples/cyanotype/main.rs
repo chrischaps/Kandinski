@@ -11,7 +11,7 @@
 //! cargo run -p flint-player --example cyanotype
 //! cargo run -p flint-player --example cyanotype -- --style cyanotype:process=print
 //! cargo run -p flint-player --example cyanotype -- --screenshot print.png
-//! cargo run -p flint-player --example cyanotype -- --scene examples/double_sided.scene.toml \
+//! cargo run -p flint-player --example cyanotype -- --scene flint-examples/double_sided.scene.toml \
 //!     --style cyanotype
 //! ```
 //!
@@ -38,9 +38,9 @@ impl PlayerExtension for SunPrints {
 }
 
 fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::new("warn"))
-        .init();
+    // The player's log (#716): the load summary, the controls line and
+    // what scripts print, on stderr, as `flint play` says them
+    flint_player::logging::init(&flint_player::logging::LogArgs::default());
 
     let args: Vec<String> = std::env::args().skip(1).collect();
     let value = |flag: &str| {
@@ -85,7 +85,8 @@ fn main() -> anyhow::Result<()> {
     // the registry when the renderer is made, and a `--style` word too.
     player.add_extension(Box::new(SunPrints));
     // So a typo in a word stops here, as it does in flint-player
-    flint_render::stylize::check_style_specs(&styles).map_err(anyhow::Error::msg)?;
+    flint_render::stylize::check_style_specs(&styles, &player.core.styles)
+        .map_err(anyhow::Error::msg)?;
     player.launch.style_specs = styles;
     if screenshot.is_some() {
         player.capture = CaptureConfig::new(screenshot, at, None, Some(at + 0.5));

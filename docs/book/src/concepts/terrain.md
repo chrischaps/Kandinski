@@ -1,5 +1,7 @@
 # Terrain
 
+> **Package:** `engine`: every game has it. Its terrain is grouped in the engine's manifest as the package it becomes in a later phase, with no switch yet ([Packages](packages.md)).
+
 Flint's terrain system provides heightmap-based outdoor environments via the `flint-terrain` crate. Rolling hills, mountains, valleys, and open landscapes are defined by a grayscale heightmap image and textured with up to four blended surface layers controlled by an RGBA splat map.
 
 ## How It Works
@@ -14,7 +16,7 @@ Heightmap PNG          flint-terrain              flint-render
                                                    cascaded shadows
 
 Splat Map PNG                                    flint-physics
-  RGBA channels  ──►  4-layer texture blend      Rapier trimesh
+  RGBA channels  ──►  4-layer texture blend      Rapier heightfield
   R=grass G=dirt       tiled from world pos       collision collider
   B=rock  A=sand
 ```
@@ -92,6 +94,24 @@ Splat maps can be painted manually in any image editor that supports RGBA channe
 - **Mid elevations** --- dirt (green channel)
 - **Steep slopes / high peaks** --- rock (blue channel)
 - **Very low areas** --- sand (alpha channel)
+
+## Generating Terrain From a Spec
+
+A `.terrain.toml` spec describes both maps as a recipe: `[geometry]` (size, height and resolution), a list of `[[height_layers]]` run in order (`op = "noise"`, `"flatten"` or `"erosion"`), and `[[splat_rules]]` that paint each layer by height, slope and noise. [`flint-examples/rolling_meadow.terrain.toml`](https://github.com/chrischaps/flint-examples/blob/main/rolling_meadow.terrain.toml) is one. Shape it by eye in the terrain editor (`flint edit x.terrain.toml`), or bake it from the command line:
+
+```bash
+flint gen flint-examples/rolling_meadow.terrain.toml -o terrain/meadow.png   # terrain/meadow_height.png + meadow_splat.png
+flint gen flint-examples/rolling_meadow.terrain.toml -o terrain/             # terrain/output_height.png + output_splat.png
+flint gen flint-examples/rolling_meadow.terrain.toml --seed 12 --dry-run     # what it would write, and the cost
+flint gen flint-examples/rolling_meadow.terrain.toml -o terrain/meadow.png --register   # kept in the project's store, reused
+flint gen --describe terrain_v1                                              # every key, its default and range
+```
+
+A terrain spec is a procgen spec for the `terrain_v1` generator (Flint#1168). `flint gen` reads a `.terrain.toml` as one: `[meta]` and `[seed]` stay where they are, and the other tables are its `[params]`, so `--print-spec` writes the same recipe as a `*.procgen.toml` (`generator = "terrain_v1"`, `[params.geometry]`, `[[params.height_layers]]`), which bakes the same maps. Everything a procgen spec has, a terrain spec has: `--register` keeps both maps in the project's store and hands them back while the spec, seed and generator are unchanged; `--batch` makes variants by seed; `--validate` reads the written maps back; and the AI steps write and refine recipes (`flint gen --ai-create "rolling hills with a river valley" --ai-generator terrain_v1 -o terrain/`, where a word such as hills, mountains or valley picks `terrain_v1` without the flag).
+
+The heightmap is a 16-bit greyscale PNG and the splat map an RGBA8 PNG at the same resolution, written as `<stem>_height.png` and `<stem>_splat.png`; point the `terrain` component's `heightmap` and `splat_map` at them. Both are the bytes the editor's Ctrl+E export writes (the one bake, `flint_terrain::bake`, makes both), and the same spec and seed bake the same bytes every run. The summary says how much of the ground each layer covers.
+
+The spec is checked against `terrain_v1`'s schema before anything is baked, by path. A key nothing reads is a warning with the key it was probably meant to be (``warning: `height_layers[1].octave` is not a parameter of the noise layer (did you mean `octaves`?)``), and `--strict` makes it an error. A value the bake can't use is an error that stops the run: a splat rule for a layer past 3, a `noise_type` that isn't one, a resolution over 4096. The terrain editor lists the same lines under its Save buttons while the file has them.
 
 ## Texture Tiling
 
@@ -189,13 +209,15 @@ The **Grass Debug** panel (`F3` in the player, see [Debug Panels](../guides/debu
 
 ## Physics Collision
 
-Terrain automatically gets a **trimesh physics collider** via Rapier. The mesh geometry is exported as vertices and triangle indices, then registered as a fixed (immovable) rigid body. This means:
+Terrain automatically gets a **heightfield physics collider** via Rapier: the chunks' vertex grid as one grid of heights, on a fixed (immovable) rigid body. This means:
 
 - Characters walk on the terrain surface naturally
 - Objects collide with the terrain
 - Raycasts hit the terrain for line-of-sight checks
 
-The collider shape exactly matches the rendered mesh, so what you see is what you collide with.
+The collider is the rendered mesh triangle for triangle: each cell is split along the same diagonal the chunks use, so what you see is what you collide with. A heightfield is Rapier's own shape for a grid of heights. It holds one number a vertex rather than a mesh's points and triangles, and it knows its cells' neighbours, so the edges between cells and the seams between chunks are smooth to anything rolling or walking over them: a ball rolling across them no longer hops (until #1219 the collider was the chunks' triangles as one trimesh, and a ball rolling down a slope could be thrown 0.19 m into the air at a cell edge).
+
+The terrain's collider takes its entity's `collider.layer` and `mask` like any other, and `get_collider_extents` on it answers `shape: "heightfield"` with its box.
 
 ## Height Sampling from Scripts
 
@@ -248,8 +270,8 @@ Terrain is fully cleared and reloaded during [scene transitions](scripting.md). 
 The terrain system is split across crates to maintain clean dependency boundaries:
 
 - **`flint-terrain`** --- pure data crate (no GPU dependency). Generates chunked mesh geometry from heightmap data. Outputs raw positions, normals, UVs, and indices.
-- **`flint-render`** --- `TerrainPipeline` and `terrain_shader.wgsl`. Assembles GPU vertex buffers from terrain data, handles splat-map texture blending and PBR lighting. `GrassPipeline` with `grass_compute.wgsl` and `grass_render.wgsl` owns the grass layer; `flint-terrain` only holds its `GrassConfig`.
-- **`flint-physics`** --- reuses existing `register_static_trimesh()` for collision. No terrain-specific physics code needed.
+- **`flint-render`** --- `TerrainPipeline` and `terrain_shader.wgsl`. Assembles GPU vertex buffers from terrain data and handles splat-map texture blending; its lighting is the meshes' own (`direct_light.wgsl`, #738). `GrassPipeline` with `grass_compute.wgsl` and `grass_render.wgsl` owns the grass layer; `flint-terrain` only holds its `GrassConfig`.
+- **`flint-physics`** --- `register_static_heightfield()` takes the terrain's `height_grid()` (its chunks' vertices as one grid) for collision; physics reads no terrain files.
 - **`flint-script`** --- `terrain_height(x, z)` Rhai function via callback pattern.
 
 This separation means `flint-terrain` can be used independently for tools, CLI commands, or headless processing without pulling in the GPU stack.
@@ -262,7 +284,7 @@ This separation means `flint-terrain` can be used independently for tools, CLI c
 - **CPU-side simulation** --- no GPU compute for terrain generation
 - **Fixed PBR parameters** --- metallic and roughness are uniform across the entire terrain surface
 
-See the [Terrain Roadmap](../../../TERRAIN_ROADMAP.md) for planned features including LOD, sculpting, auto-splatting, triplanar mapping, and more.
+See the [Terrain Roadmap](https://github.com/chrischaps/Flint/blob/main/docs/TERRAIN_ROADMAP.md) for planned features: chunk LOD, per-layer normal maps, triplanar mapping, several terrains a scene, and more.
 
 ## Further Reading
 

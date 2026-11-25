@@ -23,6 +23,7 @@
 //! Nothing is ever deleted or overwritten: a directory with files in it is
 //! refused unless `--force`, and with `--force` a file already there is kept.
 
+use crate::output::say;
 use anyhow::{bail, Context, Result};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -87,6 +88,11 @@ const SHARED: &[File] = &[
     ("AGENTS.md", template!("shared/agents.md")),
     ("bundle.toml", template!("shared/bundle.toml")),
     ("config/input.toml", template!("shared/config/input.toml")),
+    ("ui/pause.ui.toml", template!("shared/ui/pause.ui.toml")),
+    (
+        "ui/pause.style.toml",
+        template!("shared/ui/pause.style.toml"),
+    ),
     (".gitignore", template!("shared/gitignore")),
     // Folders git would not keep empty. The game's schemas start empty:
     // the engine's are named by flint.toml, not copied.
@@ -94,6 +100,22 @@ const SHARED: &[File] = &[
     ("schemas/archetypes/.gitkeep", ""),
     ("renders/.gitignore", "*\n!.gitignore\n"),
 ];
+
+/// The engine's menu helpers (#731), which every template's HUD imports
+/// (`import "menu"`). The search finds `scripts/lib/` in the project, then
+/// in `engine/`, never in a checkout named by path, so a project with no
+/// `engine/` carries this copy of the engine's own file (#1228). With
+/// `--engine subtree` the engine's is found and nothing is copied.
+const MENU_LIB: File = (
+    "scripts/lib/menu.rhai",
+    concat!(
+        "// A copy of the engine's scripts/lib/menu.rhai, written by `flint init`.\n",
+        "// Once the engine is a subtree at engine/, delete it: the same import\n",
+        "// then finds the engine's own, which follows engine updates.\n",
+        "//\n",
+        include_str!("../../../../scripts/lib/menu.rhai")
+    ),
+);
 
 impl Template {
     fn name(self) -> &'static str {
@@ -157,9 +179,11 @@ impl Template {
     /// The web page's controls line.
     fn controls(self) -> &'static str {
         match self {
-            Template::Walk => "WASD to walk, mouse to look, Space to jump, H for help",
-            Template::Blank => "H for help",
-            Template::TwoD => "WASD to move, H for help",
+            Template::Walk => {
+                "WASD to walk, mouse to look, Space to jump, H for help, Esc to pause"
+            }
+            Template::Blank => "H for help, Esc to pause",
+            Template::TwoD => "WASD to move, H for help, Esc to pause",
         }
     }
 
@@ -314,6 +338,11 @@ pub fn run(args: InitArgs) -> Result<()> {
         ),
     };
     let template = args.template;
+    // Where `import "menu"` finds the menu helpers
+    let menu_lib = match args.engine {
+        EngineMode::Subtree => "engine/scripts/lib/menu.rhai",
+        _ => MENU_LIB.0,
+    };
     let values: &[(&str, &str)] = &[
         // Sections first: they hold the keys below
         ("engine_section", engine_section.trim_end()),
@@ -323,6 +352,7 @@ pub fn run(args: InitArgs) -> Result<()> {
         ("template_blurb", template.blurb()),
         ("scripts_note", template.scripts_note()),
         ("controls", template.controls()),
+        ("menu_lib", menu_lib),
         ("template", template.name()),
         ("engine", engine_dir.as_deref().unwrap_or("")),
         ("schemas", &schemas),
@@ -332,7 +362,11 @@ pub fn run(args: InitArgs) -> Result<()> {
 
     let mut written = Vec::new();
     let mut kept = Vec::new();
-    for (path, text) in SHARED.iter().chain(template.files()) {
+    let menu_copy: &[File] = match args.engine {
+        EngineMode::Subtree => &[],
+        _ => &[MENU_LIB],
+    };
+    for (path, text) in SHARED.iter().chain(template.files()).chain(menu_copy) {
         let to = dir.join(path);
         if to.exists() {
             kept.push(*path);
@@ -352,7 +386,7 @@ pub fn run(args: InitArgs) -> Result<()> {
 /// What a file is, for the printed list.
 fn describes(path: &str, template: Template) -> String {
     match path {
-        "flint.toml" => "the manifest: id, schemas, start scene, input".into(),
+        "flint.toml" => "the manifest: id, schemas, start scene, input, packages".into(),
         "CLAUDE.md" => "the guide to this project, for you and for agents".into(),
         "AGENTS.md" => "points other agents at CLAUDE.md".into(),
         "bundle.toml" => "packing rules for the web build".into(),
@@ -365,18 +399,21 @@ fn describes(path: &str, template: Template) -> String {
         "scenes/main.scene.toml" => template.scene_line().into(),
         "scripts/hud.rhai" => "the HUD, drawn by the scene's hud_controller".into(),
         "scripts/player.rhai" => "steers the player sprite".into(),
+        "scripts/lib/menu.rhai" => "the engine's menu helpers, copied".into(),
+        "ui/pause.ui.toml" => "the pause menu (Esc or Start), a UI document".into(),
+        "ui/pause.style.toml" => "the pause menu's look".into(),
         _ => String::new(),
     }
 }
 
 fn report(args: &InitArgs, name: &str, engine: Option<&str>, written: &[&str], kept: &[&str]) {
     let template = args.template;
-    println!(
+    say!(
         "Created Flint project `{name}` ({} template) in {}",
         template.name(),
         slashed(Path::new(&args.name))
     );
-    println!();
+    say!();
     let mut paths: Vec<&str> = written.to_vec();
     paths.sort_by_key(|p| (p.matches('/').count() > 0, *p));
     for path in paths {
@@ -385,61 +422,84 @@ fn report(args: &InitArgs, name: &str, engine: Option<&str>, written: &[&str], k
             Some((folder, ".gitkeep" | ".gitignore")) => format!("{folder}/"),
             _ => path.to_string(),
         };
-        println!("  {shown:<26} {}", describes(path, template));
+        say!("  {shown:<26} {}", describes(path, template));
     }
     for path in kept {
-        println!("  {path:<26} kept: it was already there");
+        say!("  {path:<26} kept: it was already there");
     }
-    println!();
+    say!();
 
     let scene = "scenes/main.scene.toml";
     match (args.engine, engine) {
         (EngineMode::Path, Some(engine)) => {
-            println!("Engine: {engine}");
-            println!("  flint.toml names its schemas by that path, so the commands below work");
-            println!("  now, on this machine. CLAUDE.md says how to carry the engine inside the");
-            println!("  game instead (a git subtree at engine/), as Flint's games do.");
+            say!("Engine: {engine}");
+            say!("  flint.toml names its schemas by that path, so the commands below work");
+            say!("  now, on this machine. CLAUDE.md says how to carry the engine inside the");
+            say!("  game instead (a git subtree at engine/), as Flint's games do.");
         }
         (EngineMode::Subtree, _) => {
-            println!("Engine: engine/ (a git subtree; not added yet)");
-            println!("  flint.toml names engine/schemas. flint init runs no git, so until the");
-            println!("  subtree is added every flint command here stops with `schema directory");
-            println!("  not found`.");
+            say!("Engine: engine/ (a git subtree; not added yet)");
+            say!("  flint.toml names engine/schemas. flint init runs no git, so until the");
+            say!("  subtree is added every flint command here stops with `schema directory");
+            say!("  not found`.");
         }
         _ => {
-            println!("Engine: none named");
-            println!("  flint.toml lists only the game's own, empty schemas/. The scene validates");
-            println!(
-                "  and renders, but an engine archetype resolves to nothing and `flint schema`"
-            );
-            println!("  finds no engine component. CLAUDE.md says how to name an engine.");
+            say!("Engine: none named");
+            say!("  flint.toml lists only the game's own, empty schemas/. The scene validates");
+            say!("  and renders, but an engine archetype resolves to nothing and `flint schema`");
+            say!("  finds no engine component. CLAUDE.md says how to name an engine.");
         }
     }
-    println!();
-    println!("Next steps:");
+    say!();
+    let mut next = Vec::new();
     if Path::new(&args.name) != Path::new(".") {
         let dir = slashed(Path::new(&args.name));
         if dir.contains(' ') {
-            println!("  cd \"{dir}\"");
+            next.push(format!("cd \"{dir}\""));
         } else {
-            println!("  cd {dir}");
+            next.push(format!("cd {dir}"));
         }
     }
     if args.engine == EngineMode::Subtree {
-        println!("  git init");
-        println!("  git add .");
-        println!("  git commit -m \"Start {name}\"");
-        println!("  git remote add flint-engine https://github.com/chrischaps/Flint.git");
-        println!("  git subtree add --prefix=engine flint-engine main --squash");
+        next.push("git init".to_string());
+        next.push("git add .".to_string());
+        next.push(format!("git commit -m \"Start {name}\""));
+        next.push(
+            "git remote add flint-engine https://github.com/chrischaps/Flint.git".to_string(),
+        );
+        next.push("git subtree add --prefix=engine flint-engine main --squash".to_string());
     }
-    println!("  flint check");
-    println!("  flint render {scene} --output renders/main.png");
+    next.push("flint check".to_string());
+    next.push(format!("flint render {scene} --output renders/main.png"));
     if args.engine != EngineMode::None {
-        println!("  flint play");
+        next.push("flint play".to_string());
     }
-    println!();
-    println!("CLAUDE.md in the project is the map: the loop, where each file lives, how to");
-    println!("find components and script functions, and what trips people up.");
+    say!("Next steps:");
+    for line in &next {
+        say!("  {line}");
+    }
+    say!();
+    say!("CLAUDE.md in the project is the map: the loop, where each file lives, how to");
+    say!("find components and script functions, and what trips people up.");
+    crate::output::when_json(|| {
+        serde_json::json!({
+            "name": name,
+            "dir": slashed(Path::new(&args.name)),
+            "template": template.name(),
+            "engine": {
+                "mode": match args.engine {
+                    EngineMode::Path => "path",
+                    EngineMode::Subtree => "subtree",
+                    EngineMode::None => "none",
+                },
+                "path": engine,
+            },
+            "written": written,
+            "kept": kept,
+            "next_steps": next,
+            "guide": "CLAUDE.md",
+        })
+    });
 }
 
 #[cfg(test)]
@@ -474,6 +534,7 @@ mod tests {
             "template_blurb",
             "scripts_note",
             "controls",
+            "menu_lib",
             "template",
             "engine",
             "schemas",
@@ -494,6 +555,7 @@ mod tests {
             .chain(Template::Walk.files())
             .chain(Template::Blank.files())
             .chain(Template::TwoD.files())
+            .chain(std::iter::once(&MENU_LIB))
             .map(|(_, text)| *text)
             .chain(sections);
         for text in files {

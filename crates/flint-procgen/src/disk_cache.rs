@@ -3,7 +3,7 @@
 //! The in-memory [`ProcGenCache`](crate::ProcGenCache) only helps on a
 //! revisit within one run; without this tier every launch of the player
 //! regenerates every procgen texture and mesh (about 3 s of a 4 s start on
-//! `showcase_game/levels/tavern_hub.scene.toml`). Underneath it, each output
+//! the tavern level of the example game kept in the checkout). Underneath it, each output
 //! is kept as one file in a directory, usually `<project>/.flint/procgen-cache/`.
 //!
 //! - **The key** is whatever the memory cache is keyed on, the spec's hash
@@ -76,7 +76,7 @@ pub struct DiskStats {
 const MAGIC: &[u8; 4] = b"FPGC";
 /// Bump when the encoding (or anything in `GeneratorOutput`'s types) changes
 /// shape: every file written under another version is then a miss.
-pub const DISK_FORMAT: u32 = 1;
+pub const DISK_FORMAT: u32 = 2; // 2: `ImageData::format` (#1168)
 const HEADER_LEN: usize = 8;
 const EXTENSION: &str = "fpgc";
 
@@ -168,7 +168,7 @@ impl DiskCache {
                 self.stats.evictions += imp::trim(&self.config.dir, self.config.max_bytes, &path);
             }
             Err(e) => {
-                eprintln!(
+                tracing::warn!(target: "load",
                     "[procgen] could not keep {} in the disk cache: {e}",
                     path.display()
                 );
@@ -243,6 +243,7 @@ mod imp {
     /// Remove the least recently touched files until `dir` holds at most
     /// `max_bytes`, never `keep` (the file just written). Returns how many
     /// went.
+    #[allow(clippy::disallowed_methods)] // lists the engine's own cache folder on the disk, which no bundle holds
     pub fn trim(dir: &Path, max_bytes: u64, keep: &Path) -> u64 {
         let Ok(entries) = fs::read_dir(dir) else {
             return 0;

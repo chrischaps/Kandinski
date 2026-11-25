@@ -8,11 +8,20 @@
 //! layer over it.
 
 use flint_schema::{
-    ArchetypeSchema, ComponentSchema, FieldSchema, FieldType, SchemaRegistry, OLD_TYPE_NAMES,
-    TYPE_NAMES,
+    ArchetypeOrigin, ArchetypeSchema, ComponentSchema, FieldSchema, FieldType, PanelRole,
+    PanelSpec, SchemaOrigin, SchemaRegistry, OLD_TYPE_NAMES, TYPE_NAMES,
 };
 use serde_json::{json, Map, Value};
 use std::collections::HashMap;
+use std::path::Path;
+
+/// A schema file as `flint schema` names it: from the working directory
+/// where it is under it, so the output doesn't carry one machine's folders.
+pub fn shown_file(path: &Path) -> String {
+    let cwd = std::env::current_dir().ok();
+    let from_here = cwd.as_deref().and_then(|cwd| path.strip_prefix(cwd).ok());
+    flint_core::project::shown(from_here.unwrap_or(path))
+}
 
 fn to_json(value: &toml::Value) -> Value {
     serde_json::to_value(value).unwrap_or(Value::Null)
@@ -39,11 +48,18 @@ fn type_json(field_type: &FieldType) -> Map<String, Value> {
         FieldType::Array { element } => {
             out.insert("element".into(), Value::Object(type_json(element)));
         }
-        FieldType::Asset { kinds, unless } => {
+        FieldType::Asset {
+            kinds,
+            unless,
+            builtins,
+        } => {
             let labels: Vec<&str> = kinds.iter().map(|kind| kind.label()).collect();
             out.insert("kinds".into(), json!(labels));
             if let Some(unless) = unless {
                 out.insert("unless".into(), json!(unless));
+            }
+            if !builtins.is_empty() {
+                out.insert("builtins".into(), json!(builtins));
             }
         }
         FieldType::Fields { fields } => {
@@ -82,42 +98,162 @@ fn fields_json(fields: &HashMap<String, FieldSchema>) -> Value {
 }
 
 /// One component: its description, whether it is open (no fields: known,
-/// and nothing in it checked) and its fields by name.
-pub fn component_json(component: &ComponentSchema) -> Value {
-    json!({
-        "kind": "component",
-        "name": component.name,
-        "description": component.description,
-        "open": component.is_open(),
-        "fields": fields_json(&component.fields),
-    })
+/// and nothing in it checked), its fields by name, and where it and each
+/// field was declared (`declared_in`, `extended_by`, each field's `file`;
+/// #794), when it was read from a file.
+pub fn component_json(component: &ComponentSchema, origin: Option<&SchemaOrigin>) -> Value {
+    fielded_json("component", component, origin)
 }
 
 /// One scene-level table (#686): what a component has, under
 /// `"kind": "table"`.
-pub fn table_json(table: &ComponentSchema) -> Value {
-    json!({
-        "kind": "table",
-        "name": table.name,
-        "description": table.description,
-        "open": table.is_open(),
-        "fields": fields_json(&table.fields),
-    })
+pub fn table_json(table: &ComponentSchema, origin: Option<&SchemaOrigin>) -> Value {
+    fielded_json("table", table, origin)
 }
 
-/// One archetype: its components, and the defaults it gives them.
-pub fn archetype_json(archetype: &ArchetypeSchema) -> Value {
+fn fielded_json(kind: &str, schema: &ComponentSchema, origin: Option<&SchemaOrigin>) -> Value {
+    let mut fields = fields_json(&schema.fields);
+    let mut out = json!({
+        "kind": kind,
+        "name": schema.name,
+        "description": schema.description,
+        "open": schema.is_open(),
+    });
+    if let Some(origin) = origin {
+        for (name, field) in fields.as_object_mut().expect("fields are an object") {
+            if let Some(file) = origin.field_file(name) {
+                field["file"] = json!(shown_file(file));
+            }
+        }
+        out["declared_in"] = json!(origin.declared_in.as_deref().map(shown_file));
+        out["extended_by"] = json!(origin
+            .extended_by
+            .iter()
+            .map(|file| shown_file(file))
+            .collect::<Vec<_>>());
+    }
+    out["fields"] = fields;
+    if let Some(panel) = &schema.panel {
+        out["panel"] = panel_json(panel);
+    }
+    out
+}
+
+/// A component's F3 panel (#744, #1020): its `title` and its `rows` in the
+/// panel's order, each with `field`, `role` and `label`, and the keys that
+/// say more than the defaults: `labels`, `press` (a trigger's), `step`,
+/// `min`, `max`, `slider` and `presets` (a tune row's editor), `format`,
+/// `scale`, `unset`, `from` and `commit`.
+pub fn panel_json(panel: &PanelSpec) -> Value {
+    let rows: Vec<Value> = panel
+        .rows
+        .iter()
+        .map(|row| {
+            let mut out = Map::new();
+            out.insert("field".into(), json!(row.field));
+            out.insert("role".into(), json!(row.role.name()));
+            out.insert("label".into(), json!(row.label));
+            if !row.labels.is_empty() {
+                out.insert("labels".into(), json!(row.labels));
+            }
+            let tune = row.role == PanelRole::Tune;
+            if row.role == PanelRole::Trigger {
+                out.insert("press".into(), to_json(&row.press));
+            }
+            if tune {
+                for (key, value) in [("step", row.step), ("min", row.min), ("max", row.max)] {
+                    if let Some(value) = value {
+                        out.insert(key.into(), json!(value));
+                    }
+                }
+                if row.slider {
+                    out.insert("slider".into(), json!(true));
+                }
+                if !row.presets.is_empty() {
+                    let presets: Vec<Value> = row
+                        .presets
+                        .iter()
+                        .map(|(name, n)| json!([name, n]))
+                        .collect();
+                    out.insert("presets".into(), json!(presets));
+                }
+            }
+            if let Some(format) = &row.format {
+                out.insert("format".into(), json!(format));
+            }
+            if row.scale != 1.0 {
+                out.insert("scale".into(), json!(row.scale));
+            }
+            if let Some(unset) = row.unset {
+                out.insert("unset".into(), json!(unset));
+            }
+            if let Some(from) = &row.from {
+                out.insert("from".into(), json!(from));
+            }
+            if tune && !row.commit {
+                out.insert("commit".into(), json!(false));
+            }
+            Value::Object(out)
+        })
+        .collect();
+    json!({ "title": panel.title, "rows": rows })
+}
+
+/// One archetype: its components, and the defaults it gives them. Read
+/// from files (`origin`, #1054), it also names `declared_in`, `extended_by`,
+/// the file that listed each component (`component_files`) and the one
+/// that gave each default (`default_files`, by component, then field).
+pub fn archetype_json(archetype: &ArchetypeSchema, origin: Option<&ArchetypeOrigin>) -> Value {
     let defaults: Map<String, Value> = sorted(&archetype.defaults)
         .into_iter()
         .map(|(component, table)| (component.clone(), to_json(table)))
         .collect();
-    json!({
+    let mut out = json!({
         "kind": "archetype",
         "name": archetype.name,
         "description": archetype.description,
         "components": archetype.components,
         "defaults": defaults,
-    })
+    });
+    // Its placeholder box (#751), only when the archetype gives one
+    if let Some(visual) = &archetype.visual {
+        // Each channel as the file spells it (0.76, not 0.7599999904632568)
+        let color = visual
+            .color
+            .map(|c| c.to_string().parse::<f64>().unwrap_or(c.into()));
+        out["visual"] = json!({ "color": color, "wireframe": visual.wireframe });
+    }
+    if let Some(origin) = origin {
+        out["declared_in"] = json!(origin.declared_in.as_deref().map(shown_file));
+        out["extended_by"] = json!(origin
+            .extended_by
+            .iter()
+            .map(|file| shown_file(file))
+            .collect::<Vec<_>>());
+        let components: Map<String, Value> = archetype
+            .components
+            .iter()
+            .filter_map(|c| Some((c.clone(), json!(shown_file(origin.component_file(c)?)))))
+            .collect();
+        out["component_files"] = Value::Object(components);
+        let defaults: Map<String, Value> = sorted(&archetype.defaults)
+            .into_iter()
+            .map(|(component, table)| {
+                let fields: Map<String, Value> = table
+                    .as_table()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|(field, _)| {
+                        let file = origin.default_file(component, field)?;
+                        Some((field.clone(), json!(shown_file(file))))
+                    })
+                    .collect();
+                (component.clone(), Value::Object(fields))
+            })
+            .collect();
+        out["default_files"] = Value::Object(defaults);
+    }
+    out
 }
 
 /// Everything loaded: the directories, the type names (and the old spellings
@@ -127,17 +263,30 @@ pub fn registry_json(registry: &SchemaRegistry, dirs: &[String]) -> Value {
     let components: Map<String, Value> = registry
         .components()
         .into_iter()
-        .map(|c| (c.name.clone(), component_json(c)))
+        .map(|c| {
+            let origin = registry.component_origin(&c.name);
+            (c.name.clone(), component_json(c, origin))
+        })
         .collect();
     let tables: Map<String, Value> = registry
         .tables()
         .into_iter()
-        .map(|t| (t.name.clone(), table_json(t)))
+        .map(|t| {
+            (
+                t.name.clone(),
+                table_json(t, registry.table_origin(&t.name)),
+            )
+        })
         .collect();
     let archetypes: Map<String, Value> = registry
         .archetypes()
         .into_iter()
-        .map(|a| (a.name.clone(), archetype_json(a)))
+        .map(|a| {
+            (
+                a.name.clone(),
+                archetype_json(a, registry.archetype_origin(&a.name)),
+            )
+        })
         .collect();
     let types: Vec<Value> = TYPE_NAMES
         .iter()
@@ -236,22 +385,8 @@ fn type_schema(field_type: &FieldType) -> Map<String, Value> {
         FieldType::Vec2 => numbers(2, 2),
         FieldType::Vec3 => vec3_schema(),
         FieldType::Vec4 => numbers(4, 4),
-        FieldType::Color => json!({
-            "anyOf": [
-                numbers(3, 4),
-                {
-                    "type": "object",
-                    "properties": {
-                        "r": { "type": "number" },
-                        "g": { "type": "number" },
-                        "b": { "type": "number" },
-                        "a": { "type": "number" },
-                    },
-                    "required": ["r", "g", "b"],
-                },
-                { "type": "integer", "minimum": 0, "maximum": 0xFFFFFF },
-            ]
-        }),
+        // [r, g, b] or [r, g, b, a] and nothing else: what the readers take (#804)
+        FieldType::Color => numbers(3, 4),
         FieldType::Transform => json!({
             "type": "object",
             "properties": {
@@ -267,6 +402,8 @@ fn type_schema(field_type: &FieldType) -> Map<String, Value> {
             "type": "array",
             "items": Value::Object(type_schema(element)),
         }),
+        // Any value: the component's reader judges its form (#1051)
+        FieldType::Any => json!({}),
     };
     match value {
         Value::Object(map) => map,
@@ -279,14 +416,23 @@ fn field_schema(field: &FieldSchema) -> Value {
     let mut description = field.description.clone().unwrap_or_default();
     let note = match &field.field_type {
         FieldType::Entity => Some("The name of an entity in this scene.".to_string()),
-        FieldType::Asset { kinds, .. } if !kinds.is_empty() => Some(format!(
-            "Found by the project's asset search as: {}.",
-            kinds
-                .iter()
-                .map(|kind| kind.label())
-                .collect::<Vec<_>>()
-                .join(", ")
-        )),
+        FieldType::Asset {
+            kinds, builtins, ..
+        } if !kinds.is_empty() => {
+            let found = format!(
+                "Found by the project's asset search as: {}.",
+                kinds
+                    .iter()
+                    .map(|kind| kind.label())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            Some(if builtins.is_empty() {
+                found
+            } else {
+                format!("{found} Built in, with no file: {}.", builtins.join(", "))
+            })
+        }
         _ => None,
     };
     if let Some(note) = note {
@@ -304,13 +450,55 @@ fn field_schema(field: &FieldSchema) -> Value {
     if let Some(default) = &field.default {
         out.insert("default".into(), to_json(default));
     }
-    if let Some(min) = field.min {
-        out.insert("minimum".into(), json!(min));
+    let mut out = Value::Object(out);
+    match field.field_type {
+        // A table's range (none says one) stays on the table
+        FieldType::Fields { .. } | FieldType::Table => {
+            if let Value::Object(map) = &mut out {
+                if let Some(min) = field.min {
+                    map.insert("minimum".into(), json!(min));
+                }
+                if let Some(max) = field.max {
+                    map.insert("maximum".into(), json!(max));
+                }
+            }
+        }
+        _ => put_range(&mut out, field.min, field.max),
     }
-    if let Some(max) = field.max {
-        out.insert("maximum".into(), json!(max));
+    out
+}
+
+/// A field's range on every number its schema takes (#492): a scalar's
+/// own, and each member of a vector or colour (`tint = [r, g, b]`), as
+/// `flint validate` checks them; JSON Schema's `minimum` on an array would
+/// say nothing. A number that has a range of its own (a hex colour's) keeps
+/// it.
+fn put_range(value: &mut Value, min: Option<f64>, max: Option<f64>) {
+    match value {
+        Value::Object(map) => {
+            let number = matches!(
+                map.get("type").and_then(Value::as_str),
+                Some("number" | "integer")
+            );
+            if number && !map.contains_key("minimum") && !map.contains_key("maximum") {
+                if let Some(min) = min {
+                    map.insert("minimum".into(), json!(min));
+                }
+                if let Some(max) = max {
+                    map.insert("maximum".into(), json!(max));
+                }
+            }
+            for v in map.values_mut() {
+                put_range(v, min, max);
+            }
+        }
+        Value::Array(items) => {
+            for v in items {
+                put_range(v, min, max);
+            }
+        }
+        _ => {}
     }
-    Value::Object(out)
 }
 
 /// A table of `fields`. A key no field declares is allowed, as the engine

@@ -10,6 +10,9 @@
 //!   [`OLD_TYPE_NAMES`]). It still loads.
 //! - `unknown-type`: a type that is none ([`TYPE_NAMES`]), an `asset` with no
 //!   `kind`, or a `kind` that is no asset kind.
+//! - `bad-panel`: a mistake in what a component's fields say about its F3
+//!   panel (#744): a role that is none, a key a field's panel doesn't hold, a
+//!   `format` with no placeholder. The loader leaves that row off the panel.
 //! - `ignored-schema-key`: a key the loader ignores. The usual one is a field
 //!   written under `[component.x]` instead of `[component.x.fields]`, which
 //!   leaves the component with no fields: nothing in it is checked and none
@@ -18,10 +21,13 @@
 //! [`SchemaRegistry`](crate::SchemaRegistry) runs it on every file it loads
 //! and keeps the result ([`SchemaRegistry::lints`](crate::SchemaRegistry::lints)).
 //! `flint validate` prints the ones about a game's files
-//! ([`SchemaRegistry::game_lints`](crate::SchemaRegistry::game_lints)); the
+//! ([`SchemaRegistry::game_lints`](crate::SchemaRegistry::game_lints)), and
+//! the player says them once as it reads its schemas (#1064); the
 //! engine's own files are held clean by `tests/engine_schemas.rs`.
 
-use crate::component::{type_name_of, COMPONENT_KEYS, FIELD_KEYS, OLD_TYPE_NAMES, TYPE_NAMES};
+use crate::component::{
+    type_name_of, ComponentSchemaDefinition, COMPONENT_KEYS, FIELD_KEYS, OLD_TYPE_NAMES, TYPE_NAMES,
+};
 use flint_core::diagnostic::{self, codes, Diagnostic};
 use flint_core::project::AssetKind;
 use std::path::Path;
@@ -137,6 +143,23 @@ pub fn lint_schema_file(kind: SchemaKind, text: &str, file: Option<&Path>) -> Ve
 
 fn lint_component(kind: SchemaKind, name: &str, def: &toml::Table, found: &mut Vec<Diagnostic>) {
     let key_word = kind.key();
+    lint_panel(kind, name, def, found);
+    // An extension adds fields (#794); the description is the declaring layer's
+    let extends = def.get("extend").and_then(|v| v.as_bool()) == Some(true);
+    if extends && def.contains_key("description") {
+        found.push(
+            Diagnostic::warning(
+                codes::IGNORED_SCHEMA_KEY,
+                format!(
+                    "`description` is ignored: `[{key_word}.{name}]` says `extend = true`, so \
+                     it adds fields to the `{name}` an earlier layer declared, which keeps that \
+                     layer's description"
+                ),
+            )
+            .field("description")
+            .hint("describe each field you add with its own `description`"),
+        );
+    }
     for (key, value) in def {
         if key == "fields" {
             for (field, field_def) in value.as_table().into_iter().flatten() {
@@ -158,7 +181,10 @@ fn lint_component(kind: SchemaKind, name: &str, def: &toml::Table, found: &mut V
             } else {
                 Diagnostic::warning(
                     codes::IGNORED_SCHEMA_KEY,
-                    format!("`{key}` is ignored: a {key_word} holds `description` and `fields`"),
+                    format!(
+                        "`{key}` is ignored: a {key_word} holds `description`, `fields`, \
+                         `panel`, `extend` and `retired`"
+                    ),
                 )
                 .hint_opt(diagnostic::did_you_mean(
                     key,
@@ -167,6 +193,50 @@ fn lint_component(kind: SchemaKind, name: &str, def: &toml::Table, found: &mut V
             };
             found.push(d.field(key.clone()));
         }
+    }
+}
+
+/// `bad-panel`: what is wrong with a component's F3 panel (#744), each as
+/// the loader reads it ([`crate::panel::panel_of`]), and any `panel` in a
+/// scene table, which has none.
+fn lint_panel(kind: SchemaKind, name: &str, def: &toml::Table, found: &mut Vec<Diagnostic>) {
+    let fields = def.get("fields").and_then(|f| f.as_table());
+    if kind == SchemaKind::Table {
+        let keyed = def.contains_key("panel")
+            || fields
+                .into_iter()
+                .flatten()
+                .any(|(_, f)| f.get("panel").is_some());
+        if keyed {
+            found.push(
+                Diagnostic::warning(
+                    codes::BAD_PANEL,
+                    "a scene table has no F3 panel: only a component's fields can be on one",
+                )
+                .hint("leave `panel` out of a `[table.*]`"),
+            );
+        }
+        return;
+    }
+    let Ok(parsed) = toml::Value::Table(def.clone()).try_into::<ComponentSchemaDefinition>() else {
+        return;
+    };
+    let mut schemas = Vec::new();
+    for (field, field_def) in &parsed.fields {
+        schemas.push((
+            field.as_str(),
+            field_def.clone().to_field_schema(),
+            field_def.panel(),
+        ));
+    }
+    let rows: Vec<_> = schemas.iter().map(|(f, s, p)| (*f, s, *p)).collect();
+    let (_, problems) = crate::panel::panel_of(name, parsed.panel.as_ref(), &rows);
+    for problem in problems {
+        let d = Diagnostic::warning(codes::BAD_PANEL, problem.message).hint_opt(problem.hint);
+        found.push(match problem.field {
+            Some(field) => d.field(field),
+            None => d.field("panel"),
+        });
     }
 }
 
@@ -206,6 +276,15 @@ fn lint_field(path: &str, def: &toml::Value, found: &mut Vec<Diagnostic>) {
     }
     if type_name.and_then(type_name_of) == Some("asset") {
         lint_asset_kind(path, table.get("kind"), found);
+    } else if table.contains_key("builtins") {
+        found.push(
+            Diagnostic::warning(
+                codes::IGNORED_SCHEMA_KEY,
+                "`builtins` is ignored: only an asset field takes names with no file",
+            )
+            .field(format!("{path}.builtins"))
+            .hint("write type = \"asset\" with a `kind`, or leave `builtins` out"),
+        );
     }
     if let Some(element) = table.get("element") {
         lint_field(&format!("{path}[]"), element, found);
@@ -371,7 +450,7 @@ desciption = "Typo"
             lines,
             [
                 "warning[ignored-schema-key] collider.desciption: `desciption` is ignored: a \
-                 component holds `description` and `fields`",
+                 component holds `description`, `fields`, `panel`, `extend` and `retired`",
                 "warning[ignored-schema-key] collider.friction: `friction` is ignored: it is \
                  written under `[component.collider]`, and fields are read from \
                  `[component.collider.fields]`",
@@ -450,6 +529,24 @@ file = { type = "asset" }
                  looked for",
                 "warning[ignored-schema-key] rig.note.optional: `optional` is ignored: it is no \
                  key of a field definition",
+            ]
+        );
+    }
+
+    /// #1063: `builtins` is an asset's; on any other field it says nothing.
+    #[test]
+    fn builtins_belong_to_an_asset_field() {
+        assert_eq!(
+            said(
+                r#"
+[component.rig.fields]
+palette = { type = "asset", kind = "palettes", builtins = ["amber"] }
+ramp = { type = "string", builtins = ["classic"] }
+"#
+            ),
+            [
+                "warning[ignored-schema-key] rig.ramp.builtins: `builtins` is ignored: only an \
+              asset field takes names with no file"
             ]
         );
     }

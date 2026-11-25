@@ -28,6 +28,7 @@
 //! off: the constant used as `comp::NAME` / `components::NAME`, or the name
 //! as a string literal. It can't tell a reader from a writer, so it catches
 //! a schema nobody mentions, not one nobody honours.
+#![allow(clippy::disallowed_methods)] // a test: reads its files off the disk, not through the vfs
 
 use flint_schema::diagnostic::codes;
 use flint_schema::{validate_component_data, SchemaRegistry, OLD_TYPE_NAMES, TYPE_NAMES};
@@ -88,11 +89,6 @@ const CHECKED_AGAINST_SCENES: &[&str] = &[
 /// Tables that look like a light and that nothing reads.
 const STALE_LIGHT_TABLES: &[&str] = &["directional_light", "point_light", "spot_light"];
 
-/// Where a stale light table may stay: the frozen scenes the goldens load
-/// (`tests/fixtures/scenes/README.md`). They are lit by the defaults, their
-/// pixels are pinned, and making the table a real light would move them.
-const FROZEN: &[&str] = &["tests/fixtures/", "crates/flint-cli/tests/golden/fixtures/"];
-
 fn repo() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
 }
@@ -107,6 +103,8 @@ const COMPONENT_FILES: &[&str] = &[
     "crates/flint-core/src/components.rs",
     "crates/flint-geometry/src/components.rs",
     "crates/flint-wooze/src/components.rs",
+    "crates/flint-living/src/components.rs",
+    "crates/flint-music/src/components.rs",
 ];
 
 /// `(IDENT, "value")` for every `pub const IDENT: &str = "value";` in
@@ -161,8 +159,41 @@ fn schema_names(dir: &str, kind: &str, header: &str) -> BTreeMap<String, String>
     names
 }
 
+/// The engine's schema directories from the repository root: `schemas`,
+/// then each package's `packages/<name>/schemas` in the order the resolver
+/// brings them (#1332).
+fn engine_dirs() -> Vec<String> {
+    let mut dirs = vec!["schemas".to_string()];
+    for (package, _) in flint_core::project::package_schema_dirs(&repo().join("schemas")) {
+        dirs.push(format!("packages/{package}/schemas"));
+    }
+    assert!(
+        dirs.len() > 1,
+        "no package brings schemas: packages/ not found"
+    );
+    dirs
+}
+
+/// The engine's set: `schemas` and its packages', as a game gets it.
+fn engine_registry() -> SchemaRegistry {
+    let dirs: Vec<PathBuf> = engine_dirs().iter().map(|d| repo().join(d)).collect();
+    SchemaRegistry::load_from_directories(&dirs).unwrap()
+}
+
+/// The engine's set with the examples' layer over it (the root flint.toml).
+fn layered_registry() -> SchemaRegistry {
+    let mut dirs: Vec<PathBuf> = engine_dirs().iter().map(|d| repo().join(d)).collect();
+    dirs.push(repo().join("schemas/examples"));
+    SchemaRegistry::load_from_directories(&dirs).unwrap()
+}
+
 fn engine_components() -> BTreeMap<String, String> {
-    let names = schema_names("schemas", "components", "component");
+    let mut names = BTreeMap::new();
+    for dir in engine_dirs() {
+        for (name, file) in schema_names(&dir, "components", "component") {
+            names.insert(name, format!("{dir}/components/{file}"));
+        }
+    }
     assert!(names.len() > 30, "schemas/components not found");
     names
 }
@@ -281,7 +312,7 @@ fn every_engine_schema_has_a_reader() {
                 .any(|(ident, value)| value == name && constant_is_used(&source, ident));
             !by_constant && !literal_is_used(&source, name) && !exempt(NO_READER, name)
         })
-        .map(|(name, file)| format!("{name} (schemas/components/{file})"))
+        .map(|(name, file)| format!("{name} ({file})"))
         .collect();
     assert!(
         unread.is_empty(),
@@ -322,7 +353,7 @@ fn exemptions_are_still_needed() {
 
 #[test]
 fn the_engine_set_has_no_room_builder_vocabulary() {
-    let engine = SchemaRegistry::load_from_directory(repo().join("schemas")).unwrap();
+    let engine = engine_registry();
     for name in EXAMPLE_ARCHETYPES {
         assert!(
             engine.get_archetype(name).is_none(),
@@ -347,11 +378,7 @@ fn the_engine_set_has_no_room_builder_vocabulary() {
 
     // The layer over the engine's set is what the examples load
     // (flint.toml at the repository root)
-    let layered = SchemaRegistry::load_from_directories(&[
-        repo().join("schemas"),
-        repo().join("schemas/examples"),
-    ])
-    .unwrap();
+    let layered = layered_registry();
     for name in EXAMPLE_ARCHETYPES {
         let archetype = layered
             .get_archetype(name)
@@ -416,16 +443,31 @@ fn scene_entities() -> Vec<(String, String, toml::Table)> {
     }
     let root = repo();
     let mut out = Vec::new();
-    for dir in ["examples", "tests", "showcase_game", "crates"] {
-        walk(&root.join(dir), &root, &mut out);
+    // ...and each game kept in the checkout: a top-level directory with a
+    // `flint.toml`, found by it so the engine names no game (#760)
+    let games = std::fs::read_dir(&root)
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|d| d.join("flint.toml").is_file());
+    for dir in ["tests", "crates"]
+        .map(|d| root.join(d))
+        .into_iter()
+        .chain(games)
+    {
+        walk(&dir, &root, &mut out);
     }
-    assert!(out.len() > 500, "the repository's scenes were not found");
+    assert!(
+        out.len() > 300,
+        "the repository's scenes were not found: {} entities",
+        out.len()
+    );
     out
 }
 
 #[test]
 fn the_repository_scenes_fit_the_new_schemas() {
-    let registry = SchemaRegistry::load_from_directory(repo().join("schemas")).unwrap();
+    let registry = engine_registry();
     let mut problems = BTreeSet::new();
     let mut checked = 0;
     for (file, entity, table) in scene_entities() {
@@ -463,10 +505,11 @@ fn the_repository_scenes_fit_the_new_schemas() {
 }
 
 #[test]
-fn no_example_carries_a_light_table_nothing_reads() {
+fn no_scene_carries_a_light_table_nothing_reads() {
+    // The frozen fixtures too, since #796 deleted theirs: nothing read them,
+    // so the goldens that load them were lit by the defaults either way
     let stale: BTreeSet<String> = scene_entities()
         .into_iter()
-        .filter(|(file, _, _)| !FROZEN.iter().any(|frozen| file.starts_with(frozen)))
         .flat_map(|(file, entity, table)| {
             STALE_LIGHT_TABLES
                 .iter()
@@ -486,7 +529,7 @@ fn no_example_carries_a_light_table_nothing_reads() {
 
 #[test]
 fn the_four_schemas_say_what_their_readers_take() {
-    let registry = SchemaRegistry::load_from_directory(repo().join("schemas")).unwrap();
+    let registry = engine_registry();
     let fields = |name: &str| -> BTreeSet<String> {
         registry
             .get_component(name)
@@ -499,7 +542,7 @@ fn the_four_schemas_say_what_their_readers_take() {
     let set =
         |names: &[&str]| -> BTreeSet<String> { names.iter().map(|n| n.to_string()).collect() };
 
-    // What `SceneRenderer::extract_lights_from_world` reads
+    // What `LightState::extract` (flint-render's scene_renderer/lights.rs) reads
     assert_eq!(
         fields("light"),
         set(&[
@@ -513,21 +556,27 @@ fn the_four_schemas_say_what_their_readers_take() {
             "source_radius",
             "inner_angle",
             "outer_angle",
+            "inner_angle_deg",
+            "outer_angle_deg",
+            "cast_shadows",
             "volumetric_intensity",
             "volumetric_color",
         ])
     );
     // `model_loader` and `is_runtime_model`
     assert_eq!(fields("model"), set(&["asset", "runtime"]));
-    // `spline_gen::load_splines`
+    // flint-render's `load_scene_splines`
     assert_eq!(fields("spline"), set(&["file"]));
-    // `spline_gen::parse_spline_mesh_component`
+    // flint-render's `splines::mesh_def`
     assert_eq!(
         fields("spline_mesh"),
         set(&[
             "spline",
             "width",
             "height",
+            "profile",
+            "profile_closed",
+            "smooth",
             "offset",
             "color",
             "stripe_color",
@@ -546,8 +595,9 @@ fn the_four_schemas_say_what_their_readers_take() {
 
     // A default is written into the component at load (`populate_world`),
     // so only a field whose reader falls back to that very value may carry
-    // one: `range` with a default would beat an authored `radius`, and
-    // `volumetric_color` would stop following `color`.
+    // one: `range` with a default would beat an authored `radius`,
+    // `volumetric_color` would stop following `color`, and `type` would hide
+    // a light that forgot it, which the renderer says (#682).
     let with_default = |name: &str| -> BTreeSet<String> {
         registry
             .get_component(name)
@@ -558,7 +608,7 @@ fn the_four_schemas_say_what_their_readers_take() {
             .map(|(k, _)| k.clone())
             .collect()
     };
-    assert_eq!(with_default("light"), set(&["type", "color", "intensity"]));
+    assert_eq!(with_default("light"), set(&["color", "intensity"]));
     for name in ["model", "spline", "spline_mesh"] {
         assert_eq!(with_default(name), set(&[]), "{name}");
     }
@@ -568,8 +618,17 @@ fn the_four_schemas_say_what_their_readers_take() {
 /// examples layer: `(path from the repository root, parsed)`.
 fn component_files() -> Vec<(String, toml::Table)> {
     let mut out = Vec::new();
-    for dir in ["schemas/components", "schemas/examples/components"] {
-        for entry in std::fs::read_dir(repo().join(dir)).unwrap().flatten() {
+    let mut dirs: Vec<String> = engine_dirs()
+        .iter()
+        .map(|d| format!("{d}/components"))
+        .collect();
+    dirs.push("schemas/examples/components".to_string());
+    for dir in dirs {
+        let Ok(entries) = std::fs::read_dir(repo().join(&dir)) else {
+            // a package with schemas but no components (`[living]` alone)
+            continue;
+        };
+        for entry in entries.flatten() {
             let path = entry.path();
             if path.extension().is_some_and(|e| e == "toml") {
                 let doc: toml::Table = read(&path)
@@ -632,11 +691,7 @@ fn every_type_in_schemas_is_written_in_its_one_spelling() {
     );
 
     // ...and the loader agrees about the fields it does read
-    let registry = SchemaRegistry::load_from_directories(&[
-        repo().join("schemas"),
-        repo().join("schemas/examples"),
-    ])
-    .unwrap();
+    let registry = layered_registry();
     let said: Vec<String> = registry
         .lints()
         .iter()
@@ -654,11 +709,7 @@ fn every_type_in_schemas_is_written_in_its_one_spelling() {
 /// `fields` outright.
 #[test]
 fn no_schema_file_holds_a_key_the_loader_ignores() {
-    let registry = SchemaRegistry::load_from_directories(&[
-        repo().join("schemas"),
-        repo().join("schemas/examples"),
-    ])
-    .unwrap();
+    let registry = layered_registry();
     let mut ignored: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for d in registry.lints() {
         if d.code == codes::IGNORED_SCHEMA_KEY {
@@ -700,7 +751,7 @@ fn no_schema_file_holds_a_key_the_loader_ignores() {
 #[test]
 fn engine_schemas_type_their_references() {
     use flint_schema::FieldType;
-    let registry = SchemaRegistry::load_from_directory(repo().join("schemas")).unwrap();
+    let registry = engine_registry();
     let field = |component: &str, field: &str| -> String {
         registry
             .get_component(component)
@@ -719,6 +770,28 @@ fn engine_schemas_type_their_references() {
     assert_eq!(field("material", "texture"), "asset<textures|specs>");
     assert_eq!(field("spline", "file"), "asset<files>");
     assert_eq!(field("terrain", "heightmap"), "asset<files>");
+    // #1063: a name the loader takes with no file is the field's `builtins`
+    assert_eq!(
+        field("ascii_style", "palette"),
+        "asset<palettes> or cga, cga-warm, cga16, phosphor, amber, mono, paper"
+    );
+    assert_eq!(field("ascii_style", "font"), "asset<glyph-sets> or builtin");
+    assert_eq!(
+        field("pencil_style", "paper_image"),
+        "asset<papers> or none"
+    );
+    assert_eq!(
+        field("pencil_style", "stroke_image"),
+        "asset<strokes> or none"
+    );
+    assert_eq!(
+        field("watercolor_style", "paper_image"),
+        "asset<papers> or none"
+    );
+    assert_eq!(
+        field("ui_text", "font"),
+        "asset<glyph-sets|fonts> or builtin"
+    );
     assert_eq!(
         field("material", "blend_mode"),
         "enum[alpha, additive, multiply]"
@@ -734,4 +807,33 @@ fn engine_schemas_type_their_references() {
             .field_type,
         FieldType::Fields { .. }
     ));
+}
+
+/// #751: the colours the renderer once kept in a table by name are in the
+/// archetypes' own files now, as they were: a scene of the examples' layer
+/// draws as it did. The renderer names none of them.
+#[test]
+fn the_first_demos_archetypes_carry_their_placeholder_colours() {
+    let registry = layered_registry();
+    let was = [
+        ("room", [0.27, 0.53, 1.0, 0.5], true),
+        ("door", [1.0, 0.53, 0.27, 1.0], false),
+        ("furniture", [0.27, 1.0, 0.53, 1.0], false),
+        ("character", [1.0, 1.0, 0.27, 1.0], false),
+        ("wall", [0.76, 0.70, 0.60, 1.0], false),
+        ("floor", [0.55, 0.55, 0.52, 1.0], false),
+        ("ceiling", [0.65, 0.62, 0.58, 1.0], false),
+        ("pillar", [0.70, 0.65, 0.55, 1.0], false),
+    ];
+    for (name, color, wireframe) in was {
+        let visual = registry
+            .get_archetype(name)
+            .and_then(|a| a.visual)
+            .unwrap_or_else(|| panic!("archetype {name} has no [archetype.{name}.visual]"));
+        assert_eq!(
+            (visual.color, visual.wireframe),
+            (color, wireframe),
+            "{name}"
+        );
+    }
 }

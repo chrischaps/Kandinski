@@ -30,7 +30,7 @@ use std::collections::HashMap;
 pub fn validate_component(schema: &ComponentSchema, data: &toml::Value) -> Vec<Diagnostic> {
     problems(schema, data)
         .into_iter()
-        .map(|problem| problem.diagnostic(schema))
+        .map(|problem| problem.diagnostic(schema, "component"))
         .collect()
 }
 
@@ -47,7 +47,7 @@ pub fn validate_table(schema: &TableSchema, data: &toml::Value) -> Vec<Diagnosti
                 Problem::NotATable { got } => Some(*got),
                 _ => None,
             };
-            let mut d = problem.diagnostic(schema);
+            let mut d = problem.diagnostic(schema, "table");
             d.component = None;
             d.table = Some(schema.name.clone());
             if let Some(got) = not_a_table {
@@ -112,7 +112,8 @@ enum Problem {
 }
 
 impl Problem {
-    fn diagnostic(self, schema: &ComponentSchema) -> Diagnostic {
+    /// `header` is the schema file's key for it: `component` or `table`.
+    fn diagnostic(self, schema: &ComponentSchema, header: &str) -> Diagnostic {
         let d = match self {
             Problem::NotATable { got } => Diagnostic::error(
                 codes::BAD_TYPE,
@@ -137,20 +138,38 @@ impl Problem {
                     Some(table) => field[table.len() + 1..].to_string(),
                     None => field.clone(),
                 };
-                let hint = diagnostic::did_you_mean(&key, declared.iter().map(String::as_str))
-                    .unwrap_or_else(|| {
-                        format!(
-                            "the fields of `{owner}` are {}; a game's own field is declared in \
-                             its schema layer",
-                            listed(declared.iter())
-                        )
-                    });
-                Diagnostic::warning(
-                    codes::UNKNOWN_FIELD,
-                    format!("`{owner}` has no field `{key}`"),
-                )
-                .field(field)
-                .hint(hint)
+                // A field of the component itself can be added from a later
+                // layer in a few lines (#794); a nested table's are its own
+                let how = match &table {
+                    None => format!(
+                        "a game adds its own in its schema layer: `[{header}.{}]` with \
+                         `extend = true`, and `{key}` under `[{header}.{}.fields]`",
+                        schema.name, schema.name
+                    ),
+                    Some(_) => "a game's own field is declared in its schema layer".to_string(),
+                };
+                // A field the schema took out says why, not what is near it
+                // (#1212)
+                let retired = table.is_none().then(|| schema.retired.get(&key)).flatten();
+                let (message, hint) = match retired {
+                    Some(why) => (
+                        format!("`{owner}` has no field `{key}` any more"),
+                        why.clone(),
+                    ),
+                    None => (
+                        format!("`{owner}` has no field `{key}`"),
+                        diagnostic::did_you_mean(&key, declared.iter().map(String::as_str))
+                            .unwrap_or_else(|| {
+                                format!(
+                                    "the fields of `{owner}` are {}; {how}",
+                                    listed(declared.iter())
+                                )
+                            }),
+                    ),
+                };
+                Diagnostic::warning(codes::UNKNOWN_FIELD, message)
+                    .field(field)
+                    .hint(hint)
             }
             Problem::BadType {
                 field,
@@ -348,14 +367,14 @@ fn check_value(
             toml::Value::String(_),
         ) => {}
         (FieldType::Vec2, toml::Value::Array(arr)) => {
-            check_numbers(field_name, "vec2", 2..=2, arr, found)
+            check_numbers(field_name, "vec2", 2..=2, arr, (min, max), found)
         }
         (FieldType::Vec4, toml::Value::Array(arr)) => {
-            check_numbers(field_name, "vec4", 4..=4, arr, found)
+            check_numbers(field_name, "vec4", 4..=4, arr, (min, max), found)
         }
         // A colour is [r, g, b] or [r, g, b, a]: what `toml_color` reads
         (FieldType::Color, toml::Value::Array(arr)) => {
-            check_numbers(field_name, "color", 3..=4, arr, found)
+            check_numbers(field_name, "color", 3..=4, arr, (min, max), found)
         }
         (FieldType::Fields { fields }, toml::Value::Table(t)) => {
             table_problems(fields, t, Some(field_name), found)
@@ -364,7 +383,7 @@ fn check_value(
         (FieldType::Vec3, toml::Value::Table(t)) => {
             if ["x", "y", "z"].iter().all(|k| t.contains_key(*k)) {
                 for key in ["x", "y", "z"] {
-                    check_number(&format!("{field_name}.{key}"), &t[key], found);
+                    check_number(&format!("{field_name}.{key}"), &t[key], (min, max), found);
                 }
             } else {
                 found.push(shape("a vec3 table needs x, y and z"));
@@ -373,7 +392,7 @@ fn check_value(
         (FieldType::Vec3, toml::Value::Array(arr)) => {
             if arr.len() == 3 {
                 for (i, item) in arr.iter().enumerate() {
-                    check_number(&format!("{field_name}[{i}]"), item, found);
+                    check_number(&format!("{field_name}[{i}]"), item, (min, max), found);
                 }
             } else {
                 found.push(shape(&format!("a vec3 is 3 numbers, got {}", arr.len())));
@@ -394,17 +413,30 @@ fn check_value(
                 }
             }
         }
-        // ...or the older {r, g, b, a}, which no engine reader takes
+        // The older `{ r, g, b }` table and `0xRRGGBB` integer once passed
+        // here, and no engine reader takes either: the scene validated and
+        // the colour was never drawn (#804). Say what to write instead.
         (FieldType::Color, toml::Value::Table(t)) => {
-            if !["r", "g", "b"].iter().all(|k| t.contains_key(*k)) {
-                found.push(shape("a color table needs r, g and b"));
+            let channel = |k: &str| t.get(k).map_or("0".to_string(), |v| v.to_string());
+            let mut written = vec![channel("r"), channel("g"), channel("b")];
+            if t.contains_key("a") {
+                written.push(channel("a"));
             }
+            found.push(shape(&format!(
+                "a color is [r, g, b] or [r, g, b, a], and no reader takes a table: write [{}]",
+                written.join(", ")
+            )));
         }
-        // ...or a hex color like 0xFF8844
         (FieldType::Color, toml::Value::Integer(hex)) => {
-            if !(0..=0xFFFFFF).contains(hex) {
-                found.push(shape("a hex color is 0x000000 to 0xFFFFFF"));
-            }
+            let [_, r, g, b] = (*hex as u32).to_be_bytes();
+            let unit = |c: u8| format!("{:.3}", c as f32 / 255.0);
+            found.push(shape(&format!(
+                "a color is [r, g, b] or [r, g, b, a], and no reader takes an integer: write \
+                 [{}, {}, {}]",
+                unit(r),
+                unit(g),
+                unit(b)
+            )));
         }
         (FieldType::Enum { values }, toml::Value::String(s)) => {
             if !values.contains(s) {
@@ -416,6 +448,8 @@ fn check_value(
             }
         }
         (FieldType::Table, toml::Value::Table(_)) => {}
+        // The component's reader judges an `any` value's form
+        (FieldType::Any, _) => {}
         (FieldType::Array { element }, toml::Value::Array(arr)) => {
             for (i, item) in arr.iter().enumerate() {
                 check_value(
@@ -437,12 +471,14 @@ fn check_value(
 }
 
 /// `arr` as a `type_name` of `len` numbers: the wrong count is one problem
-/// about the field, a member that is no number one about `field[i]`.
+/// about the field, a member that is no number, or outside the field's
+/// `range` (each member's: a colour's channels, #492), one about `field[i]`.
 fn check_numbers(
     field_name: &str,
     type_name: &str,
     len: std::ops::RangeInclusive<usize>,
     arr: &[toml::Value],
+    range: (Option<f64>, Option<f64>),
     found: &mut Vec<Problem>,
 ) {
     if !len.contains(&arr.len()) {
@@ -458,7 +494,7 @@ fn check_numbers(
         return;
     }
     for (i, item) in arr.iter().enumerate() {
-        check_number(&format!("{field_name}[{i}]"), item, found);
+        check_number(&format!("{field_name}[{i}]"), item, range, found);
     }
 }
 
@@ -478,6 +514,9 @@ pub struct Reference {
     /// The name written.
     pub name: String,
     pub kind: ReferenceKind,
+    /// The names the field takes with no file (an asset's `builtins`,
+    /// #1063): none of them is a reference, and a miss's hint offers them.
+    pub builtins: Vec<String>,
 }
 
 /// Every entity and asset `data` names as a `schema` component, by field
@@ -486,7 +525,8 @@ pub struct Reference {
 ///
 /// Left out: an empty string (the reference is not set; a script fills it),
 /// a value that is not a string ([`validate_component`] has said `bad-type`),
-/// an asset with no kind, and an asset whose `unless` sibling is `true`.
+/// an asset with no kind, an asset whose `unless` sibling is `true`, and an
+/// asset that is one of its field's `builtins` (`"amber"`, `"none"`, #1063).
 pub fn references(schema: &ComponentSchema, data: &toml::Value) -> Vec<Reference> {
     let mut found = Vec::new();
     if let Some(table) = data.as_table() {
@@ -522,26 +562,34 @@ fn value_references(
     siblings: &toml::Table,
     found: &mut Vec<Reference>,
 ) {
-    let named = |kind: ReferenceKind| {
+    let named = |kind: ReferenceKind, builtins: &[String]| {
         value
             .as_str()
-            .filter(|name| !name.is_empty())
+            .filter(|name| !name.is_empty() && !builtins.iter().any(|b| b == name))
             .map(|name| Reference {
                 field: path.to_string(),
                 name: name.to_string(),
                 kind,
+                builtins: builtins.to_vec(),
             })
     };
     match (field_type, value) {
-        (FieldType::Entity, _) => found.extend(named(ReferenceKind::Entity)),
-        (FieldType::Asset { kinds, unless }, _) => {
+        (FieldType::Entity, _) => found.extend(named(ReferenceKind::Entity, &[])),
+        (
+            FieldType::Asset {
+                kinds,
+                unless,
+                builtins,
+            },
+            _,
+        ) => {
             let off = unless
                 .as_deref()
                 .and_then(|sibling| siblings.get(sibling))
                 .and_then(toml::Value::as_bool)
                 .unwrap_or(false);
             if !off && !kinds.is_empty() {
-                found.extend(named(ReferenceKind::Asset(kinds.clone())));
+                found.extend(named(ReferenceKind::Asset(kinds.clone()), builtins));
             }
         }
         (FieldType::Array { element }, toml::Value::Array(items)) => {
@@ -556,13 +604,21 @@ fn value_references(
     }
 }
 
-fn check_number(field_name: &str, value: &toml::Value, found: &mut Vec<Problem>) {
-    if !matches!(value, toml::Value::Integer(_) | toml::Value::Float(_)) {
-        found.push(Problem::BadType {
+/// One member of a vector: a number, inside the field's `(min, max)`.
+fn check_number(
+    field_name: &str,
+    value: &toml::Value,
+    (min, max): (Option<f64>, Option<f64>),
+    found: &mut Vec<Problem>,
+) {
+    match value {
+        toml::Value::Integer(n) => check_range(field_name, *n as f64, min, max, found),
+        toml::Value::Float(n) => check_range(field_name, *n, min, max, found),
+        _ => found.push(Problem::BadType {
             field: field_name.to_string(),
             expected: "a number".to_string(),
             got: value_type_name(value),
-        });
+        }),
     }
 }
 
@@ -645,6 +701,8 @@ mod tests {
             name: "door".to_string(),
             description: None,
             fields,
+            panel: None,
+            retired: Default::default(),
         }
     }
 
@@ -839,6 +897,8 @@ mod tests {
             name: "inventory".to_string(),
             description: None,
             fields: HashMap::new(),
+            panel: None,
+            retired: Default::default(),
         };
         let data: toml::Value = toml::from_str("slots = 4\nitems = [\"key\"]\n").unwrap();
         assert_eq!(validate_component(&schema, &data), []);
@@ -900,12 +960,22 @@ mod tests {
                 "error[bad-type] rig.tint: expected color, got string",
             ]
         );
-        // The older colour forms still pass
+        // The older colour forms are refused, with the array to write
+        // instead: no reader takes them (#804)
         assert_eq!(
             said(&schema, "tint = { r = 1.0, g = 0.5, b = 0.0 }\n"),
-            NOTHING
+            [
+                "error[bad-type] rig.tint: a color is [r, g, b] or [r, g, b, a], and no reader \
+              takes a table: write [1.0, 0.5, 0.0]"
+            ]
         );
-        assert_eq!(said(&schema, "tint = 0xFF8844\n"), NOTHING);
+        assert_eq!(
+            said(&schema, "tint = 0xFF8800\n"),
+            [
+                "error[bad-type] rig.tint: a color is [r, g, b] or [r, g, b, a], and no reader \
+              takes an integer: write [1.000, 0.533, 0.000]"
+            ]
+        );
     }
 
     /// A table that declares fields is checked like a component, each
@@ -994,6 +1064,33 @@ mod tests {
         // `unless`: a mesh that code uploads has no file to look for
         let runtime: toml::Value = toml::from_str("asset = \"blob\"\nruntime = true\n").unwrap();
         assert_eq!(references(&schema, &runtime), []);
+    }
+
+    /// #1063: a name the field's `builtins` lists needs no file, so it is no
+    /// reference; any other name is, and carries the list for its hint.
+    #[test]
+    fn a_built_in_name_is_no_reference() {
+        let schema = schema_of(
+            "palette = { type = \"asset\", kind = \"palettes\", builtins = [\"amber\", \"cga\"] }\n\
+             paper = { type = \"asset\", kind = \"papers\", builtins = [\"none\"] }\n",
+        );
+        let named = |text: &str| -> Vec<(String, Vec<String>)> {
+            let data: toml::Value = toml::from_str(text).unwrap();
+            assert_eq!(validate_component(&schema, &data), []);
+            references(&schema, &data)
+                .into_iter()
+                .map(|r| (r.name, r.builtins))
+                .collect()
+        };
+        assert_eq!(named("palette = \"amber\"\npaper = \"none\"\n"), []);
+        let strings = |names: &[&str]| names.iter().map(|n| n.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            named("palette = \"ambr\"\npaper = \"cold_press\"\n"),
+            [
+                ("ambr".to_string(), strings(&["amber", "cga"])),
+                ("cold_press".to_string(), strings(&["none"])),
+            ]
+        );
     }
 
     /// The old error variants name their field now (#683).

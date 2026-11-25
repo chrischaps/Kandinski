@@ -8,6 +8,7 @@
 //! --sweep post.exposure=0.8,1.2           a [post_process] field (`|` splits vectors)
 //! --sweep ascii.cell=6,8,12               any registered style's param or option
 //! --sweep wooze.glide=0,0.25,0.5,1        a Living Props wooze knob (#216)
+//! --sweep living.echoes.spread=0,0.9,1.8  the scene's `[living] echoes` (#531)
 //! ```
 //!
 //! What a key means is decided here, before a scene loads or a GPU wakes, so a
@@ -15,7 +16,10 @@
 //! post or style column changes the `[post_process]` it draws with
 //! ([`Sweep::column_def`], [`Sweep::column_style`]); a wooze column lays
 //! [`Sweep::wooze_table`] over the scene's `[wooze]`, and so draws through
-//! `render.rs`'s stages, a world and renderer a column (#487). The sheet the
+//! `render.rs`'s stages, a world and renderer a column (#487); an echoes column
+//! is written into its own copy of the scene's `[living]` table
+//! ([`SweepGrid::lay_living`]) before its stage loads, so it draws what a scene
+//! with that table draws. The sheet the
 //! columns land on is [`super::style_sheet::compose`] for every family.
 
 use super::look::{did_you_mean, find, overlay, Look};
@@ -34,6 +38,9 @@ pub enum SweepKey {
     /// `wooze.<knob>=...`: one of the scene's global wooze values (#216), as
     /// `WoozeField::set_global` names it.
     Wooze { knob: String },
+    /// `living.echoes.<knob>=...`: one field of the scene's `[living] echoes`
+    /// table (#531), as a scene would write it.
+    Echoes { knob: String },
 }
 
 /// `--sweep KEY=V1,V2,...`, parsed and checked.
@@ -54,6 +61,9 @@ pub const CELL_SIZE: (u32, u32) = (640, 360);
 /// The knobs `wooze.<knob>` can turn.
 pub const WOOZE_KNOBS: [&str; 5] = ["amplitude", "step", "glide", "jitter", "preset"];
 
+/// The fields `living.echoes.<knob>` can turn: `[living] echoes`' own.
+pub const ECHO_KNOBS: [&str; 3] = ["count", "spread", "alpha"];
+
 /// `clap`'s value parser for `--sweep`.
 pub fn parse_sweep(spec: &str) -> Result<Sweep, String> {
     Sweep::parse(spec)
@@ -65,8 +75,8 @@ impl Sweep {
     pub fn parse(spec: &str) -> Result<Self, String> {
         let (key, values) = spec.split_once('=').ok_or_else(|| {
             format!(
-                "expected KEY=V1,V2,... (got '{spec}'): e.g. ascii.cell=6,8,12 or \
-                 wooze.glide=0,0.25,0.5,1"
+                "expected KEY=V1,V2,... (got '{spec}'): e.g. ascii.cell=6,8,12, \
+                 wooze.glide=0,0.25,0.5,1 or living.echoes.spread=0,0.9,1.8"
             )
         })?;
         let key = key.trim();
@@ -93,15 +103,17 @@ impl Sweep {
         let key = if key == "look" {
             SweepKey::Look
         } else if let Some(field) = key.strip_prefix("post.") {
-            parse_post(field)?
+            parse_post(field, &values)?
         } else if let Some(knob) = key.strip_prefix("wooze.") {
             parse_wooze(knob, &values)?
+        } else if let Some(field) = key.strip_prefix("living.") {
+            parse_living(field, &values)?
         } else if let Some((style, k)) = key.split_once('.') {
             parse_style(key, style, k, &values)?
         } else {
             return Err(format!(
-                "--sweep: '{key}' is not look, post.<field>, <style>.<key> or wooze.<knob> \
-                 (e.g. ascii.cell; `--style help` lists the keys)"
+                "--sweep: '{key}' is not look, post.<field>, <style>.<key>, wooze.<knob> or \
+                 living.echoes.<knob> (e.g. ascii.cell; `--style help` lists the keys)"
             ));
         };
         Ok(Self { key, values })
@@ -114,15 +126,18 @@ impl Sweep {
             SweepKey::Style { style, key } => format!("{style}.{key}"),
             SweepKey::Post { field } => format!("post.{field}"),
             SweepKey::Wooze { knob } => format!("wooze.{knob}"),
+            SweepKey::Echoes { knob } => format!("living.echoes.{knob}"),
         }
     }
 
     /// What column `i` is labelled with on the sheet: its value, or for a wooze
-    /// number the knob and its value (`glide 0.25`), as #216's sheets were.
+    /// number the knob and its value (`glide 0.25`), as #216's sheets were,
+    /// and an echoes field the same way (`spread 0.9`).
     pub fn label(&self, i: usize) -> String {
         let value = &self.values[i];
         match &self.key {
             SweepKey::Wooze { knob } if knob != "preset" => format!("{knob} {value}"),
+            SweepKey::Echoes { knob } => format!("{knob} {value}"),
             _ => value.clone(),
         }
     }
@@ -173,6 +188,21 @@ impl Sweep {
         Some(table)
     }
 
+    /// The `[living] echoes` field column `i` of an echoes sweep sets, and its
+    /// value as a scene would write it: `count` an integer, the others floats.
+    /// `None` for a sweep of anything else.
+    pub fn echoes_field(&self, i: usize) -> Option<(&str, toml::Value)> {
+        let SweepKey::Echoes { knob } = &self.key else {
+            return None;
+        };
+        let text = &self.values[i];
+        let value = match knob.as_str() {
+            "count" => toml::Value::Integer(text.parse().ok()?),
+            _ => toml::Value::Float(text.parse().ok()?),
+        };
+        Some((knob, value))
+    }
+
     /// Said when columns `i` and `i + 1` came out the same, pixel for pixel: the
     /// sweep showed nothing, and a reader would otherwise think it showed "no
     /// difference". What usually explains it depends on what was swept.
@@ -181,6 +211,14 @@ impl Sweep {
             SweepKey::Wooze { .. } => {
                 "nothing on screen is reading this knob at this moment, or a zone is keeping \
                  it off these values"
+            }
+            SweepKey::Echoes { knob } if knob == "count" => {
+                "every copy the added echoes would draw has faded to nothing at this spread \
+                 and alpha"
+            }
+            SweepKey::Echoes { .. } => {
+                "no living prop draws echoes here: a count of 0, in the scene's [living] \
+                 echoes or every spec's, leaves nothing for spread or alpha to change"
             }
             SweepKey::Style { .. } => {
                 "the style is off, nothing it draws reads this key, or the style clamps both \
@@ -330,6 +368,14 @@ impl SweepGrid {
         cell_def(&self.axes(column, row), scene, base, scene_path)
     }
 
+    /// The look the cell's `look=` axis names, if either axis is one.
+    pub fn cell_look(&self, column: usize, row: usize) -> Option<&str> {
+        self.axes(column, row)
+            .into_iter()
+            .find(|(s, _)| s.key == SweepKey::Look)
+            .map(|(s, i)| s.values[i].as_str())
+    }
+
     /// The cell's `--style` words, one per style axis.
     pub fn cell_styles(&self, column: usize, row: usize) -> Vec<String> {
         self.axes(column, row)
@@ -346,6 +392,39 @@ impl SweepGrid {
             .map(|(s, i)| format!("{} = {}", s.name(), s.values[i]))
             .collect::<Vec<_>>()
             .join(", ")
+    }
+
+    /// Whether either axis turns a field of the scene's `[living]` table.
+    pub fn is_living(&self) -> bool {
+        self.axes(0, 0)
+            .iter()
+            .any(|(s, _)| matches!(s.key, SweepKey::Echoes { .. }))
+    }
+
+    /// Write the cell's `[living]` values into a scene's tables (#531): each
+    /// echoes axis's field into `[living] echoes`, the table and its `echoes`
+    /// made when the scene has none, every other field left as the scene
+    /// wrote it. The cell then draws what a scene with that table draws,
+    /// since everything downstream reads `[living]` from these tables.
+    pub fn lay_living(&self, column: usize, row: usize, tables: &mut toml::Table) {
+        for (sweep, i) in self.axes(column, row) {
+            let Some((knob, value)) = sweep.echoes_field(i) else {
+                continue;
+            };
+            let living = tables
+                .entry("living")
+                .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+            // A [living] that isn't a table was refused when the scene settled
+            let Some(living) = living.as_table_mut() else {
+                continue;
+            };
+            let echoes = living
+                .entry("echoes")
+                .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+            if let Some(echoes) = echoes.as_table_mut() {
+                echoes.insert(knob.to_string(), value);
+            }
+        }
     }
 
     /// The first wooze knob either axis turns.
@@ -399,28 +478,91 @@ pub enum CellView {
     Small,
     /// Each drawn at the full size and a region kept pixel for pixel
     /// (`--sweep-crop X,Y,W,H`): glyphs true to size, a part of the frame.
-    Crop { x: u32, y: u32, w: u32, h: u32 },
+    Crop(Crop),
     /// Each drawn at the full size and shrunk to a cell (`--sweep-scale
     /// full`): the whole composition the final render has, its glyphs blurred.
     Full,
 }
 
+/// The region a `--sweep-crop` keeps: in pixels of the frame, or as
+/// fractions of it (#501), so one crop holds at any `--width/--height`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Crop {
+    /// `700,380,480,270`: X, Y, W, H in pixels.
+    Pixels([u32; 4]),
+    /// `0.4,0.48,0.33,0.33`: X, Y, W, H as shares of the frame's width and
+    /// height, each in 0..=1, the region inside the frame.
+    Fraction([f64; 4]),
+}
+
+impl Crop {
+    /// The region in pixels of a `width` x `height` frame. A fraction's
+    /// edges are rounded, not its size, so a region that ends at the frame's
+    /// edge ends there at any size; it keeps at least a pixel each way.
+    pub fn pixels(&self, width: u32, height: u32) -> (u32, u32, u32, u32) {
+        match *self {
+            Crop::Pixels([x, y, w, h]) => (x, y, w, h),
+            Crop::Fraction([fx, fy, fw, fh]) => {
+                let edge = |f: f64, size: u32| ((f * f64::from(size)).round() as u32).min(size);
+                let (x0, y0) = (edge(fx, width), edge(fy, height));
+                let (x1, y1) = (edge(fx + fw, width), edge(fy + fh, height));
+                let x0 = x0.min(width.saturating_sub(1));
+                let y0 = y0.min(height.saturating_sub(1));
+                (x0, y0, x1.max(x0 + 1) - x0, y1.max(y0 + 1) - y0)
+            }
+        }
+    }
+}
+
 /// How wide a `CellView::Full` cell is shrunk to.
 pub const FULL_CELL_WIDTH: u32 = 640;
 
-/// `clap`'s value parser for `--sweep-crop X,Y,W,H`.
+/// `clap`'s value parser for `--sweep-crop X,Y,W,H`: pixels of the full
+/// frame, or, when any value has a decimal point, fractions of it (#501).
 pub fn parse_crop(spec: &str) -> Result<CellView, String> {
     let parts: Vec<&str> = spec.split(',').map(str::trim).collect();
+    let usage = || {
+        format!(
+            "--sweep-crop takes X,Y,W,H in pixels of the full frame or as fractions of it \
+             (got '{spec}'), e.g. 640,360,640,360 or 0.33,0.33,0.33,0.33 for the middle \
+             of a 1920x1080 frame"
+        )
+    };
+    if parts.iter().any(|p| p.contains('.')) {
+        let numbers: Option<Vec<f64>> = parts.iter().map(|p| p.parse().ok()).collect();
+        let Some(&[x, y, w, h]) = numbers.as_deref() else {
+            return Err(usage());
+        };
+        const SLACK: f64 = 1e-9;
+        if [x, y, w, h]
+            .iter()
+            .any(|v| !(v.is_finite() && (0.0..=1.0).contains(v)))
+        {
+            return Err(format!(
+                "--sweep-crop {spec}: a crop in fractions takes each value from 0 to 1 \
+                 (pixels have no decimal point: 700,380,480,270)"
+            ));
+        }
+        if w <= 0.0 || h <= 0.0 {
+            return Err(format!(
+                "--sweep-crop {spec}: the width and height must be over 0"
+            ));
+        }
+        if x + w > 1.0 + SLACK || y + h > 1.0 + SLACK {
+            return Err(format!(
+                "--sweep-crop {spec}: the region reaches past the frame (X + W and Y + H \
+                 must be at most 1)"
+            ));
+        }
+        return Ok(CellView::Crop(Crop::Fraction([x, y, w, h])));
+    }
     let numbers: Option<Vec<u32>> = parts.iter().map(|p| p.parse().ok()).collect();
     match numbers.as_deref() {
-        Some(&[x, y, w, h]) if w > 0 && h > 0 => Ok(CellView::Crop { x, y, w, h }),
+        Some(&[x, y, w, h]) if w > 0 && h > 0 => Ok(CellView::Crop(Crop::Pixels([x, y, w, h]))),
         Some(&[_, _, _, _]) => Err(format!(
             "--sweep-crop {spec}: the width and height must be over 0"
         )),
-        _ => Err(format!(
-            "--sweep-crop takes X,Y,W,H in pixels of the full frame (got '{spec}'), \
-             e.g. 640,360,640,360 for the middle of a 1920x1080 frame"
-        )),
+        _ => Err(usage()),
     }
 }
 
@@ -438,38 +580,44 @@ impl CellView {
     pub fn render_size(&self, width: Option<u32>, height: Option<u32>) -> (u32, u32) {
         let (w, h) = match self {
             CellView::Small => CELL_SIZE,
-            CellView::Crop { .. } | CellView::Full => FULL_SIZE,
+            CellView::Crop(_) | CellView::Full => FULL_SIZE,
         };
         (width.unwrap_or(w), height.unwrap_or(h))
     }
 
-    /// A crop that leaves the frame is refused before any drawing.
+    /// A crop that leaves the frame is refused before any drawing. A crop
+    /// in fractions never does.
     pub fn check(&self, width: u32, height: u32) -> Result<(), String> {
-        if let CellView::Crop { x, y, w, h } = *self {
+        if let CellView::Crop(Crop::Pixels([x, y, w, h])) = *self {
             if x.saturating_add(w) > width || y.saturating_add(h) > height {
                 return Err(format!(
                     "--sweep-crop {x},{y},{w},{h} reaches past the {width}x{height} frame \
-                     (set --width/--height, or a smaller crop)"
+                     (set --width/--height, a smaller crop, or give it in fractions)"
                 ));
             }
         }
         Ok(())
     }
 
+    /// The region a crop keeps of a `width` x `height` frame, in pixels;
+    /// `None` for a cell that shows the whole frame.
+    pub fn region(&self, width: u32, height: u32) -> Option<(u32, u32, u32, u32)> {
+        match self {
+            CellView::Crop(crop) => Some(crop.pixels(width, height)),
+            CellView::Small | CellView::Full => None,
+        }
+    }
+
     /// The cell a drawn frame becomes.
     pub fn cell(&self, frame: image::RgbaImage) -> image::RgbaImage {
+        let (fw, fh) = frame.dimensions();
+        if let Some((x, y, w, h)) = self.region(fw, fh) {
+            return image::imageops::crop_imm(&frame, x, y, w, h).to_image();
+        }
         match *self {
-            CellView::Small => frame,
-            CellView::Crop { x, y, w, h } => {
-                image::imageops::crop_imm(&frame, x, y, w, h).to_image()
-            }
-            CellView::Full => {
-                let (w, h) = frame.dimensions();
-                if w <= FULL_CELL_WIDTH {
-                    return frame;
-                }
-                let th = ((u64::from(h) * u64::from(FULL_CELL_WIDTH) + u64::from(w) / 2)
-                    / u64::from(w))
+            CellView::Full if fw > FULL_CELL_WIDTH => {
+                let th = ((u64::from(fh) * u64::from(FULL_CELL_WIDTH) + u64::from(fw) / 2)
+                    / u64::from(fw))
                 .max(1) as u32;
                 image::imageops::resize(
                     &frame,
@@ -478,14 +626,28 @@ impl CellView {
                     image::imageops::FilterType::Triangle,
                 )
             }
+            _ => frame,
         }
+    }
+
+    /// Where a crop sheet's cells come from (#501): the whole of one drawn
+    /// frame, with the region its cells keep. `None` unless this is a crop.
+    /// A crop is the same region of every cell's frame, so the first one
+    /// stands for them all.
+    pub fn locator(&self, frame: &image::RgbaImage) -> Option<super::style_sheet::Locator> {
+        let (w, h) = frame.dimensions();
+        self.region(w, h).map(|region| super::style_sheet::Locator {
+            frame: frame.clone(),
+            region,
+        })
     }
 
     /// What a reader has to know about the scale, for the sheet's subtitle.
     pub fn describe(&self, width: u32, height: u32) -> String {
         match *self {
             CellView::Small => format!("{width}x{height} frames"),
-            CellView::Crop { x, y, w, h } => {
+            CellView::Crop(crop) => {
+                let (x, y, w, h) = crop.pixels(width, height);
                 format!("1:1 {w}x{h} at {x},{y} of {width}x{height}")
             }
             CellView::Full => {
@@ -496,12 +658,24 @@ impl CellView {
     }
 }
 
-fn parse_post(field: &str) -> Result<SweepKey, String> {
+fn parse_post(field: &str, values: &[String]) -> Result<SweepKey, String> {
     if !PostProcessDef::field_names().iter().any(|k| k == field) {
         return Err(format!(
             "--sweep: [post_process] has no field '{field}'{}",
             did_you_mean(PostProcessDef::closest_field(field))
         ));
+    }
+    // A built-in effect's value past what it is tuned for is refused, as a
+    // style sweep's is (#355, #741)
+    if let Some(param) = flint_schema::post_effects::param(field) {
+        for value in values {
+            if let Some(e) = param.range_error(&parse_value(value)) {
+                return Err(format!(
+                    "--sweep post.{field}={value}: {e} (`flint render --list-effects` lists \
+                     every key's range)"
+                ));
+            }
+        }
     }
     Ok(SweepKey::Post {
         field: field.to_string(),
@@ -530,11 +704,58 @@ fn parse_wooze(knob: &str, values: &[String]) -> Result<SweepKey, String> {
     })
 }
 
+/// `living.<field>`: `[living] echoes`' fields (#531), each value held to
+/// what a spec's echoes take (`EchoConfig::check`), so no column draws a value
+/// the props would refuse.
+fn parse_living(field: &str, values: &[String]) -> Result<SweepKey, String> {
+    let Some(knob) = field
+        .strip_prefix("echoes.")
+        .filter(|k| ECHO_KNOBS.contains(k))
+    else {
+        return Err(format!(
+            "--sweep: can't sweep 'living.{field}': it takes living.echoes.{}",
+            ECHO_KNOBS.join(", living.echoes.")
+        ));
+    };
+    for value in values {
+        let mut echoes = flint_procgen::EchoConfig::default();
+        if knob == "count" {
+            echoes.count = value.parse().map_err(|_| {
+                format!("--sweep: living.echoes.count takes whole numbers, and '{value}' isn't")
+            })?;
+        } else {
+            let number = value
+                .parse::<f32>()
+                .ok()
+                .filter(|n| n.is_finite())
+                .ok_or_else(|| {
+                    format!("--sweep: living.echoes.{knob} takes numbers, and '{value}' isn't")
+                })?;
+            if knob == "spread" {
+                echoes.spread = number;
+            } else {
+                echoes.alpha = number;
+            }
+        }
+        // `why` starts with the value: `3: must be from 0 to 1.82 steps, ...`
+        if let Err((_, why)) = echoes.check() {
+            return Err(format!("--sweep living.echoes.{knob}={why}"));
+        }
+    }
+    Ok(SweepKey::Echoes {
+        knob: knob.to_string(),
+    })
+}
+
 fn parse_style(key: &str, style: &str, k: &str, values: &[String]) -> Result<SweepKey, String> {
     for value in values {
         // `StyleSpec` refuses a value past its param's range (#355), which
         // would draw the same column twice
-        match flint_render::stylize::StyleSpec::parse(&format!("{style}:{k}={value}")) {
+        let word = format!("{style}:{k}={value}");
+        match flint_render::stylize::StyleSpec::parse(
+            &word,
+            &flint_render::stylize::StyleRegistry::new(),
+        ) {
             Ok(_) => {}
             // Maybe a user style (#274), registered only once the scene's
             // folder is read; the column's apply checks it
@@ -657,6 +878,83 @@ mod tests {
             .contains("'dreamy'"));
     }
 
+    /// #531: an echoes field parses, labels like a wooze knob and is written
+    /// into the scene's `[living] echoes` as a scene would write it.
+    #[test]
+    fn an_echoes_sweep_is_written_into_the_living_table() {
+        let spread = parse_sweep("living.echoes.spread=0,0.9,1.8").unwrap();
+        assert_eq!(spread.name(), "living.echoes.spread");
+        assert_eq!(spread.label(1), "spread 0.9");
+        assert_eq!(spread.wooze_knob(), None, "no wooze knob");
+        assert_eq!(spread.column_style(0), None, "and no style");
+        let count = parse_sweep("living.echoes.count=0,3").unwrap();
+        assert_eq!(
+            count.echoes_field(1),
+            Some(("count", toml::Value::Integer(3)))
+        );
+
+        // Over a scene's table: the column's field, the scene's others kept
+        let grid = SweepGrid::new(&[spread]).unwrap().unwrap();
+        assert!(grid.is_living());
+        let mut tables: toml::Table = toml::from_str(
+            "[living]\nstagger = \"none\"\nsoftness = 0.3\nechoes = { count = 2, spread = 0.2 }",
+        )
+        .unwrap();
+        grid.lay_living(1, 0, &mut tables);
+        let scene: toml::Table = toml::from_str(
+            "[living]\nstagger = \"none\"\nsoftness = 0.3\nechoes = { count = 2, spread = 0.9 }",
+        )
+        .unwrap();
+        assert_eq!(tables, scene, "what a scene with spread = 0.9 says");
+
+        // A scene with no [living] gets one holding only the field
+        let mut bare = toml::Table::new();
+        grid.lay_living(2, 0, &mut bare);
+        let expected: toml::Table = toml::from_str("[living]\nechoes = { spread = 1.8 }").unwrap();
+        assert_eq!(bare, expected);
+
+        // In a grid, each axis writes its own field
+        let grid = SweepGrid::new(&[
+            parse_sweep("living.echoes.alpha=0.1,0.4").unwrap(),
+            parse_sweep("living.echoes.count=1,6").unwrap(),
+        ])
+        .unwrap()
+        .unwrap();
+        let mut both = toml::Table::new();
+        grid.lay_living(1, 1, &mut both);
+        let expected: toml::Table =
+            toml::from_str("[living]\nechoes = { alpha = 0.4, count = 6 }").unwrap();
+        assert_eq!(both, expected);
+        assert!(!SweepGrid::new(&[parse_sweep("wooze.glide=0,1").unwrap()])
+            .unwrap()
+            .unwrap()
+            .is_living());
+    }
+
+    #[test]
+    fn a_bad_echoes_sweep_says_what_was_wrong() {
+        let unknown = parse_sweep("living.echoes.width=1,2").unwrap_err();
+        assert!(unknown.contains("living.echoes.spread"), "{unknown}");
+        assert!(parse_sweep("living.softness=0,1")
+            .unwrap_err()
+            .contains("living.echoes.count"));
+        assert!(parse_sweep("living.echoes.count=1,2.5")
+            .unwrap_err()
+            .contains("whole numbers"));
+        assert!(parse_sweep("living.echoes.count=-1,2").is_err());
+        let many = parse_sweep("living.echoes.count=1,40").unwrap_err();
+        assert!(many.contains("at most 16"), "{many}");
+        let wide = parse_sweep("living.echoes.spread=0,3").unwrap_err();
+        assert!(wide.contains("faded to nothing"), "{wide}");
+        let bright = parse_sweep("living.echoes.alpha=0.2,1.5").unwrap_err();
+        assert!(bright.contains("[0.0, 1.0]"), "{bright}");
+        assert!(parse_sweep("living.echoes.alpha=0.2,NaN")
+            .unwrap_err()
+            .contains("takes numbers"));
+        let s = parse_sweep("living.echoes.spread=0.5,0.5").unwrap();
+        assert!(s.identical_warning(0).contains("count of 0"));
+    }
+
     #[test]
     fn bad_sweeps_say_why() {
         assert!(Sweep::parse("ascii.cell=8")
@@ -760,6 +1058,12 @@ mod tests {
             s("post.exposure=1,2"),
         ]);
         assert!(three.unwrap_err().contains("one (a row) or two"));
+        // #741: a post value past its range is refused, naming it
+        let hot = Sweep::parse("post.bloom_intensity=0.1,3").unwrap_err();
+        assert!(
+            hot.contains("bloom_intensity=3 is outside its range 0..1"),
+            "{hot}"
+        );
         let big = ["1"; 12].join(",");
         let many = SweepGrid::new(&[
             s(&format!("post.exposure={big}")),
@@ -816,6 +1120,70 @@ mod tests {
 
         let small = CellView::from_args(None, None);
         assert_eq!(small.render_size(None, Some(200)), (640, 200));
+    }
+
+    /// #501: a crop in fractions of the frame, the same region at any size.
+    #[test]
+    fn a_crop_in_fractions_scales_with_the_frame() {
+        let crop = parse_crop("0.25,0.5,0.5,0.5").unwrap();
+        assert_eq!(crop.region(1920, 1080), Some((480, 540, 960, 540)));
+        assert_eq!(crop.region(640, 360), Some((160, 180, 320, 180)));
+        assert_eq!(crop.describe(640, 360), "1:1 320x180 at 160,180 of 640x360");
+        assert!(crop.check(17, 3).is_ok(), "a fraction is always inside");
+        let frame = image::RgbaImage::new(1280, 720);
+        assert_eq!(crop.cell(frame).dimensions(), (640, 360));
+        // Edges round, not sizes: a region to the frame's edge ends there
+        let right = parse_crop("0.5,0,0.5,1").unwrap();
+        assert_eq!(right.region(101, 7), Some((51, 0, 50, 7)));
+        // The golden pair: these fractions are 220,130,240,135 of 640x360
+        assert_eq!(
+            parse_crop("0.34375,0.3611,0.375,0.375")
+                .unwrap()
+                .region(640, 360),
+            parse_crop("220,130,240,135").unwrap().region(640, 360),
+        );
+        // Never empty, even far smaller than a pixel
+        assert_eq!(
+            parse_crop("0.999,0.999,0.0001,0.0001")
+                .unwrap()
+                .region(100, 100),
+            Some((99, 99, 1, 1))
+        );
+        // Any decimal point makes the whole crop fractional
+        assert_eq!(
+            parse_crop("0,0,1.0,1").unwrap(),
+            CellView::Crop(Crop::Fraction([0.0, 0.0, 1.0, 1.0]))
+        );
+        assert_eq!(
+            parse_crop("0,0,1,1").unwrap(),
+            CellView::Crop(Crop::Pixels([0, 0, 1, 1]))
+        );
+    }
+
+    #[test]
+    fn crops_in_fractions_that_cant_be_are_refused() {
+        assert!(parse_crop("700,0.5,0.3,0.3")
+            .unwrap_err()
+            .contains("from 0 to 1"));
+        assert!(parse_crop("0.5,0.5,0,0.2").unwrap_err().contains("over 0"));
+        assert!(parse_crop("0.6,0,0.5,0.5")
+            .unwrap_err()
+            .contains("past the frame"));
+        assert!(parse_crop("0.1,0.1,0.5").is_err());
+        assert!(parse_crop("0.1,NaN,0.5,0.5").is_err());
+    }
+
+    /// The locator is the first frame whole, with the region it keeps; only
+    /// a crop has one.
+    #[test]
+    fn only_a_crop_has_a_locator() {
+        let frame = image::RgbaImage::new(640, 360);
+        let crop = parse_crop("0.5,0.5,0.25,0.25").unwrap();
+        let locator = crop.locator(&frame).unwrap();
+        assert_eq!(locator.region, (320, 180, 160, 90));
+        assert_eq!(locator.frame.dimensions(), (640, 360));
+        assert!(CellView::Full.locator(&frame).is_none());
+        assert!(CellView::Small.locator(&frame).is_none());
     }
 
     #[test]

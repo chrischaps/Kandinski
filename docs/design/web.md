@@ -21,8 +21,6 @@ rustup target add wasm32-unknown-unknown
 cargo check --target wasm32-unknown-unknown -p flint-player   # the whole player
 cd crates/flint-player
 trunk serve                 # http://127.0.0.1:8080, the player on the First Light scene
-trunk serve shims.html      # the shim check (#100): sky clear, time, pad, rebinds;
-                            #   sound behind a Begin click (#101)
 trunk build --release       # dist/, with wasm-opt -Oz (trunk fetches binaryen)
 trunk build --release --cargo-profile web-release   # what the site ships (#123, Size)
 ```
@@ -30,9 +28,12 @@ trunk build --release --cargo-profile web-release   # what the site ships (#123,
 CI keeps this compiling (#96). The `wasm32 check` job in
 `.github/workflows/ci.yml` runs `scripts/wasm-check.sh` on every PR: a wasm32
 clippy pass over `flint-player` and the workspace crates it links, with every
-lint off but `disallowed_methods`, configured in
-`scripts/wasm-clippy/clippy.toml` to deny `Instant::now`, `SystemTime::now`
-and their `elapsed()`. Those are the calls that compile but panic. #100
+lint off but `disallowed_methods`: the root `clippy.toml`'s list (reads past
+the vfs, `as_float`, the wgpu seams), which native `cargo clippy` reads too,
+plus `scripts/wasm-clippy/wasm-only.toml`, which denies `Instant::now`,
+`SystemTime::now` and their `elapsed()` (#761: on native `web_time::Instant`
+is `std::time::Instant`, so only a wasm build can tell them apart). Those are
+the calls that compile but panic. #100
 moved the 32 sites that predated the check to `web-time` and removed
 their allows, so a std time call in a runtime crate now fails the check.
 
@@ -227,6 +228,16 @@ can't change or break the site between Flint deploys. Moving a game forward
 means changing its `ref`. Float is pinned to its `engine-catchup` branch
 (#102): the engine subtree at Flint `main`, plus its `bundle.toml`.
 
+**A game in this repo** (#430) gives `path`, a folder in the Flint
+checkout, in place of `repo` and `ref`. `build.py` exports it from where it
+is, so it plays at the commit the site is built from and needs no pin:
+every deploy then checks an engine feature in a real browser at the
+engine's own commit. Sun Prints (`tools/play-site/sunprint/`,
+`?game=sunprint`) is the first: a garden whose whole look is a
+user-authored style, a cyanotype in a `.shader.toml` and two WGSL passes,
+which on the web only the browser compiles (#415). `build.py --only
+sunprint` builds just that game for a local trial.
+
 **The doorway.** Before any wasm is fetched, an inline script in
 `index.html` decides whether this visit can play:
 
@@ -247,8 +258,7 @@ means changing its `ref`. Float is pinned to its `engine-catchup` branch
 can play. Its `pattern_preload` preloads only the 90 KB JS glue. Trunk's
 default loader also preloads the wasm, so even a browser that can't play
 would have downloaded the whole wasm (7 MB). Under `trunk serve` there is no `games.json`
-and the page plays what the query names, as before. `shims.html` has no
-doorway, so it awaits `undefined` and starts at once.
+and the page plays what the query names, as before.
 
 **Embed.** `?game=float&embed=1` is for iframes. It shows the world and its
 Begin button, with the progress hairline centred low, and no wordmark,
@@ -309,13 +319,15 @@ packs the engine's. Book: guides/publishing-to-the-web.md.
 
 | Run | Result |
 |---|---|
-| `flint export web examples/`, no `--player` | trunk built the player in 5 m 54 s (cold `web-release`); `demo.flintpack` 228 files 106.12 MB, `demo.audio.flintpack` 14 files 1.84 MB |
+| `flint export web` of the examples, no `--player` | trunk built the player in 5 m 54 s (cold `web-release`); `demo.flintpack` 228 files 106.12 MB, `demo.audio.flintpack` 14 files 1.84 MB |
 | `/` | the address became `/?game=demo`; the gate read "Flint demos"; the tavern loaded (49 entities), its scripts started, the late audio bundle arrived |
 | `/?scene=pencil_sketch.scene.toml` | `&game=demo` added; Pencil Sketch (11 entities) drawn from the same bundle |
 | `build.py` (Float `3e0b75f`, FlintKart `bd910be`) through export | float 16.03 MB in 3 bundles, kart 91.88 MB in 2 plus its film and poster; `games.json` holds the keys and values the old script wrote |
 
-The demo bundle is large because the tavern's `wooden_bench.glb` (31 MB) and
-`wood_planks.png` (27 MB) are. The packer doesn't drop files no scene reads.
+The demo bundle was large because the tavern's `wooden_bench.glb` (31 MB) and
+`wood_planks.png` (27 MB) were; #759 capped both at 2048 texels a side
+(3.6 MB and a 1.9 MB `wood_planks.jpg`). The packer doesn't drop files no
+scene reads.
 
 ## Flint Kart (#104)
 
@@ -536,11 +548,22 @@ the page's `#perf` panel):
   `requestAnimationFrame` loop of the page's own, timed by rAF's
   timestamps. Timing the player's callbacks instead showed jitter that no
   one sees (p99 23 ms where rAF said 16.8).
+- **mean** (#1318): the window's span over its frames, which doesn't snap to
+  refreshes, marked `GPU-bound` with its inputs when the page is unpaced
+  (`fps=native`), the player's work is under half the frame and the frames
+  miss the refresh (read from the same rAF intervals,
+  `frame_rate::estimate_refresh`). Then it is the GPU's ms a frame, the
+  number #568 counted submissions for: Float with Kuwahara at 3840x2160 in
+  Chrome read p50 33.4 and mean 38.4 against timestamps of 38.2 to 39.1
+  (`tools/web-perf/README.md`, "GPU-bound pages").
 - **worst**: the longest gap between the player's frames, and how much of
   it was the player's own work. A long frame with little work in it is the
   browser's, not ours.
-- canvas pixels and DPR, the adapter as the browser names it (wgpu 23's
-  WebGPU backend leaves `AdapterInfo` empty, so the page asks
+- canvas pixels and DPR, the adapter as the browser names it (wgpu's
+  WebGPU backend fills only `AdapterInfo::name`, and wgpu 30 takes that from
+  the browser's `GPUAdapterInfo.description`, which Chrome 157 and Firefox
+  159 leave empty: #949 found the player's log line still says
+  `GPU adapter:  (Other, BrowserWebGpu)` in both. So the page asks
   `navigator.gpu` itself), draw calls and triangles, late audio buffers and
   the mean time to mix one (`AudioEngine::buffer_stats`).
 - **voices**: the sounds and spatial tracks kira holds, and how many of
@@ -550,9 +573,10 @@ the page's `#perf` panel):
 - **cpu ms**, mean and max per phase of the frame: input, scripts,
   physics, script ui, anim/fx, sync (procgen, renderer sync, late audio),
   render (draw lists, encoding, submission), hud, present.
-- **scripts**: the four with the worst single frame, by file, and the
-  script system's own steps in brackets (`[hot reload]`, `[load, on_init]`,
-  `[events]`); `ScriptSystem::set_update_timing`.
+- **scripts**: the four callbacks with the worst single frame, by file
+  and callback (`hud.rhai:on_draw_ui`, #703), and the script system's own
+  steps in brackets, less the callbacks they ran (`[hot reload]`,
+  `[load]`); `ScriptSystem::set_timing` / `take_times`.
 - **gpu ms** per pass from `timestamp-query` (ADR 0108), where the adapter
   has it. The post chain is now a scope per effect (`SSAO`, `Bloom`,
   `Volumetric`, `Kuwahara`), not one `Post-process`. Without timestamps the
@@ -633,7 +657,7 @@ buffer, on the main thread. `?perf=1` now counts what it mixes: a
 really mixes, and the one-shots it skipped or stole; the `audio` line
 gains the mean time to mix one buffer.
 
-**Where the time goes.** `examples/mix_bench.rs` builds Float's mixer on
+**Where the time goes.** `crates/flint-audio/examples/mix_bench.rs` builds Float's mixer on
 kira's mock backend and times one 2048-frame buffer natively. Pausing the
 six loops Float keeps at volume 0 (four songs, rain, storm) saved only
 7%: a paused-or-not plain voice costs about 0.013 ms. A kira **spatial
@@ -744,7 +768,7 @@ The ASCII style (#265, per entity since #266, temporal since #277) adds
 two things to a frame: the entity style mask (`Style mask`, a redraw of
 the styled entities' ids after the scene pass) and the glyph style itself
 (`ASCII`, a cell pass and a glyph pass at the display stage). Measured on
-`examples/ascii_entities.scene.toml` (six styled props, meadow, SSAO, bloom),
+`flint-examples/ascii_entities.scene.toml` (six styled props, meadow, SSAO, bloom),
 RTX 4070 laptop, release build, 1920x1080 output, `flint render
 --gpu-time 240`, best of five processes since other jobs shared the GPU:
 
@@ -760,16 +784,16 @@ RTX 4070 laptop, release build, 1920x1080 output, `flint render
 | full screen at `--pixels-per-point 2` (16 px cells) | | 0.043 / 0.040 | |
 
 Re-measured for #337 after edges (#267) and tone normalisation (#289)
-were on by default and in the demo. Same machine, Vulkan, `--ascii-scope
-screen`, best of 3 alternated with main:
+were on by default and in the demo. Same machine, Vulkan, `--style
+ascii:scope=screen`, best of 3 alternated with main:
 
 | | main (b9aabc3) | #337 |
 |---|---|---|
 | edges on (default), no styled entities | 0.39--0.43 | 0.43 ms |
 | edges on, over the demo's props | 0.518 | 0.447 ms |
-| `--ascii-edges 0`, no styled entities | 0.049 | 0.048 ms |
-| `--ascii-edges 0`, over the props (barrel normalised) | 0.150 | 0.094 ms |
-| `--ascii-edges 0`, over the props, no `normalize` | 0.075 | 0.074 ms |
+| `--style ascii:edges=0`, no styled entities | 0.049 | 0.048 ms |
+| `--style ascii:edges=0`, over the props (barrel normalised) | 0.150 | 0.094 ms |
+| `--style ascii:edges=0`, over the props, no `normalize` | 0.075 | 0.074 ms |
 
 Most of the gap was the statistics: one fragment a lattice row walked
 320 samples, 180 threads in all, latency-bound. Summed in runs of 20,
@@ -805,10 +829,12 @@ cell, glyph) and two `writeBuffer`s a frame, and at scale 1 one bind
 group a frame: the mask's draw group over the caller's depth view, which
 wgpu 23 can't key (the same reason the base chain makes two there). Under
 a render scale the chain owns its depth and all of them are kept. Since
-#379 the player passes its depth view with an id
-(`RenderContext::depth_target()`, a fresh `new_depth_id()` whenever the
-context makes the texture again) and those groups are kept at scale 1
-too (measured below the table, "Bind groups over the caller's depth").
+#379 the player passed its depth view with an id (a fresh
+`new_depth_id()` whenever the context made the texture again) and those
+groups were kept at scale 1 too (measured below the tables, "Bind groups
+over the caller's depth"). Since #960 (wgpu 30) the renderer keys them on
+the view itself, which compares by identity, so every host's depth view is
+kept, a bare `&TextureView` included, and the id is gone.
 
 **Re-read with `tools/web-perf/run.mjs` (#381, 2026-11-12).** The table
 above is now one command over a `flint export web` folder of the same three
@@ -842,6 +868,29 @@ but the canvas kept the display's 1.5 (2880x1620 at "DPR 1"), since winit
 sizes it from a ResizeObserver's device-pixel box. `?begin=auto` lifts the
 gate, so the screenshots need no hiding.
 
+**Bind groups over the caller's depth (#565, 2026-11-18).** #379's reading in
+the browser, at render scale 1 (`&scale=1`, scene 1920x1080 on a 1920x1080
+canvas at DPR 1). The player was main's Play site build at 7f835647; the
+ASCII bundle is `tools/phone-perf/ascii_variants.py`'s three scenes, and
+Float's is the one that site serves (Float@8595f72e). The readout rounds a
+frame's count to one decimal, so `run.mjs` now also keeps the page's running
+totals (`window.flintGpuCalls`) at each read and prints the difference
+between the first read and the last (`between` in the page's JSON). Three
+reads, 20 s apart end to end, Chrome 157:
+
+| page | frames between reads | `createBindGroup` | `createBuffer` | passes a frame |
+|---|---|---|---|---|
+| `ascii_none` | 1201 | 0 | 0 | 17 |
+| `ascii_entities` | 1201 | 0 | 0 | 30 |
+| `ascii_full` | 1201 | 0 | 0 | 30 |
+| Float, `scenes/float.scene.toml` | 1202 | 0 | 0 | 16--19 |
+
+None at all, where #270's table above read 3 a frame on the styled pages and
+2 on the plain one. Every group a page makes is made in its first 25 s
+(the totals at the first read: 103 on `ascii_entities`, 563 on Float), and
+none after. The styled pages draw 30 passes a frame here, against #381's 26:
+the style's passes have changed since, which this reading doesn't look into.
+
 **Cells are output pixels.** ASCII runs at the display stage, after the
 upscale, so a render scale or the web's DPR cap changes only the scene
 under the glyphs, never the grid: 8 pt cells are 16 device pixels at DPR
@@ -870,7 +919,51 @@ Desktop, 1920x1080, RTX 4070 laptop, best of five alternating runs:
 
 The control isn't scissored and moved within this machine's run-to-run
 spread. The saving scales with the share of the screen the props leave
-untouched, which is what a phone pays for. The browser is unmeasured.
+untouched, which is what a phone pays for.
+
+**In the browser (#538).** Measured with `tools/web-perf/run.mjs` on a
+`flint export web` folder of #270's ASCII variants plus
+`flint-examples/watercolor.scene.toml` (watercolor is scissored since #538 too),
+each page twice: as written, and with the page's `?scissor=0`, which draws
+the full passes as `FLINT_STYLE_SCISSOR=0` does natively. Chrome 157, RTX
+4070 laptop, 1920x1080 device pixels, two 10 s windows a page, three runs
+(two at DPR 1, one at DPR 2) on 2026-11-17, the player built from the
+#538 branch:
+
+| page | canvas / scene | pass | scissored | `scissor=0` |
+|---|---|---|---|---|
+| DPR 1, `ascii_entities` | 1920x1080 / 1920x1080 | ASCII | 0.83--0.89 | 1.52--1.60 ms |
+| | | Style edges | 0.24--0.26 | 0.50--0.54 ms |
+| DPR 1, `watercolor` | 1920x1080 / 1920x1080 | Watercolor | 0.61--0.67 | 1.07--1.22 ms |
+| DPR 2 (cap 1.5), `ascii_entities` | 1920x1080 / 1440x810 | ASCII | 1.34 | 1.56--1.61 ms |
+| | | Style edges | 0.26 | 0.36--0.37 ms |
+| DPR 2, `watercolor` | 1920x1080 / 1440x810 | Watercolor | 0.76--0.79 | 1.44--1.53 ms |
+
+Every page said `under vsync at idle clocks` (39--46% busy), so the
+times read about four times the desktop's (`flint render --gpu-time`:
+watercolor 0.110 against 0.236 ms, ASCII 0.17 against 0.45). Compare the
+two columns, taken minutes apart in one Chrome, rather than either with
+the desktop. One more read is left out of the table: the first DPR 1
+`watercolor+scissor=0` window caught the GPU at 12% busy and read every
+pass lower (Watercolor 0.29, SSAO 1.00, against 3.3 on its next window).
+The control page (`ascii_none`) and the passes nothing scissors (Style
+mask 0.13--0.16, Bloom, Composite) are the same in both columns.
+
+- **The browser saves what the desktop does, in proportion.** ASCII at
+  DPR 1 is 45% cheaper scissored (desktop 63%), watercolor 45% (desktop
+  53%), and the shared edge pass, which reads only inside the per-entity
+  readers' rect (#743), half.
+- **DPR 2 saves less on ASCII**: its glyph rect is grown by two of the
+  largest cell, and 8 pt cells are 16 device pixels there, so the rect
+  holds more of the frame around the six props (15% off). Watercolor's
+  reach is a few points, and it still halves.
+- **The scissor adds a render pass on ASCII** (30 passes a frame against
+  29) and no bind group or buffer write; watercolor's count is the same
+  (22).
+
+The phone (#378's Pixel) is still unmeasured: it needs the pixel lock and
+Chris's phone. Mali's timestamps read 0.00 after `Scene` there, so it is a
+frame-time comparison, unpaced (`?fps=native`), against `?scissor=0`.
 
 **DX12.** The ASCII and mask passes read every texture with
 `textureLoad` and bind no sampler of their own (the chain's one linear
@@ -917,7 +1010,8 @@ A second run bisected it on the no-style scene with `?style=`
   nothing styled) and not the display stage (invert and palette hold
   60). Four times the cell area barely helps, so it doesn't follow the
   cell count, and a p90 near 100 ms says about one frame in ten stalls
-  rather than every frame paying the same. Edges add little on top.
+  rather than every frame paying the same. Edges seemed to add little on
+  top, but every row had them: `edges` defaults to 1 (#568, below).
 - **The CPU isn't it:** 2.3 ms a frame without, 3.6--5.7 with. No bind
   groups a frame at the 0.67 cap, as on the desktop under a scale.
 - **The pass timings can't say which.** Chrome exposes
@@ -928,8 +1022,99 @@ A second run bisected it on the no-style scene with `?style=`
 - Paced (the phone's default `fps=auto`), the per-entity scene holds 30
   fps, one refresh in four at 120 Hz, with p99 117 ms.
 
-Finding and fixing the pass is #568. The suspects are the cell pass's
-ping-ponged `Rgba16Uint` history (#277) and the glyph pass.
+### The pass: the shared edges (#568)
+
+**Three quarters of ASCII's cost on the phone is the shared edge pass**,
+`edges.wgsl`'s `fs_main` (#743), which ASCII draws while `edges > 0`.
+`edges` defaults to 1, so every ASCII row above had it: the "edges" rows
+only set it again (`ascii_variants.py` writes `edges = 1.0`, the
+default), which is why edges seemed to "add little on top". The
+suspects above (the cell history, the glyph pass) are about 1 ms
+together.
+
+**How it was found.** A frame time snaps to whole refreshes, so a pass
+that costs 2 ms reads as nothing or as half the frame rate depending on
+where the frame sat. With the scene at `?scale=1` every page here is
+GPU-bound (the no-style control is about 29 ms), unpaced
+(`fps=native`), and 10 000 / frames in 10 s is the GPU's milliseconds a
+frame. `tools/phone-perf/submits.mjs` counts the player's submissions in
+the page; each round plays every page once, five or six rounds
+alternated. To cut one pass, a copy of the site serves main's wasm with
+that shader's WGSL swapped for text of the same length that returns
+early behind a runtime test, so the pipeline and its registers stay and
+the work goes. Pixel 8 Pro, Chrome 157, canvas 1008x2005, main at
+6194270 (the Play site's build), the no-style ASCII scene,
+2026-11-18, thermal status 1--2 and skin 39--43 °C throughout (on USB,
+not charging):
+
+| page, `?scale=1` | ms a frame (median of 5) | over that round's control |
+|---|---|---|
+| no style | 30.3 | |
+| `?style=ascii` | 34.9 | +4.3 |
+| the same, `edges.wgsl`'s full path skipped (its 25 loads and flat test kept) | 33.2 | +2.8 |
+| the same, `edges.wgsl` returning at once | 31.5 | +1.1 |
+
+An earlier run (two rounds) put `?style=ascii:edges=0` at +1.0,
+`invert` at +0.4 and `palette` at +1--3 over the control. Stubbing the
+edge cell pass, or the thin and corner passes, saved nothing beyond the
+noise (three rounds).
+
+- **The pass is about 3.1 ms at `scale=1`**, where the depth is the
+  canvas's 2.0 M pixels. At the web's 0.67 cap it draws half as many,
+  so about 1.5 ms. The rest of ASCII (cells, glyphs, the edge cell,
+  thin and corner passes, the history copies) is about 1 ms. Pencil
+  reads the same pass with its creases; contour reads `fs_steps`, which
+  wasn't measured here.
+- **Half of it is the 25 loads and the flat test every pixel makes**
+  (1.6 ms), and half the full path (1.5 ms), which only 11% of the
+  pixels take in this scene: the grass band, the figure and the props'
+  outlines. (Counted on the desktop: the same scene at 1008x2005 through
+  `edges_view`, with a copy of `edges.wgsl` that marks each patch that
+  isn't flat.) On the RTX 4070 the whole pass is 0.09 ms at 1080p.
+
+**Two fixes that didn't work**, each against main in the same run:
+
+| change to `edges.wgsl` | ASCII over control | pixels |
+|---|---|---|
+| main | +3.78 ms (median of 6) | |
+| nine `textureGather`s for the 25 loads (four for `fs_steps`' nine) | +3.65 (median of 6) | all 123 stylize goldens byte-identical |
+| no `pos` or `rel` arrays: each position and distance recomputed from the depths | about 2 ms slower than main (3 rounds) | 19 goldens drift, inside tolerance (8 glyph pixels in ASCII's, 1--3 levels in pencil's) |
+| that, and no depth array (each depth read again) | about 12 ms slower (3 rounds) | |
+
+So the pass isn't bound by texture fetches (the gathers cut them 2.8x
+and saved nothing), and recomputing what the arrays hold costs more than
+the registers it frees. On the desktop the gathers cost 5 µs (the pass's
+minimum 0.087 to 0.092 ms), so they were left out.
+
+**What it costs, and the lever today.** On a phone whose scene is near
+the 60 Hz budget, the edge pass's 1.5 ms at the 0.67 cap is what pushes
+ASCII's frame past a refresh: a frame that misses one waits for the
+next, so 60 becomes 40 or 30. In a round at the web's defaults
+(`?perf=1&fps=native`, thermal 1) the no-style control drew 557--633
+frames in 10 s, `invert` 449--450, `ascii` 363--420 and
+`ascii:edges=0` 409--542. That day `invert` fell short of the control as
+well, unlike #378's run, so the phone's ceiling was the scene, not the
+style. Without edges ASCII drew as many frames as `invert`; with them
+7--19% fewer (2--5 ms a frame, inside one 120 Hz refresh of it but not
+of the control). `edges = 0` in a scene's
+`[post_process.styles.ascii]` (or `?style=ascii:edges=0`) is the lever,
+at the price of the line glyphs. A cheaper edge detector for phones
+(half resolution, the steps alone, or the flat test as its own small
+pass in front of the heavy one) is the follow-up.
+
+**Without the wasm patch (#1317).** The page now takes
+`?skip_pass=Style%20edges`, which leaves out the shared edge pass's
+work. Its readers still get the edge target, empty from the first frame,
+as the "returning at once" stub above left it. It also takes
+`?repeat_pass=<label>:<N>`, which draws a part N times. Both are keyed by
+the GPU rows' labels, so a site copy with a patched shader is needed only
+to cut part of a pass, as the "full path skipped" row did. The book's
+Profiling guide, "Costing a part without timestamps", says how. Checked
+in desktop Chrome 157 (RTX 4070, `tools/web-perf/run.mjs`, the ASCII
+edges fixture, 1920x1080, 2026-11-20) on the branch's Play-site build:
+the page recorded 27 render passes a frame, 26 with the skip (and no
+`Style edges` row), and 30 with `repeat_pass=Style%20edges:4`. The edge
+lines left the picture. The Pixel's figure is still to be taken.
 
 ## Touch (#132)
 
@@ -989,7 +1174,7 @@ release the cursor (`touch_overlay.rs`). On an iPad that release threw
 the game stopped: frozen on its last frame, with the page around it still
 answering. Chrome and Android have the API, so no Pixel or desktop run saw
 it. The wasm clippy check now denies `winit::window::Window::set_cursor_grab`
-(`scripts/wasm-clippy/clippy.toml`). `tools/web-touch/ipad.mjs` replays the
+(`scripts/wasm-clippy/wasm-only.toml`). `tools/web-touch/ipad.mjs` replays the
 iPad in desktop Chrome over CDP: touch emulation, a 1180x820 DPR 2 viewport,
 an iPadOS Chrome user agent, and optionally WebKit's missing APIs deleted
 (`coalesced`, `dpbox`, `lock`). It taps, drags and calls the game FROZEN or
@@ -1030,7 +1215,7 @@ yet: that is #133.
 Firefox 159 on Windows drew Float at p50 83.3 ms, five refreshes, with a
 stall of 1 to 3 s every few seconds and half the audio buffers late.
 There were two causes, one on top of the other, and neither was Firefox's
-presentation: the sky-only shim page held 16.7 ms in the same browser
+presentation: the sky-only shim page (retired by #752) held 16.7 ms in the same browser
 (99% of 5,373 frames).
 
 All of these runs are headed Firefox 159 over WebDriver BiDi, Float's
@@ -1091,6 +1276,14 @@ arrives, and the mesh's buffers are shared through `Arc`.
 because its steps share one uniform buffer (`PostProcessPipeline::run_bloom`);
 it makes 24 of the 36 bind groups left. Firefox no longer shows the cost,
 but it's the next to go. Safari wasn't run.
+
+**Half rate at the start (#962).** Firefox on hardware vsync runs every page
+at 33 to 38 fps for its first 15 to 18 s, then at 60. A page with no Flint
+at all does the same, and wgpu 23, wgpu 30 and main measured alike. That
+was #949's "Sun Prints hitches to 33 ms". `layout.frame_rate=60` removes
+it, so compare builds with `run.mjs --prefs layout.frame_rate=60`; the
+numbers are in `tools/web-perf/README.md`. What remains is a freeze of about
+2 s just after Begin, most often on main (#1349).
 
 ## Full screen (#135)
 
@@ -1488,22 +1681,23 @@ tickets). Counts are for the runtime crates the player links:
   -i <crate>` finds none of them. Only flint-cli and the viewer use them.
   The remaining `std::process::id` calls in player crates are all in tests.
 
-The shim page (`shims.html`, bin `flint-web-shims`) exercises all of these: the day runs on
-`web_time::Instant`, the left stick scrubs it, `pause_day` (Space or the
-pad's South button) holds it through `InputState`, and R followed by a key
-or pad button rebinds `pause_day` and saves the rebind through `user_files`.
-
-Over its sky sits the Begin gate (#101). Float's sea and one of its songs
-are fetched from its GitHub repo and decoded, and the click opens the sound
-(query parameters are listed at the top of `flint_web_shims.rs`: `?music=`,
-`?buffer=`, `?audio=`, `?begin=auto`, `?stall=`). The corner counts late
-buffers, and the console prints a steadiness line every 10 s.
+A shim page (`shims.html`, bin `flint-web-shims`) exercised these before
+the player ran in the browser: a sky clear whose day ran on
+`web_time::Instant`, scrubbed by the left stick, held by `pause_day`
+through `InputState` and rebound with R through `user_files`, under a Begin
+gate that streamed Float's sea and a song from Float's repo on GitHub. The
+real player (`index.html`, #99) does all of it on real scenes, so #752
+deleted the page: the player has one web binary, and no engine source
+fetches from a game's repo. Its late-buffer counter lives on in `?perf=1`'s
+audio line (`AudioEngine::buffer_stats`), and the console's steadiness line
+every 10 s is flint-audio's. Its `?stall=` and `?buffer=` knobs went with it;
+the page is in the history at `5e29be73` for a rerun of the measurements below.
 
 ## Sound
 
 #101. A browser gives no sound before a user gesture: an `AudioContext`
 made earlier is kept suspended, and Chrome warns about it. So on wasm32
-`AudioEngine::new()` stays silent, and the shim page's **Begin** gate opens the
+`AudioEngine::new()` stays silent, and the page's **Begin** gate opens the
 stream from inside the click handler:
 
 - `AudioEngine::silent()` / `start()`. On the desktop `new()` is `silent()`
@@ -1605,8 +1799,8 @@ thread talks to it by `postMessage`:
   with `{}` and needs no wasm-bindgen glue (a worklet has no `TextDecoder`
   for it anyway). It is built with the workspace's `worklet` profile
   (opt-level 3: it runs against the audio thread's deadline), by a trunk
-  `pre_build` hook into `target/worklet`, and `index.html` / `shims.html`
-  copy it next to the page.
+  `pre_build` hook into `target/worklet`, and `index.html` copies it next
+  to the page.
 - `flint_audio::remote` is the engine's side. Each call (`play_non_spatial`,
   `create_spatial_track`, `set_position`, `set_bus_volume`, …) becomes a
   `remote::Command`, encoded into one byte batch; the ids are made on the
@@ -1644,8 +1838,12 @@ thread talks to it by `postMessage`:
   error, no `ready` within 4 s), `AudioEngine::poll` notices, starts the old
   main-thread stream, and `AudioSystem` replays its sources. `?mixer=main`
   asks for the main thread outright, for comparisons. A scene with a
-  `music_session` also stays on the main thread: the suite clocks itself on
-  kira's manager (`manager_mut`), which only exists there.
+  `music_session` mixes in the worklet too since #1216 (ADR 0135): the suite
+  plays on `flint_audio::clocked::ClockedMixer`, whose remote side is the
+  `ClockNew`/`StemBusNew`/`StemPlay`/`..At` commands, and its clock's ticks
+  come back in the worklet's reports. Until #1216 it stayed on the main
+  thread. If the worklet fails, the suite starts again on the main-thread
+  mixer (`AudioEngine::mixer_epoch`).
 - The worklet's `AudioContext` asks for `latencyHint: "balanced"` and runs at
   the device's own rate (48 kHz on most phones), so the browser no longer
   resamples kira's 44.1 kHz output.
@@ -1665,7 +1863,7 @@ command protocol to keep in step with the engine's API; it needs no headers,
 no service worker and no second player build.
 
 **Measured** in headless Chrome 156 on this laptop with the shim page
-(`shims.html`, Float's `ocean_loop.ogg` and `music_day.ogg`, built
+(`shims.html`, since retired (#752), Float's `ocean_loop.ogg` and `music_day.ogg`, built
 `web-release`), 60 s each. `?stall=N` holds the main thread N ms every 2 s;
 `?mixer=main` is the old stream:
 
@@ -1775,6 +1973,37 @@ gzip -9:
 | after #754, without `music`, `rhythm`, `procgen` and `living` | | 11.23 MB | 4.28 MB |
 | after #754, `--no-default-features` | | 10.92 MB | 4.14 MB |
 
+### Packages (#1336)
+
+What leaving the feature packages out saves, measured once by hand on
+2026-11-25 at `8c4501ec` plus #1336's branch (Windows 11, x86_64 MSVC, rustc
+1.99.1, trunk 0.21.14 with its wasm-opt 123 `-Oz`, gzip -9 of the `.wasm`).
+**All** is the default build: every package. **None** leaves out every
+package (living, music, rhythm, procgen, debug-hud) and keeps the devices
+(`audio`, `gamepad`) and `frame-history`. **Standard** keeps the standard
+tier (procgen, debug-hud): what a game listing none of the feature packages
+gets. The desktop builds share one target dir, one after the other; the web
+builds run from `crates/flint-player`, where `index.html` is.
+
+| Build | Command | Size | gzip -9 |
+|---|---|---|---|
+| Release player, all | `cargo build --release -p flint-player --bin flint-player` | 77.04 MB | |
+| Release player, standard | the same `--no-default-features --features audio,gamepad,frame-history,debug-hud,procgen` | 74.26 MB (-3.6%) | |
+| Release player, none | the same `--no-default-features --features audio,gamepad,frame-history` | 70.20 MB (-8.9%) | |
+| Web `.wasm`, all | `trunk build --release --cargo-profile web-release` | 18.25 MB | **6.84 MB** |
+| Web `.wasm`, standard | the same `--no-default-features --features audio,gamepad,frame-history,debug-hud,procgen` | 17.65 MB | 6.60 MB (-3.5%) |
+| Web `.wasm`, none | the same `--no-default-features --features audio,gamepad,frame-history` | 16.62 MB | **6.19 MB** (-9.5%) |
+
+The packages are a tenth of either binary. Leaving them out saves 6.8 MB of
+desktop player and 0.65 MB on the wire. The rest is the kernel, and the
+render features and standard packages that have no switch yet (ADR 0136's
+later phases).
+
+The default web build is now 6.84 MB gzipped, against 4.70 MB at #754 and
+the "4 MB gzip line" above. A second `wasm-opt -Oz` pass over it saves 0.2%,
+so it was optimized. What grew between #754 and now is not measured here
+(#1526).
+
 The **size probe** is a throwaway bin, not committed. It builds a
 `PlayerApp` from a `black_box` world and passes opaque bytes to
 `rhai::Engine::eval`, `image::load_from_memory`, `toml::from_str` and
@@ -1802,7 +2031,7 @@ The showcase film is not part of the wasm or any bundle, so the 4 MB gzip
 line above doesn't count it. It is a click-to-play film on the Flint page,
 loaded on its own (`preload="none"` with its poster), and these are its
 sizes, recorded so the next cut can be held to them. The storyboard
-(`docs/design/showcase-film.md`, "The 16:9 cut") has the whole table.
+(`flint-examples/film/storyboard.md`, "The 16:9 cut") has the whole table.
 
 | File | Size | |
 |---|---|---|

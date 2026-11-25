@@ -30,14 +30,11 @@ pub struct SchemaArgs {
     pub list: bool,
 
     /// text; json (the schemas as data: every field, type, default and
-    /// range); or json-schema (a JSON Schema for a .scene.toml, for taplo
-    /// and Even Better TOML; with a component's name, for its table alone)
+    /// range; the global --json is the same); or json-schema (a JSON Schema
+    /// for a .scene.toml, for taplo and Even Better TOML; with a component's
+    /// name, for its table alone)
     #[arg(long, default_value = "text")]
     pub format: String,
-
-    /// The same as --format json
-    #[arg(long)]
-    pub json: bool,
 
     /// Write to this file (UTF-8, no byte-order mark) instead of stdout
     #[arg(long, short)]
@@ -58,11 +55,11 @@ enum Format {
 }
 
 pub fn run(args: SchemaArgs) -> Result<()> {
-    let format = match (args.format.as_str(), args.json) {
+    // A JSON Schema is a JSON document too, so --json keeps it
+    let format = match (args.format.as_str(), crate::output::json()) {
         ("text", true) | ("json", _) => Format::Json,
         ("text", false) => Format::Text,
-        ("json-schema", false) => Format::JsonSchema,
-        ("json-schema", true) => bail!("--json and --format json-schema are two formats: pass one"),
+        ("json-schema", _) => Format::JsonSchema,
         (other, _) => bail!("unknown format '{other}': text, json or json-schema"),
     };
 
@@ -113,9 +110,14 @@ pub fn run(args: SchemaArgs) -> Result<()> {
             registry.get_component(name),
             registry.get_table(name),
         ) {
-            (Some(component), _) => schema_export::component_json(component),
-            (None, Some(table)) => schema_export::table_json(table),
-            (None, None) => schema_export::archetype_json(registry.get_archetype(name).unwrap()),
+            (Some(component), _) => {
+                schema_export::component_json(component, registry.component_origin(name))
+            }
+            (None, Some(table)) => schema_export::table_json(table, registry.table_origin(name)),
+            (None, None) => schema_export::archetype_json(
+                registry.get_archetype(name).unwrap(),
+                registry.archetype_origin(name),
+            ),
         }),
         (Format::JsonSchema, None) if args.list => {
             bail!("--list has no JSON Schema: `flint schema --format json-schema` is the scene's")
@@ -139,8 +141,10 @@ pub fn run(args: SchemaArgs) -> Result<()> {
         Some(path) => {
             std::fs::write(path, &out).with_context(|| format!("Failed to write {path}"))?;
             eprintln!("Wrote {path}");
+            crate::output::when_json(|| serde_json::json!({ "written": [path] }));
         }
-        None => print!("{out}"),
+        None if format == Format::Text => print!("{out}"),
+        None => crate::output::document_text(&out),
     }
     Ok(())
 }
@@ -237,10 +241,20 @@ fn one_text(name: &str, registry: &SchemaRegistry) -> String {
     let mut out = String::new();
     // Try component first, then scene table, then archetype
     let fielded = [
-        ("Component", "component", registry.get_component(name)),
-        ("Scene table", "table", registry.get_table(name)),
+        (
+            "Component",
+            "component",
+            registry.get_component(name),
+            registry.component_origin(name),
+        ),
+        (
+            "Scene table",
+            "table",
+            registry.get_table(name),
+            registry.table_origin(name),
+        ),
     ];
-    for (heading, noun, schema) in fielded {
+    for (heading, noun, schema, origin) in fielded {
         let Some(component) = schema else {
             continue;
         };
@@ -251,13 +265,27 @@ fn one_text(name: &str, registry: &SchemaRegistry) -> String {
         if let Some(desc) = &component.description {
             out.push_str(&format!("Description: {desc}\n"));
         }
+        // Each field's layer (#794): one file says it for every field; with
+        // an extension, the files are numbered and each field gives its number
+        let mut layers = None;
+        if let Some(origin) = origin {
+            if let Some(files) =
+                layers_header(origin.declared_in.as_deref(), &origin.extended_by, &mut out)
+            {
+                layers = Some(Layers { origin, files });
+            }
+        }
+        if let Some(panel) = &component.panel {
+            out.push_str(&panel_text(panel));
+            out.push('\n');
+        }
         out.push_str("\nFields:\n");
         if component.is_open() {
             out.push_str(&format!(
                 "  (none declared: the {noun} is open, and nothing in it is checked)\n"
             ));
         }
-        fields_text(&component.fields, 1, &mut out);
+        fields_text(&component.fields, layers.as_ref(), 1, &mut out);
     }
     if !out.is_empty() {
         return out;
@@ -270,6 +298,18 @@ fn one_text(name: &str, registry: &SchemaRegistry) -> String {
     if let Some(desc) = &archetype.description {
         out.push_str(&format!("Description: {desc}\n"));
     }
+    // Each component's and default's layer (#1054), as a component's fields
+    let origin = registry.archetype_origin(name);
+    let files = origin.and_then(|origin| {
+        layers_header(origin.declared_in.as_deref(), &origin.extended_by, &mut out)
+    });
+    let tag = |file: Option<&std::path::Path>| -> String {
+        let at = files
+            .as_ref()
+            .zip(file)
+            .and_then(|(files, file)| files.iter().position(|f| *f == file));
+        at.map(|at| format!("   [{}]", at + 1)).unwrap_or_default()
+    };
     out.push_str("\nComponents:\n");
     for comp_name in &archetype.components {
         let exists = if registry.get_component(comp_name).is_some() {
@@ -277,7 +317,8 @@ fn one_text(name: &str, registry: &SchemaRegistry) -> String {
         } else {
             " (not found)"
         };
-        out.push_str(&format!("  - {comp_name}{exists}\n"));
+        let layer = tag(origin.and_then(|o| o.component_file(comp_name)));
+        out.push_str(&format!("  - {comp_name}{exists}{layer}\n"));
     }
 
     if !archetype.defaults.is_empty() {
@@ -288,21 +329,115 @@ fn one_text(name: &str, registry: &SchemaRegistry) -> String {
             out.push_str(&format!("  [{comp_name}]\n"));
             if let Some(table) = defaults.as_table() {
                 for (k, v) in table {
-                    out.push_str(&format!("    {} = {}\n", k, format_toml_value(v)));
+                    let layer = tag(origin.and_then(|o| o.default_file(comp_name, k)));
+                    out.push_str(&format!("    {} = {}{layer}\n", k, format_toml_value(v)));
                 }
             } else {
                 out.push_str(&format!("    {}\n", format_toml_value(defaults)));
             }
         }
     }
+    // The box its `bounds` draws as with nothing else to draw (#751)
+    if let Some(visual) = &archetype.visual {
+        let [r, g, b, a] = visual.color;
+        out.push_str(&format!(
+            "\nPlaceholder: color = [{r}, {g}, {b}, {a}]{}\n",
+            if visual.wireframe { ", wireframe" } else { "" }
+        ));
+    }
     out
+}
+
+/// A component's F3 panel on one line (#1020): its title, then each role's
+/// fields in the panel's order, a label beside a field when the panel calls
+/// it something other than its name, and a trigger's buttons when it has
+/// several (formats, ranges and the rest are in `--format json`'s `panel`):
+/// `Panel "Dead calm": status phase, calm, next_in_s · trigger trigger_calm "Calm now"`.
+fn panel_text(panel: &flint_schema::PanelSpec) -> String {
+    use flint_schema::PanelRole;
+    let groups: Vec<String> = PanelRole::ALL
+        .iter()
+        .filter_map(|(name, role)| {
+            let rows: Vec<String> = panel
+                .rows_with(*role)
+                .map(|row| {
+                    let mut text = row.field.clone();
+                    if *role == PanelRole::Trigger && !row.labels.is_empty() {
+                        let buttons: Vec<&str> = row
+                            .labels
+                            .iter()
+                            .map(String::as_str)
+                            .filter(|l| !l.is_empty())
+                            .collect();
+                        text.push_str(&format!(" [{}]", buttons.join(", ")));
+                    } else if row.label != flint_schema::panel::words_of(&row.field) {
+                        text.push_str(&format!(" \"{}\"", row.label));
+                    }
+                    text
+                })
+                .collect();
+            (!rows.is_empty()).then(|| format!("{name} {}", rows.join(", ")))
+        })
+        .collect();
+    format!("Panel \"{}\": {}", panel.title, groups.join(" · "))
+}
+
+/// `Declared in:` and each `Extended by:` line of a schema read from files
+/// (#794, #1054). With an extension the files are numbered, and returned in
+/// that order so each line below can end with its number.
+fn layers_header<'a>(
+    declared_in: Option<&'a std::path::Path>,
+    extended_by: &'a [std::path::PathBuf],
+    out: &mut String,
+) -> Option<Vec<&'a std::path::Path>> {
+    let extended = !extended_by.is_empty();
+    let files: Vec<&std::path::Path> = declared_in
+        .into_iter()
+        .chain(extended_by.iter().map(|file| file.as_path()))
+        .collect();
+    for (at, file) in files.iter().enumerate() {
+        let what = if at == 0 && declared_in.is_some() {
+            "Declared in:"
+        } else {
+            "Extended by:"
+        };
+        let number = if extended {
+            format!("[{}] ", at + 1)
+        } else {
+            String::new()
+        };
+        out.push_str(&format!(
+            "{what} {number}{}\n",
+            schema_export::shown_file(file)
+        ));
+    }
+    extended.then_some(files)
+}
+
+/// The numbered files of a component another layer extended (#794), as
+/// its header lists them.
+struct Layers<'a> {
+    origin: &'a flint_schema::SchemaOrigin,
+    files: Vec<&'a std::path::Path>,
+}
+
+impl Layers<'_> {
+    /// `[2]`: the number of the file `field` was declared in.
+    fn tag(&self, field: &str) -> Option<String> {
+        let file = self.origin.field_file(field)?;
+        let at = self.files.iter().position(|f| *f == file)?;
+        Some(format!("[{}]", at + 1))
+    }
 }
 
 /// `fields` by name, each with its description and range below it. A table
 /// that declares its own fields (and an array of such tables: a
-/// `[[wooze.zone]]`) has them listed under it, a level in.
+/// `[[wooze.zone]]`) has them listed under it, a level in. With `layers`
+/// (a component another layer extended, #794), each top-level field's line
+/// ends with the number of the file that declared it.
 fn fields_text(
     fields: &std::collections::HashMap<String, flint_schema::FieldSchema>,
+    layers: Option<&Layers>,
     depth: usize,
     out: &mut String,
 ) {
@@ -325,6 +460,9 @@ fn fields_text(
         ));
         if let Some(default) = &field_schema.default {
             out.push_str(&format!(" = {}", format_toml_value(default)));
+        }
+        if let Some(tag) = layers.and_then(|layers| layers.tag(field_name)) {
+            out.push_str(&format!("   {tag}"));
         }
         out.push('\n');
 
@@ -352,7 +490,7 @@ fn fields_text(
             if nested.values().any(|f| {
                 f.description.is_some() || f.required || f.min.is_some() || f.max.is_some()
             }) {
-                fields_text(nested, depth + 2, out);
+                fields_text(nested, None, depth + 2, out);
             }
         }
     }

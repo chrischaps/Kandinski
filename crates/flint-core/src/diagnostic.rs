@@ -81,9 +81,15 @@ pub mod codes {
     /// `collider` with no `rigidbody`. Found by the system that reads it,
     /// while the game runs (#685).
     pub const NEEDS_COMPONENT: &str = "needs-component";
+    /// A `character_controller` on a second entity: one is the player, the
+    /// first by name, and the others' are never read (#1212).
+    pub const SECOND_PLAYER: &str = "second-player";
     /// An `entity` field (or an entity's `parent`) that names no entity of
     /// the scene. An empty string is "not set" and passes.
     pub const UNKNOWN_ENTITY: &str = "unknown-entity";
+    /// Entities whose `parent`s close into a loop: one parented to itself,
+    /// or `a` to `b` to `a` (#680). The scene does not load.
+    pub const PARENT_CYCLE: &str = "parent-cycle";
     /// An `asset` field (or, in `flint check`, an asset of a known kind) that
     /// names no file the project's asset search finds; the hint, or `tried`,
     /// lists the paths.
@@ -98,12 +104,32 @@ pub mod codes {
     /// `[component.x]` instead of `[component.x.fields]`, or a misspelled
     /// key of a field.
     pub const IGNORED_SCHEMA_KEY: &str = "ignored-schema-key";
+    /// A component schema's fields say something about its F3 panel the
+    /// loader can't use (#744): a role that is none, a key a field's panel
+    /// doesn't hold, a `format` with no placeholder. That row is left off.
+    pub const BAD_PANEL: &str = "bad-panel";
     /// A top-level table of a scene that no loaded schema directory declares
     /// as a `[table.<name>]` (#686): a misspelled `[enviroment]`, or a
     /// game's own table before its schema says so. A warning (nothing reads
     /// it, so the scene plays as if it were not there); `--strict` makes it
     /// an error.
     pub const UNKNOWN_TABLE: &str = "unknown-table";
+    /// A `[post_process]` value outside what its built-in effect is tuned
+    /// for (#741), as a style value past its range warns (#355): it still
+    /// draws, maybe badly.
+    pub const POST_RANGE: &str = "post-range";
+    /// A light past the number of its type the shader takes (#682): the
+    /// strongest directional lights and the point and spot lights nearest
+    /// the camera are drawn, and this one is off while it isn't among them.
+    pub const LIGHT_CAP: &str = "light-cap";
+    /// A value written in two forms of which one is read (#682: a spot's
+    /// `inner_angle` and `inner_angle_deg`): the other does nothing.
+    pub const TWO_FORMS: &str = "two-forms";
+    /// A light's `cast_shadows` the renderer can't honour (#504): a second
+    /// spot asking (one spot casts, the first by name), a point light asking
+    /// (none casts yet), or the strongest directional light refusing. The
+    /// light still lights.
+    pub const SHADOW_CAP: &str = "shadow-cap";
 
     // What `flint check` adds (#687): the project around the scene.
 
@@ -117,6 +143,15 @@ pub mod codes {
     pub const SCENE_LOAD: &str = "scene-load";
     /// `flint.toml` does not read.
     pub const BAD_MANIFEST: &str = "bad-manifest";
+    /// A package's `package.toml` does not read, or claims what another
+    /// package's does (ADR 0136 decision 8, #1331).
+    pub const BAD_PACKAGE: &str = "bad-package";
+    /// A component, scene table or script function of a package the
+    /// project's `[packages]` leaves out (ADR 0136 decision 9, #1334).
+    pub const UNLISTED_PACKAGE: &str = "unlisted-package";
+    /// A package the project's `[packages]` lists that the running binary
+    /// was built without (#1335): `flint build` builds one with it.
+    pub const UNBUILT_PACKAGE: &str = "unbuilt-package";
     /// A schema directory is missing, or a schema file does not read.
     pub const BAD_SCHEMAS: &str = "bad-schemas";
     /// A constraint file does not read, or a constraint's query does not
@@ -135,10 +170,42 @@ pub mod codes {
     /// A `[living.species.<spec>]` table is wrong, or no living prop grows
     /// from that spec.
     pub const BAD_SPECIES: &str = "bad-species";
+    /// A field the scene declares (`[field.<name>]`, #1014) has a key or
+    /// zone that is wrong, named by the field and the key or zone.
+    pub const BAD_FIELD: &str = "bad-field";
     /// An input config a scene or the manifest names does not parse.
     pub const BAD_INPUT_CONFIG: &str = "bad-input-config";
     /// A procgen spec a scene's model or texture is made from does not parse.
     pub const BAD_SPEC: &str = "bad-spec";
+    /// A UI document (`.ui.toml`) or the style file it names has a mistake
+    /// (#731): an unknown type, anchor, key, parent, class or style
+    /// property, or a value of the wrong shape, named with its element or
+    /// class. `load_ui` refuses the same document as a script error.
+    pub const BAD_UI: &str = "bad-ui";
+    /// A procgen spec a scene names has a parameter its generator ignores
+    /// (a warning) or a value it can't use (an error): a wrong type, out of
+    /// range, not one of the choices, a required key missing (#718;
+    /// `flint_procgen::validate_params`, keyed by the parameter's path).
+    pub const SPEC_PARAM: &str = "spec-param";
+    /// A `.spline.toml` a scene names does not parse, or a `spline_mesh`
+    /// profile is no polygon (#750). Placed by line and column.
+    pub const BAD_SPLINE: &str = "bad-spline";
+    /// An inline `particle_emitter` the engine can't play as written (#690):
+    /// a key it doesn't read, or a value that doesn't parse or resolve. At
+    /// run time the emitter keeps its last good settings (or makes none).
+    pub const BAD_EMITTER: &str = "bad-emitter";
+
+    /// A game's Cargo workspace lacks a `[patch.crates-io]` line the engine
+    /// it builds by path has (#982): cargo applies `[patch]` only from the
+    /// workspace root. A warning (a native build compiles without the web's
+    /// egui-winit, and cargo itself stops on a missing static DXC).
+    pub const MISSING_CARGO_PATCH: &str = "missing-cargo-patch";
+
+    /// A game's `Cargo.lock`, moved forward from an older engine, gives
+    /// gpu-allocator a different `windows` crate from wgpu-hal's (#995), so
+    /// wgpu-hal's dx12 backend doesn't compile on Windows. A warning (every
+    /// other platform builds); the hint is the `cargo update` that mends it.
+    pub const STALE_CARGO_LOCK: &str = "stale-cargo-lock";
 
     // What `flint script check` adds (#694): the scripts, at a line and
     // column.
@@ -164,6 +231,9 @@ pub mod codes {
     /// literals, which takes Rhai's slow signature search (ADR 0116
     /// decision 5).
     pub const MIXED_NUMBERS: &str = "mixed-numbers";
+    /// A `global::NAME` read in a script with no top-level `const NAME`,
+    /// which fails every call that reaches it (#1007).
+    pub const UNKNOWN_GLOBAL: &str = "unknown-global";
 
     /// Every code, the severity it is raised with, and what it means.
     pub const ALL: &[(&str, Severity, &str)] = &[
@@ -228,9 +298,19 @@ pub mod codes {
             "a component that does nothing without another the entity lacks",
         ),
         (
+            SECOND_PLAYER,
+            Severity::Warning,
+            "a character_controller on an entity that is not the player",
+        ),
+        (
             UNKNOWN_ENTITY,
             Severity::Error,
             "an entity reference that names no entity in the scene",
+        ),
+        (
+            PARENT_CYCLE,
+            Severity::Error,
+            "entities whose parents close into a loop, so the scene does not load",
         ),
         (
             MISSING_ASSET,
@@ -253,6 +333,11 @@ pub mod codes {
             "a schema file holds a key the loader ignores",
         ),
         (
+            BAD_PANEL,
+            Severity::Warning,
+            "a component schema's F3 panel says something the loader can't use; that row is left off",
+        ),
+        (
             MISSING_FILE,
             Severity::Error,
             "a file named by path that is in none of the asset folders",
@@ -268,6 +353,21 @@ pub mod codes {
             "the scene parses and its load still fails",
         ),
         (BAD_MANIFEST, Severity::Error, "flint.toml does not read"),
+        (
+            BAD_PACKAGE,
+            Severity::Error,
+            "a package.toml does not read, or provides what another package does",
+        ),
+        (
+            UNLISTED_PACKAGE,
+            Severity::Error,
+            "a scene or script uses a package flint.toml's [packages] leaves out",
+        ),
+        (
+            UNBUILT_PACKAGE,
+            Severity::Error,
+            "flint.toml's [packages] lists a package this binary was built without",
+        ),
         (
             BAD_SCHEMAS,
             Severity::Error,
@@ -309,6 +409,11 @@ pub mod codes {
             "a [living.species] table is wrong, or names a spec no living prop grows from",
         ),
         (
+            BAD_FIELD,
+            Severity::Error,
+            "a [field.<name>] table the scene declares has a key or zone that is wrong",
+        ),
+        (
             BAD_INPUT_CONFIG,
             Severity::Error,
             "an input config the scene or the manifest names does not parse",
@@ -317,6 +422,36 @@ pub mod codes {
             BAD_SPEC,
             Severity::Error,
             "a procgen spec a scene's model or texture is made from does not parse",
+        ),
+        (
+            BAD_UI,
+            Severity::Error,
+            "a UI document (.ui.toml) or its style file has an unknown type, anchor, key, parent, class or property, or a value of the wrong shape",
+        ),
+        (
+            SPEC_PARAM,
+            Severity::Error,
+            "a procgen spec a scene names has a value its generator can't use (an error) or a key it ignores (a warning)",
+        ),
+        (
+            BAD_SPLINE,
+            Severity::Error,
+            "a spline file a scene names does not parse, or a spline_mesh profile is no polygon",
+        ),
+        (
+            BAD_EMITTER,
+            Severity::Error,
+            "an inline particle_emitter has a key it does not read or a value it cannot use",
+        ),
+        (
+            MISSING_CARGO_PATCH,
+            Severity::Warning,
+            "a game's Cargo workspace lacks a [patch.crates-io] line of the engine it builds",
+        ),
+        (
+            STALE_CARGO_LOCK,
+            Severity::Warning,
+            "a game's Cargo.lock gives gpu-allocator a different windows crate from wgpu-hal's",
         ),
         (SCRIPT_SYNTAX, Severity::Error, "a script does not compile"),
         (
@@ -360,9 +495,34 @@ pub mod codes {
             "a per-frame call mixes int and float literals where numbers go, the slow lookup",
         ),
         (
+            UNKNOWN_GLOBAL,
+            Severity::Error,
+            "a script reads global::NAME and has no top-level const NAME",
+        ),
+        (
             UNKNOWN_TABLE,
             Severity::Warning,
             "a top-level scene table no loaded schema directory declares",
+        ),
+        (
+            POST_RANGE,
+            Severity::Warning,
+            "a [post_process] value outside what its effect is tuned for",
+        ),
+        (
+            LIGHT_CAP,
+            Severity::Warning,
+            "a light past the number of its type the shader takes, off while it is",
+        ),
+        (
+            TWO_FORMS,
+            Severity::Warning,
+            "a value written in two forms, of which one is read",
+        ),
+        (
+            SHADOW_CAP,
+            Severity::Warning,
+            "a light's cast_shadows the renderer can't honour; it lights without",
         ),
     ];
 }
@@ -480,21 +640,23 @@ impl Diagnostic {
     }
 
     /// Where it is, without the file: `entity 'crate' collider.friction`,
-    /// or `[post_process] bloom_intensity` for a scene-level table. Empty
-    /// when the diagnostic is about the file as a whole.
+    /// or `[post_process] bloom_intensity` for a scene-level table, each
+    /// after its `line:column` when it has one (`5:1 [living] shadowz`,
+    /// #1061). Empty when the diagnostic is about the file as a whole.
     pub fn location(&self) -> String {
-        if let Some(table) = &self.table {
-            return match &self.field {
-                Some(field) => format!("[{table}] {field}"),
-                None => format!("[{table}]"),
-            };
-        }
         let mut parts = Vec::new();
         if let Some(line) = self.line {
             parts.push(match self.column {
                 Some(column) => format!("{line}:{column}"),
                 None => format!("line {line}"),
             });
+        }
+        if let Some(table) = &self.table {
+            parts.push(match &self.field {
+                Some(field) => format!("[{table}] {field}"),
+                None => format!("[{table}]"),
+            });
+            return parts.join(" ");
         }
         if let Some(entity) = &self.entity {
             parts.push(format!("entity '{entity}'"));
@@ -588,13 +750,30 @@ pub fn counts_line(diagnostics: &[Diagnostic]) -> String {
 /// left out. Empty when there is nothing to say. `scene` names what was
 /// loaded.
 pub fn summary_lines(scene: &str, diagnostics: &[Diagnostic], limit: usize) -> Vec<String> {
+    summary_lines_of(
+        scene,
+        &format!("flint validate {scene}"),
+        diagnostics,
+        limit,
+    )
+}
+
+/// [`summary_lines`] about something other than a scene (a schema file the
+/// player read, #1064): `subject` names it, and `full_list` is the command
+/// that prints every diagnostic of it.
+pub fn summary_lines_of(
+    subject: &str,
+    full_list: &str,
+    diagnostics: &[Diagnostic],
+    limit: usize,
+) -> Vec<String> {
     if diagnostics.is_empty() {
         return Vec::new();
     }
     let mut ordered = diagnostics.to_vec();
     sort_errors_first(&mut ordered);
     let mut lines = vec![format!(
-        "{scene}: {} (the full list: flint validate {scene})",
+        "{subject}: {} (the full list: {full_list})",
         counts_line(diagnostics)
     )];
     for d in ordered.iter().take(limit) {
@@ -618,6 +797,136 @@ pub const SUMMARY_LIMIT: usize = 5;
 pub fn log_summary(scene: &str, diagnostics: &[Diagnostic]) {
     for line in summary_lines(scene, diagnostics, SUMMARY_LIMIT) {
         tracing::warn!("{line}");
+    }
+}
+
+/// [`summary_lines_of`] through `tracing::warn!`, as [`log_summary`].
+pub fn log_summary_of(subject: &str, full_list: &str, diagnostics: &[Diagnostic]) {
+    for line in summary_lines_of(subject, full_list, diagnostics, SUMMARY_LIMIT) {
+        tracing::warn!("{line}");
+    }
+}
+
+/// Codes a project may not allow: each says the file did not load, so
+/// there is nothing behind it to check, and allowing it would pass a scene
+/// that does not play.
+pub const NOT_ALLOWABLE: &[&str] = &[
+    codes::TOML_PARSE,
+    codes::FILE_UNREADABLE,
+    codes::SCENE_LOAD,
+    codes::BAD_MANIFEST,
+    codes::BAD_PACKAGE,
+    codes::BAD_PREFAB,
+];
+
+/// One entry of a project's `[project.diagnostics] allow` (#795): a code,
+/// and optionally the place it is allowed at.
+///
+/// `"unknown-field"` allows every unknown field. `"unknown-field:material"`
+/// allows those of `material` (a component, or a scene table of that name),
+/// and `"unknown-field:material.wetness"` that one field, with whatever is
+/// nested under it (`environment.fog` covers `environment.fog.colour`). An
+/// allowed diagnostic is left out of the list; the hosts that report a list
+/// say how many were.
+///
+/// ```
+/// use flint_core::diagnostic::{codes, Allow, Diagnostic};
+///
+/// let allow = Allow::parse("unknown-field:material.wetness").unwrap();
+/// let wet = Diagnostic::warning(codes::UNKNOWN_FIELD, "no field `wetness`")
+///     .entity("road")
+///     .component("material")
+///     .field("wetness");
+/// let dry = wet.clone().field("dryness");
+/// assert!(allow.matches(&wet));
+/// assert!(!allow.matches(&dry));
+/// assert!(Allow::parse("unknown-feild").unwrap_err().contains("did you mean `unknown-field`?"));
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Allow {
+    /// One of [`codes`].
+    pub code: &'static str,
+    /// `component`, `component.field`, `table` or `table.field`; `None` is
+    /// everywhere.
+    pub place: Option<String>,
+}
+
+impl Allow {
+    /// `code` or `code:place`. A code that is none of [`codes::ALL`], or one
+    /// of [`NOT_ALLOWABLE`], is refused with what to write instead.
+    pub fn parse(entry: &str) -> Result<Self, String> {
+        let (code, place) = match entry.split_once(':') {
+            Some((code, place)) => (code.trim(), Some(place.trim())),
+            None => (entry.trim(), None),
+        };
+        let Some(&(known, _, _)) = codes::ALL.iter().find(|(c, _, _)| *c == code) else {
+            let hint =
+                did_you_mean(code, codes::ALL.iter().map(|(c, _, _)| *c)).unwrap_or_else(|| {
+                    "the codes are listed in the book, concepts/schemas.md".to_string()
+                });
+            return Err(format!("`{code}` is no diagnostic code ({hint})"));
+        };
+        if NOT_ALLOWABLE.contains(&known) {
+            return Err(format!(
+                "`{known}` means the file did not load, so it can't be allowed"
+            ));
+        }
+        let place = match place {
+            Some("") => {
+                return Err(format!(
+                    "nothing after `{known}:`; write `{known}` alone to allow it everywhere"
+                ))
+            }
+            Some(place) => Some(place.to_string()),
+            None => None,
+        };
+        Ok(Self { code: known, place })
+    }
+
+    /// Whether `d` is the code, at the place if one is given.
+    pub fn matches(&self, d: &Diagnostic) -> bool {
+        if d.code != self.code {
+            return false;
+        }
+        let Some(place) = &self.place else {
+            return true;
+        };
+        let at = match (d.component.as_ref().or(d.table.as_ref()), &d.field) {
+            (Some(owner), Some(field)) => format!("{owner}.{field}"),
+            (Some(owner), None) => owner.clone(),
+            (None, Some(field)) => field.clone(),
+            (None, None) => return false,
+        };
+        at.strip_prefix(place.as_str())
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with(['.', '[']))
+    }
+}
+
+impl fmt::Display for Allow {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match &self.place {
+            Some(place) => write!(f, "{}:{place}", self.code),
+            None => f.write_str(self.code),
+        }
+    }
+}
+
+/// Take out of `diagnostics` every one an entry of `allow` matches, and say
+/// how many that was.
+pub fn drop_allowed(diagnostics: &mut Vec<Diagnostic>, allow: &[Allow]) -> usize {
+    if allow.is_empty() {
+        return 0;
+    }
+    let before = diagnostics.len();
+    diagnostics.retain(|d| !allow.iter().any(|a| a.matches(d)));
+    before - diagnostics.len()
+}
+
+/// ` (2 allowed by flint.toml)` after a count line, or nothing for none.
+pub fn allowed_note(allowed: usize) -> String {
+    match allowed {
+        0 => String::new(),
+        n => format!(" ({n} allowed by flint.toml)"),
     }
 }
 
@@ -748,7 +1057,7 @@ mod tests {
                 "{code} is not kebab-case"
             );
         }
-        assert_eq!(seen.len(), 41);
+        assert_eq!(seen.len(), 59);
     }
 
     /// A problem in a scene-level table names the table as its header is
@@ -805,6 +1114,13 @@ mod tests {
         assert_eq!(lines[2], "  warning[unknown-field]: w0");
         assert_eq!(lines[4], "  ... and 5 more");
         assert!(summary_lines("a", &[], 3).is_empty());
+        // Of a schema file (#1064): the same lines, another pointer
+        let of = summary_lines_of("schemas/components/a.toml", "flint check", &list, 3);
+        assert_eq!(
+            of[0],
+            "schemas/components/a.toml: 1 error, 7 warnings (the full list: flint check)"
+        );
+        assert_eq!(of[1..], lines[1..]);
     }
 
     #[test]
@@ -832,5 +1148,104 @@ mod tests {
         assert_eq!(edit_distance("lihgt", "light"), 1);
         assert_eq!(edit_distance("", "abc"), 3);
         assert_eq!(edit_distance("kitten", "sitting"), 3);
+    }
+
+    /// `[project.diagnostics] allow` (#795): a code everywhere, a code at a
+    /// component or table, at one field and what is nested under it, and
+    /// never a field whose name only starts the same.
+    #[test]
+    fn an_allow_entry_matches_its_code_and_place() {
+        let field = |component: &str, field: &str| {
+            Diagnostic::warning(codes::UNKNOWN_FIELD, "m")
+                .entity("e")
+                .component(component)
+                .field(field)
+        };
+        let table = |table: &str, field: &str| {
+            Diagnostic::warning(codes::UNKNOWN_FIELD, "m")
+                .table(table)
+                .field(field)
+        };
+        let allows = |entry: &str, d: &Diagnostic| Allow::parse(entry).unwrap().matches(d);
+
+        assert!(allows("unknown-field", &field("material", "wetness")));
+        assert!(allows(
+            "unknown-field:material",
+            &field("material", "wetness")
+        ));
+        assert!(allows(
+            "unknown-field:material.wetness",
+            &field("material", "wetness")
+        ));
+        assert!(!allows(
+            "unknown-field:material.wetness",
+            &field("material", "wet")
+        ));
+        assert!(!allows(
+            "unknown-field:material.wet",
+            &field("material", "wetness")
+        ));
+        assert!(!allows(
+            "unknown-field:light",
+            &field("material", "wetness")
+        ));
+        assert!(allows(
+            "unknown-field:environment.fog",
+            &table("environment", "fog.colour")
+        ));
+        // A place starts at the component: a field name alone is no place
+        assert!(!allows("unknown-field:layers", &field("terrain", "layers")));
+        assert!(allows(
+            "unknown-field:terrain.layers",
+            &field("terrain", "layers[1].clip")
+        ));
+        assert!(allows(
+            "unknown-field:weather.rian",
+            &table("weather", "rian")
+        ));
+        assert!(allows(
+            " unknown-table : weather ",
+            &Diagnostic::warning(codes::UNKNOWN_TABLE, "m").table("weather")
+        ));
+        // Another code at the same place is not allowed
+        let bad_type = Diagnostic::error(codes::BAD_TYPE, "m")
+            .component("material")
+            .field("wetness");
+        assert!(!allows("unknown-field:material.wetness", &bad_type));
+        // A place given, and nothing to place the diagnostic by
+        assert!(!allows(
+            "no-schemas:x",
+            &Diagnostic::warning(codes::NO_SCHEMAS, "m")
+        ));
+
+        let mut list = vec![
+            field("material", "wetness"),
+            field("material", "dryness"),
+            bad_type,
+        ];
+        let rules = [Allow::parse("unknown-field:material.wetness").unwrap()];
+        assert_eq!(drop_allowed(&mut list, &rules), 1);
+        assert_eq!(list.len(), 2);
+        assert_eq!(drop_allowed(&mut list, &[]), 0);
+        assert_eq!(allowed_note(0), "");
+        assert_eq!(allowed_note(2), " (2 allowed by flint.toml)");
+        assert_eq!(rules[0].to_string(), "unknown-field:material.wetness");
+    }
+
+    #[test]
+    fn an_allow_entry_that_names_no_code_says_so() {
+        let refused = |entry: &str| Allow::parse(entry).unwrap_err();
+        assert!(
+            refused("unknown-feild").contains("did you mean `unknown-field`?"),
+            "{}",
+            refused("unknown-feild")
+        );
+        assert!(refused("wibble").contains("concepts/schemas.md"));
+        assert!(refused("toml-parse").contains("did not load"));
+        assert!(refused("unknown-field:").contains("alone"));
+        for code in NOT_ALLOWABLE {
+            assert!(codes::ALL.iter().any(|(c, _, _)| c == code), "{code}");
+            assert!(refused(code).contains("did not load"), "{code}");
+        }
     }
 }

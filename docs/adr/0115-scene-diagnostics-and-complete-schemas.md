@@ -127,6 +127,14 @@ the tickets' blocked-by links. The steps get no sub-issues.
   used to return early.
 - A game can still add fields to an engine component; it gets a warning it
   can silence by declaring the field in its own schema layer.
+- Since then (#794): declaring one field no longer means copying the
+  engine's whole file. A layer's `[component.x]` (or `[table.x]`) with
+  `extend = true` adds its fields to the earlier layer's definition; without
+  it a later layer still replaces the component whole, so no layer written
+  before changed meaning. Chosen over implicit merging for that reason.
+  Archetypes followed (#1054): `[archetype.x]` with `extend = true` appends
+  its components and merges its defaults key by key into the earlier
+  layer's.
 
 ## Decisions
 
@@ -157,6 +165,11 @@ Chris accepted the recommendations on 2026-11-10:
   not see tests, the CLI, the viewer, or code compiled only off wasm; the
   native clippy job does not carry the rule, because it prints warnings
   without failing and would flag every test's assertion on a `toml::Value`.
+  Since then (#761): the rule is in the root `clippy.toml`, which native
+  `cargo clippy` reads too, warning in every runtime crate (native-only code
+  included) and denying in the five that draw; tests assert with `as_float`
+  under an allow (a crate's unit tests through one `cfg_attr(test, allow)` in
+  its lib.rs), and the wasm check still fails a PR.
 - Ported: physics, audio, and the renderer's material tint. The readers in
   the other runtime crates are not on the view yet. They coerce integers
   through `toml_util` and stay silent about a wrong type.
@@ -188,21 +201,25 @@ Chris accepted the recommendations on 2026-11-10:
   `prefabs`, `entities` and `tables`) would have moved three structs that
   every renderer host reads, for no check gained. Their raw text is kept
   beside them (`written`) so a key serde dropped is still diagnosed. A wrong
-  TOML type in a typed table remains a `toml-parse` error with its line.
+  TOML type in a typed table was a `toml-parse` error with its line until
+  #1061 (below).
 - **No `SceneTable { name, schema, parse }` registry in code.** The schema
   is the registration: a game declares `[table.weather]` and reads the raw
   table through `ExtensionCtx::scene_table` (or `scene_table_as::<T>`). A
   parse hook would be a second place to declare the same table.
 - **`scene.version` and a migrations list are not done.** There is one
   migration (`fold_legacy_style_keys`) and no second to shape a list around;
-  the version is still parsed and only printed.
-- **Found on the first run over `examples/`** (warnings, pinned in
+  the version is still parsed and only printed. #1061 settled it: the
+  version stays informational (below).
+- **Found on the first run over the examples** (warnings, pinned in
   `crates/flint-schema/tests/scene_tables.rs`): four 2D examples write
   `[camera] orthographic = true`, which nothing reads (the key is
   `projection = "orthographic"`), so they have been drawn in perspective;
   `rolling_meadow` writes `flint render`'s `distance`/`pitch`/`yaw` as
   camera keys; `campfire` has `[lights.*]` tables. No frozen fixture is
-  flagged.
+  flagged. #807 repaired all six (the 2D four now draw orthographic,
+  rolling_meadow has the `position` those flags made, campfire's lights are
+  entities), and the list is empty.
 
 ### The living tables leave flint-scene (#686, second half)
 
@@ -221,7 +238,17 @@ Chris accepted the recommendations on 2026-11-10:
   binary built on it is unchanged. A call per host, not a registry of
   parse hooks in flint-scene: a hook a test or a tool forgets to install
   would change what a scene means without a word, where a missing call is a
-  missing line in the one place that reads the tables.
+  missing line in the one place that reads the tables. A host that misses
+  it is told (#807): the fill takes out every name that isn't a built-in
+  (laying in its file, or naming the miss), so the wooze field every host
+  builds knows a name still there was never settled, and warns
+  `preset 'x' was never filled in ... this host didn't call it`.
+- **One mistake in either table is one diagnostic** (#807). The scene pass
+  holds `[living]` / `[wooze]` to their `[table.<name>]` schemas, which
+  mirror the types, and names the field; when the type check then refuses
+  the table, `flint check` / `validate` make that diagnostic the error
+  rather than adding serde's `toml-parse` beside it. serde's message stands
+  only when the pass found nothing.
 - **A table that doesn't fit its type still refuses the scene**, from
   `settle_scene` instead of from the file's parse, so the message names the
   file and the table (`grove.scene.toml: [living]: unknown field glide`)
@@ -231,3 +258,44 @@ Chris accepted the recommendations on 2026-11-10:
   formatting rules in the patcher keyed by the names `living` and `wooze`
   (a new `[living]` goes after `[wooze]`; an emptied
   `[living.species.<x>]` is dropped). They are strings, not types.
+
+## After #807 (#1061)
+
+- **A wrong type in a typed table is `bad-type`, by field.** `[camera] fov =
+  "wide"` still refuses the file's parse, so the scene does not load. But
+  `diagnose` no longer stops there: `SceneFile::parse_refusing` sets aside
+  each typed table that doesn't fit its type and parses the rest, with every
+  typed table as written in `written`. The pass then holds the table to its
+  `[table.<name>]` schema as it holds any, and its `bad-type` (naming
+  `camera.fov`) is the error, with the hint `the scene does not load until
+  the table fits`. serde's message stands, as `toml-parse` on the table,
+  only when the pass found no error there. Before, a second wrong table was
+  never seen, since the parse stopped at the first; now each is named.
+  `flint check` checks the rest of such a scene (assets, styles) and does
+  not try to build it.
+- **A scene table's diagnostic has a line and column.** The tables are
+  checked as values, after the parse, so the pass knows the table and field
+  but not where they are. `flint_scene::place_table_diagnostics(text,
+  found)` parses the text once more with spans (`toml_edit::ImDocument`),
+  only when there is a table diagnostic to place, and gives each the place
+  of the key it names: the field's key, else the nearest key above it that
+  the file writes (a missing field is at its table's header). `diagnose`,
+  `flint check` (for its own `[living]` / `[wooze]` diagnostics) and the
+  loaders' summaries all place them. `Diagnostic::location` prints the
+  place before the table: `6:1 [living] shadowz`. The player's refusal from
+  `settle_scene` still names only the file and table; the load's summary
+  logged just before it has the line. The spans are not recorded in
+  `SceneFile`, as the ticket suggested, because only a diagnostic needs
+  them, and a clean load would pay for a third parse.
+- **`scene.version` is informational.** Nothing reads it to decide what a
+  scene means. It is printed by `flint scene info` and written back. A
+  migration keys on what the scene writes, not on a number: the one
+  migration there is, `fold_legacy_style_keys`, folds an old flat key
+  wherever it appears. That works for a file an agent or a person wrote by
+  hand without knowing a version, and it stays right when a file is edited
+  and the number isn't bumped. A migration list ordered by version is built
+  when a change can't be told from the data (a key whose meaning changed
+  under the same name). Until then
+  `format::tests::the_version_changes_nothing_a_scene_reads_as` holds it:
+  the same scene under any version, or none, parses to the same tables,
+  entities and folded styles.

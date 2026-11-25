@@ -5,8 +5,10 @@
 // No depth attachment: a fragment tests itself against the scene's
 // single-sample depth (the resolve under MSAA, the scaled depth under a
 // render scale), with a tolerance of its own depth slope. The vertex
-// stages repeat shader.wgsl's and skinned_shader.wgsl's products in the
-// same order, so the depths match wherever the rasterisers agree.
+// stages call the products shader.wgsl and skinned_shader.wgsl call
+// (mesh_vertex.wgsl's `world_of` and `clip_of`, skinning.wgsl's
+// `skin_transform`, #1244; Rust puts both in front of this file inside a
+// mesh block), so the depths match wherever the rasterisers agree.
 //
 // A transparent or a particle in front of a styled entity (glass, fire)
 // unmasks it by its coverage (#290): the veil pass drew that coverage just
@@ -15,53 +17,112 @@
 // An entity whose style has `blend_source = "tear"` (#397) is drawn at its
 // blend times the reality tear's mask at the pixel (tear_mask.wgsl, which
 // Rust prepends to this file, as it does to the composite's), so its
-// style shows only where reality tears.
+// style shows only where reality tears. One with `blend_source = "field"`
+// (#859) is drawn at its blend times the screen field the game filled this
+// frame (`field_at`: discs, rings and cones, flint_core::style_field), so
+// it shows only under a shockwave's ring or a flashlight's cone.
 
-struct TransformUniforms {
-    view_proj: mat4x4<f32>,
-    model: mat4x4<f32>,
-    model_inv_transpose: mat4x4<f32>,
-    camera_pos: vec3<f32>,
-    _pad: f32,
-};
-
+// A woozy draw (#215, #737) is masked by the woozy module: wooze_noise.wgsl,
+// then this file with mesh_vertex.wgsl's FLINT_WOOZE lines on, then
+// style_mask_wooze.wgsl's vertex stages, which move each vertex as
+// wooze_vertex.wgsl does.
 struct MaskDraw {
     id: u32,
     // How far behind the scene's depth a fragment may be, in depth slopes
     slope_tolerance: f32,
     blend: u32,
-    // 1: the blend follows the tear (#397); 0: the entity's own
-    torn: u32,
-    // The composite's tear, this frame: mode_params, then mix, post time
-    // and the mask target's size in pixels
-    tear_params: vec4<f32>,
-    tear_mix: f32,
-    tear_time: f32,
+    // What the blend follows: 0 the entity's own, 1 the tear (#397), 2 the
+    // screen field (#859)
+    source: u32,
+    // The frame's tear (#746): amount, scale, iris, post time
+    // (`postprocess::tear_params`), then the mask target's size in pixels
+    tear: vec4<f32>,
     size: vec2<f32>,
+    _pad: vec2<f32>,
 };
 
+// The screen field (#859): `count` shapes, each `a` = (x, y, p0, p1) and
+// `b` = (p2, soft, kind, strength). A disc (kind 0): p0 its radius. A ring
+// (1): p0 its radius, p1 half its width. A cone (2): p0 its length, p1 its
+// direction (radians clockwise from up), p2 its half spread. Positions are
+// screen uv, lengths fractions of the screen's height.
+struct FieldShape {
+    a: vec4<f32>,
+    b: vec4<f32>,
+};
+
+struct Field {
+    count: u32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
+    shapes: array<FieldShape, 16>,
+};
+
+// 1 at or inside a shape's edge, falling smoothly to 0 `soft` past it
+// (flint_core::style_field's `edge`)
+fn field_edge(outside: f32, soft: f32) -> f32 {
+    let t = clamp(outside / max(soft, 1e-5), 0.0, 1.0);
+    return 1.0 - t * t * (3.0 - 2.0 * t);
+}
+
+// The field's value at `uv` on a screen `aspect` wide: its strongest
+// shape's. `FieldShape::value_at` in Rust is the same function.
+fn field_at(uv: vec2<f32>, aspect: f32) -> f32 {
+    var value = 0.0;
+    let count = min(field.count, 16u);
+    for (var i = 0u; i < count; i++) {
+        let s = field.shapes[i];
+        let q = (uv - s.a.xy) * vec2<f32>(aspect, 1.0);
+        let d = length(q);
+        let kind = u32(s.b.z);
+        var outside = d - s.a.z;
+        if kind == 1u {
+            outside = abs(d - s.a.z) - s.a.w;
+        } else if kind == 2u {
+            // Past the beam's side by the arc's length, or past its end
+            let turn = atan2(q.x, -q.y) - s.a.w;
+            let off = abs(turn - 6.2831853 * floor((turn + 3.14159265) / 6.2831853));
+            outside = max((off - s.b.x) * d, d - s.a.z);
+        }
+        value = max(value, field_edge(outside, s.b.y) * clamp(s.b.w, 0.0, 1.0));
+    }
+    return value;
+}
+
 // The blend to write at pixel `frag_xy`: the draw's, scaled by what the
-// veil leaves (`covered`) and, for a torn draw, by the tear there. The
-// mask's pixel centres give the same uv as the composite's at any render
-// scale, so the tear lands where the composite draws it.
+// veil leaves (`covered`) and, for a torn draw, by the tear there, or for
+// one following the field, by the field there. The mask's pixel centres
+// give the same uv as the display's at any render scale, so the tear and
+// the field land where a style following them shows.
 fn written_blend(frag_xy: vec2<f32>, covered: f32) -> u32 {
     var blend = f32(draw.blend) * (1.0 - covered);
-    if draw.torn != 0u {
-        let uv = frag_xy / draw.size;
-        blend *= tear_mask_at(uv, draw.size.x / draw.size.y, draw.tear_mix, draw.tear_params, draw.tear_time);
+    let uv = frag_xy / draw.size;
+    let aspect = draw.size.x / draw.size.y;
+    if draw.source == 1u {
+        blend *= tear_mask_at(uv, aspect, draw.tear);
+    } else if draw.source == 2u {
+        blend *= field_at(uv, aspect);
     }
     return u32(round(blend));
 }
 
-@group(0) @binding(0) var<uniform> transform: TransformUniforms;
+// The lines between FLINT_MESH { and } are a mesh's alone: the billboard
+// module (style_mask_billboard.wgsl, #1011) leaves them out and binds its
+// own groups 0 and 2 in their place. The first block, mesh_vertex.wgsl's
+// transform at group 0 and its products, is put in front by Rust.
 @group(1) @binding(0) var<uniform> draw: MaskDraw;
 @group(1) @binding(1) var scene_depth: texture_depth_2d;
 // The style veil (#290): how much of each pixel transparents and particles
 // in front of the scene cover, 0..1. That share of the pixel is theirs, not
 // the styled entity's, so the entity's blend is scaled down by it.
 @group(1) @binding(2) var veil: texture_2d<f32>;
+// The frame's screen field (#859), read by a draw whose blend follows it
+@group(1) @binding(4) var<uniform> field: Field;
+//FLINT_MESH {
 // Only the skinned entry point reads it; the static layout leaves it out
 @group(2) @binding(0) var<storage, read> bone_matrices: array<mat4x4<f32>>;
+//FLINT_MESH }
 
 struct StaticVertex {
     @location(0) position: vec3<f32>,
@@ -79,23 +140,18 @@ struct SkinnedVertex {
     @location(5) joint_weights: vec4<f32>,
 };
 
+//FLINT_MESH {
 @vertex
 fn vs_static(in: StaticVertex) -> @builtin(position) vec4<f32> {
-    let world_pos = transform.model * vec4<f32>(in.position, 1.0);
-    return transform.view_proj * world_pos;
+    return clip_of(world_of(vec4<f32>(in.position, 1.0)));
 }
 
 @vertex
 fn vs_skinned(in: SkinnedVertex) -> @builtin(position) vec4<f32> {
-    let j = in.joint_indices;
-    let w = in.joint_weights;
-    let skin = bone_matrices[j.x] * w.x
-             + bone_matrices[j.y] * w.y
-             + bone_matrices[j.z] * w.z
-             + bone_matrices[j.w] * w.w;
-    let world_pos = transform.model * (skin * vec4<f32>(in.position, 1.0));
-    return transform.view_proj * world_pos;
+    let skin = skin_transform(in.joint_indices, in.joint_weights);
+    return clip_of(world_of(skin * vec4<f32>(in.position, 1.0)));
 }
+//FLINT_MESH }
 
 @fragment
 fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec2<u32> {

@@ -84,7 +84,12 @@ fn schemas() -> PathBuf {
 }
 
 fn render(dir: &Path, out: &str, args: &[&str]) -> Output {
-    std::process::Command::new(FLINT)
+    render_command(dir, out, args).output().expect("run flint")
+}
+
+fn render_command(dir: &Path, out: &str, args: &[&str]) -> std::process::Command {
+    let mut command = std::process::Command::new(FLINT);
+    command
         .arg("render")
         .arg(dir.join("floor.scene.toml"))
         .arg("--schemas")
@@ -97,9 +102,8 @@ fn render(dir: &Path, out: &str, args: &[&str]) -> Output {
         .arg("48")
         .arg("-o")
         .arg(dir.join(out))
-        .args(args)
-        .output()
-        .expect("run flint")
+        .args(args);
+    command
 }
 
 fn timeline(dir: &Path) -> String {
@@ -524,6 +528,110 @@ fn the_report_says_what_each_capture_heard_and_what_didnt_run() {
 // #697: a capture is a script host like the player, so the style commands
 // the old headless dispatcher dropped land in the picture.
 
+/// `text` without its terminal colours (the log colours its fields).
+fn plain(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' {
+            // ESC [ ... m
+            for c in chars.by_ref() {
+                if c == 'm' {
+                    break;
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// #703: a script's `print` and `debug` are the log's, on stderr, so the
+/// report on stdout stays a report.
+#[test]
+fn a_script_print_never_reaches_the_json_report() {
+    let dir = project("print");
+    std::fs::write(
+        dir.join("scripts/tint.rhai"),
+        format!(
+            "{TINT}\nprint(\"top level says hi\");\n\
+             fn on_init() {{ print(\"init says hi\"); }}\n\
+             fn on_draw_ui() {{ debug(\"ui says hi\"); }}\n"
+        ),
+    )
+    .unwrap();
+    let tl = timeline(&dir);
+    let o = render(
+        &dir,
+        "p.png",
+        &[
+            "--expression-timeline",
+            &tl,
+            "--time",
+            "0.5",
+            "--report",
+            "json",
+        ],
+    );
+    if no_gpu(&o) {
+        return;
+    }
+    ok(&o);
+    let stdout = String::from_utf8_lossy(&o.stdout);
+    assert!(!stdout.contains("says hi"), "a print on stdout: {stdout}");
+    serde_json::from_slice::<serde_json::Value>(&o.stdout).expect("stdout is only the report");
+    let err = plain(&stderr(&o));
+    for said in ["top level says hi", "init says hi"] {
+        let line = err
+            .lines()
+            .find(|l| l.contains(said))
+            .unwrap_or_else(|| panic!("{said:?} not in the log: {err}"));
+        assert!(line.contains("script:"), "{line}");
+        assert!(line.contains("entity=director"), "{line}");
+    }
+}
+
+/// #1010: the per-script load line and the system's count are the log's,
+/// so the default filter shows them and `RUST_LOG=warn` quiets them.
+#[test]
+fn rust_log_quiets_the_script_load_lines() {
+    let dir = project("load_lines");
+    let run = |rust_log: Option<&str>, out: &str| {
+        let mut command = render_command(&dir, out, &["--scripts", "--time", "0.5"]);
+        match rust_log {
+            Some(filter) => command.env("RUST_LOG", filter),
+            None => command.env_remove("RUST_LOG"),
+        };
+        command.output().expect("run flint")
+    };
+    let shown = run(None, "default.png");
+    if no_gpu(&shown) {
+        return;
+    }
+    ok(&shown);
+    let err = plain(&stderr(&shown));
+    let loaded = err
+        .lines()
+        .find(|l| l.contains("Loaded: director"))
+        .unwrap_or_else(|| panic!("no load line under the default filter: {err}"));
+    assert!(
+        loaded.contains("DEBUG") && loaded.contains("load:"),
+        "{loaded}"
+    );
+    assert!(
+        err.contains("Script system initialized (1 scripts)"),
+        "{err}"
+    );
+
+    let quiet = run(Some("warn"), "quiet.png");
+    ok(&quiet);
+    let err = plain(&stderr(&quiet));
+    for line in ["Loaded: director", "Script system initialized"] {
+        assert!(!err.contains(line), "{line:?} under RUST_LOG=warn: {err}");
+    }
+}
+
 /// The floor drawn in ASCII from `on_init`, its cells easing from 4 to 16
 /// points over two seconds.
 const STYLER: &str = r#"
@@ -563,6 +671,155 @@ fn entity_styles_and_their_tweens_reach_the_capture() {
         read("styled2.png") == read("again2.png"),
         "two runs differed"
     );
+}
+
+/// #496: `set_look(name, seconds)` in a capture fades from the moment it was
+/// asked, each still at its own time: the start is the frame without the
+/// look, the end the cut's bytes, and the middle neither.
+#[test]
+fn a_look_fade_is_captured_at_each_moment_of_it() {
+    let dir = project("look_fade");
+    let o = render(&dir, "plain.png", &["--time", "0"]);
+    if no_gpu(&o) {
+        return;
+    }
+    ok(&o);
+    std::fs::write(
+        dir.join("scripts/tint.rhai"),
+        "fn on_init() { set_look(\"graphite\", 2.0); }\n",
+    )
+    .unwrap();
+    for t in ["0", "1", "2"] {
+        let o = render(&dir, &format!("fade{t}.png"), &["--scripts", "--time", t]);
+        ok(&o);
+        assert!(!stderr(&o).contains("set_look"), "{}", stderr(&o));
+    }
+    std::fs::write(
+        dir.join("scripts/tint.rhai"),
+        "fn on_init() { set_look(\"graphite\"); }\n",
+    )
+    .unwrap();
+    ok(&render(&dir, "cut.png", &["--scripts", "--time", "2"]));
+    let read = |name: &str| std::fs::read(dir.join(name)).unwrap();
+    assert!(
+        read("fade0.png") == read("plain.png"),
+        "the fade's start moved"
+    );
+    assert!(
+        read("fade2.png") == read("cut.png"),
+        "the fade didn't end on the cut"
+    );
+    assert!(
+        read("fade1.png") != read("fade0.png"),
+        "nothing faded by 1 s"
+    );
+    assert!(
+        read("fade1.png") != read("fade2.png"),
+        "the fade arrived at 1 s"
+    );
+}
+
+/// Kindling's shape (#1157): the scene authors one look, a script cuts to a
+/// second and later fades to a third. The cut and the fade are taken at the
+/// same capture, so a capture that laid only the last request faded from the
+/// authored look, not from the cut's.
+const THREE_LOOKS: &str = r#"
+let cut = false;
+let faded = false;
+fn on_update() {
+    let t = total_time();
+    if !cut && t >= 0.5 { set_look("graphite"); cut = true; }
+    if !faded && t >= 1.0 { set_look("ink_wash", 2.0); faded = true; }
+}
+"#;
+
+/// A scene that authors `look`, and a script set to `THREE_LOOKS`.
+fn author_look(dir: &Path, look: &str) {
+    std::fs::write(
+        dir.join("floor.scene.toml"),
+        format!("{SCENE}\n[post_process]\nlook = \"{look}\"\n"),
+    )
+    .unwrap();
+    std::fs::write(dir.join("scripts/tint.rhai"), THREE_LOOKS).unwrap();
+}
+
+/// #1157: a fade's source is the look on screen when it was asked. At the
+/// midpoint of a graphite to ink wash fade, a scene authoring blueprint
+/// (cut to graphite first) draws what a scene authoring graphite does,
+/// byte for byte; before the fix it drew blueprint's white lines on blue.
+#[test]
+fn a_fade_after_a_cut_starts_from_the_cut_not_the_authored_look() {
+    let dir = project("three_looks");
+    author_look(&dir, "blueprint");
+    let args = |t: &'static str| ["--scripts", "--time", t];
+    let o = render(&dir, "blueprint_mid.png", &args("2"));
+    if no_gpu(&o) {
+        return;
+    }
+    ok(&o);
+    ok(&render(&dir, "blueprint_at_start.png", &args("0")));
+    ok(&render(&dir, "graphite_held.png", &args("0.9")));
+    ok(&render(&dir, "ink_wash_arrived.png", &args("3")));
+    author_look(&dir, "graphite");
+    ok(&render(&dir, "graphite_mid.png", &args("2")));
+    let read = |name: &str| std::fs::read(dir.join(name)).unwrap();
+    assert!(
+        read("blueprint_mid.png") == read("graphite_mid.png"),
+        "the fade's middle depends on the look authored before the cut"
+    );
+    for other in [
+        "blueprint_at_start.png",
+        "graphite_held.png",
+        "ink_wash_arrived.png",
+    ] {
+        assert!(
+            read("blueprint_mid.png") != read(other),
+            "the fade's middle is {other}"
+        );
+    }
+}
+
+/// #497: a capture's scripts read the look it draws with (`--look` here,
+/// over the scene's none) from `on_init`, and the one they set from the
+/// frame after the capture applied it; `list_looks()` has the built-ins.
+#[test]
+fn a_capture_tells_its_scripts_the_look_it_draws_with() {
+    let dir = project("get_look");
+    std::fs::write(
+        dir.join("scripts/tint.rhai"),
+        r#"
+let n = 0;
+fn on_init() {
+    print(`init:${get_look()}`);
+    print(`listed:${list_looks().contains("graphite")}`);
+    set_look("watercolor");
+    set_look("no_such_look");
+}
+fn on_update() {
+    if n < 2 { print(`update${n}:${get_look()}`); }
+    n += 1;
+}
+"#,
+    )
+    .unwrap();
+    let o = render(
+        &dir,
+        "look.png",
+        &["--look", "ink_wash", "--scripts", "--time", "0.1"],
+    );
+    if no_gpu(&o) {
+        return;
+    }
+    ok(&o);
+    let err = stderr(&o);
+    for line in [
+        "init:ink_wash",
+        "listed:true",
+        "update0:ink_wash",
+        "update1:watercolor",
+    ] {
+        assert!(err.contains(line), "no {line} in\n{err}");
+    }
 }
 
 // #579: the boil, step_living and particles from scripts.
@@ -948,4 +1205,194 @@ fn a_state_that_pauses_living_stills_the_grove_as_in_the_player() {
         !all_alike(&gif_frames(&moving.join("moving.gif"))),
         "pausing scripts stilled the grove"
     );
+}
+
+// #693: a script that fails every frame is one line on stderr, then a
+// count, one entry in the report, and with --strict-scripts a failed run.
+const TYPO: &str = r#"
+fn on_update() {
+    let key = get_entity("key");
+    set_feild(key, "light", "intensity", 28.0);
+}
+"#;
+
+#[test]
+fn a_failing_script_is_counted_once_reported_and_fails_a_strict_run() {
+    let dir = project("typo");
+    std::fs::write(dir.join("scripts/tint.rhai"), TYPO).unwrap();
+    let o = render(
+        &dir,
+        "typo.png",
+        &["--script-time", "1", "--report", "json"],
+    );
+    if no_gpu(&o) {
+        return;
+    }
+    ok(&o);
+    let said = stderr(&o);
+    // Logged the first time, then at 10: not once a frame
+    let lines = said.matches("set_feild").count();
+    assert!(lines <= 4, "{lines} lines name it:\n{said}");
+    assert!(
+        said.contains("tint.rhai:4:5: director, on_update: Function not found: set_feild"),
+        "names the file, line, entity and callback:\n{said}"
+    );
+    assert!(said.contains("[script] 1 error ("), "{said}");
+
+    let report: serde_json::Value =
+        serde_json::from_slice(&o.stdout).expect("stdout is only the report");
+    let errors = report["script_errors"].as_array().unwrap();
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert_eq!(errors[0]["entity"], "director");
+    assert_eq!(errors[0]["callback"], "on_update");
+    assert_eq!(errors[0]["line"], 4);
+    assert!(errors[0]["count"].as_u64().unwrap() >= 60, "{errors:?}");
+
+    let strict = render(
+        &dir,
+        "strict.png",
+        &["--script-time", "1", "--strict-scripts"],
+    );
+    assert!(
+        !strict.status.success(),
+        "--strict-scripts passed a broken script"
+    );
+    assert!(
+        stderr(&strict).contains("1 script error under --strict-scripts"),
+        "{}",
+        stderr(&strict)
+    );
+    assert!(
+        dir.join("strict.png").exists(),
+        "the picture is still written"
+    );
+
+    // A compile error counts too, and a clean scene passes strict
+    std::fs::write(dir.join("scripts/tint.rhai"), "fn on_update( {\n}\n").unwrap();
+    let broken = render(
+        &dir,
+        "broken.png",
+        &["--script-time", "0.1", "--strict-scripts"],
+    );
+    assert!(!broken.status.success());
+    assert!(
+        stderr(&broken).contains("director, compile"),
+        "{}",
+        stderr(&broken)
+    );
+    std::fs::write(dir.join("scripts/tint.rhai"), TINT).unwrap();
+    let clean = render(
+        &dir,
+        "clean.png",
+        &["--script-time", "0.1", "--strict-scripts"],
+    );
+    ok(&clean);
+    assert!(stderr(&clean).contains("[script] no errors"));
+}
+
+/// The HUD is drawn headless (#731): a UI document a script loads, shown and
+/// focused by the flags as a player's input would, is painted over the
+/// capture in the state the flags put it in, as the player paints it.
+#[test]
+fn a_ui_document_is_drawn_over_the_capture() {
+    let dir = project("ui_document");
+    std::fs::create_dir_all(dir.join("ui")).unwrap();
+    std::fs::write(dir.join("flint.toml"), "[project]\n").unwrap();
+    std::fs::write(
+        dir.join("scripts/tint.rhai"),
+        "load_ui(\"ui/card.ui.toml\");\nfn on_update() {}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("ui/card.ui.toml"),
+        "[ui]\nstyle = \"ui/card.style.toml\"\n\n[elements.card]\nanchor = \"center\"\nclass = \"card\"\nvisible = false\n\n[elements.go]\ntype = \"button\"\nparent = \"card\"\nclass = \"go\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("ui/card.style.toml"),
+        "[styles.card]\nwidth = 40\nheight = 30\n\n[styles.go]\nwidth = 40\nheight = 30\nbg_color = [0.0, 0.0, 1.0, 1.0]\n\n[styles.go.focus]\nbg_color = [0.0, 1.0, 0.0, 1.0]\n",
+    )
+    .unwrap();
+    let centre = |name: &str| {
+        let image = image::open(dir.join(name)).unwrap().to_rgba8();
+        let p = image.get_pixel(32, 24);
+        [p[0], p[1], p[2]]
+    };
+
+    let hidden = render(&dir, "hidden.png", &["--scripts"]);
+    if no_gpu(&hidden) {
+        return;
+    }
+    ok(&hidden);
+    assert!(
+        !stderr(&hidden).contains("HUD isn't drawn"),
+        "{}",
+        stderr(&hidden)
+    );
+    assert_ne!(
+        centre("hidden.png"),
+        [0, 0, 255],
+        "a hidden card draws nothing"
+    );
+
+    ok(&render(&dir, "shown.png", &["--ui-show", "card"]));
+    assert_eq!(centre("shown.png"), [0, 0, 255], "the button, unfocused");
+
+    ok(&render(
+        &dir,
+        "focused.png",
+        &["--ui-show", "card", "--ui-focus", "go"],
+    ));
+    assert_eq!(centre("focused.png"), [0, 255, 0], "its focus table");
+
+    let wrong = render(&dir, "wrong.png", &["--ui-focus", "goo"]);
+    assert!(!wrong.status.success());
+    assert!(stderr(&wrong).contains("goo"), "{}", stderr(&wrong));
+}
+
+/// A text input's caret is drawn headless (#1229): `--ui-focus` gives the
+/// name field focus as a click would, and its caret (pure red here) is drawn
+/// at the start of its empty box; without focus there is none.
+#[test]
+fn ui_focus_shows_a_text_inputs_caret() {
+    let dir = project("ui_text_input");
+    std::fs::create_dir_all(dir.join("ui")).unwrap();
+    std::fs::write(dir.join("flint.toml"), "[project]\n").unwrap();
+    std::fs::write(
+        dir.join("scripts/tint.rhai"),
+        "load_ui(\"ui/name.ui.toml\");\nfn on_update() {}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("ui/name.ui.toml"),
+        "[ui]\nstyle = \"ui/name.style.toml\"\n\n[elements.name]\ntype = \"text_input\"\nclass = \"field\"\n",
+    )
+    .unwrap();
+    // A black box 4..60 x 4..44, its inside from 10; a 24-point font makes
+    // a 2-point caret, 10..12 across
+    std::fs::write(
+        dir.join("ui/name.style.toml"),
+        "[styles.field]\nx = 4\ny = 4\nwidth = 56\nheight = 40\npadding = [6, 6, 6, 6]\nfont_size = 24\nbg_color = [0.0, 0.0, 0.0, 1.0]\ncaret_color = [1.0, 0.0, 0.0, 1.0]\n",
+    )
+    .unwrap();
+    let at = |name: &str, x: u32| {
+        let image = image::open(dir.join(name)).unwrap().to_rgba8();
+        let p = image.get_pixel(x, 24);
+        [p[0], p[1], p[2]]
+    };
+
+    let unfocused = render(&dir, "unfocused.png", &["--scripts"]);
+    if no_gpu(&unfocused) {
+        return;
+    }
+    ok(&unfocused);
+    assert_eq!(at("unfocused.png", 10), [0, 0, 0], "no focus, no caret");
+
+    ok(&render(&dir, "focused.png", &["--ui-focus", "name"]));
+    let caret = at("focused.png", 10);
+    assert!(
+        caret[0] > 200 && caret[1] < 40 && caret[2] < 40,
+        "the caret at the box's start: {caret:?}"
+    );
+    assert_eq!(at("focused.png", 30), [0, 0, 0], "and only there");
 }

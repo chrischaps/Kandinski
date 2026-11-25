@@ -1,8 +1,8 @@
 //! Suite playback session: all buses started sample-locked on one clock,
-//! backend-agnostic so the same code runs live (cpal) and offline (render
-//! harness).
+//! mixer-agnostic so the same code runs live (kira on the device, or the
+//! browser's worklet, #1216) and offline (render harness).
 //!
-//! Time authority: the kira clock counts **samples** (one tick per sample at
+//! Time authority: the mixer's clock counts **samples** (one tick per sample at
 //! the manifest rate) and never changes speed. All musical interpretation —
 //! tempo changes, meter changes, bars, beats — is the Conductor's arithmetic
 //! over that sample count. One source of truth; the clock cannot drift from
@@ -13,11 +13,10 @@ use crate::manifest::{BusDecl, SuiteManifest};
 use crate::mixer::BusMixer;
 use crate::scheduler::{FiredEvent, Scheduler};
 use crate::tempo::ms_to_samples;
+use flint_audio::clocked::{ClockedMixer, MixClock, Ramp, Start};
 use flint_core::{vfs, FlintError, Result};
-use kira::backend::Backend;
-use kira::clock::{ClockHandle, ClockSpeed, ClockTime};
 use kira::sound::static_sound::StaticSoundData;
-use kira::{AudioManager, DefaultBackend, StartTime};
+use kira::{AudioManager, DefaultBackend};
 use std::path::{Path, PathBuf};
 
 /// `StaticSoundData::from_file`, read through the vfs: the bytes come from
@@ -33,7 +32,7 @@ fn static_sound_from_file(
 
 /// Beats of silence before sample 0 (at the first anchor's tempo), giving
 /// every stem's start a scheduled future clock time — the same lookahead
-/// pattern reintegration entries will use.
+/// pattern a timeline jump's re-entry uses ([`SuiteSession::schedule_jump`]).
 pub const PREROLL_BEATS: f64 = 2.0;
 
 /// Provides each bus's sound data. `FileStems` is the real implementation;
@@ -80,23 +79,24 @@ impl StemResolver for FileStems {
     }
 }
 
-/// A running suite: mixer, clock, conductor, scheduler. Owns every kira
-/// handle but not the `AudioManager` — the caller owns that (and its
-/// backend), which is what lets the offline harness drive the same session.
-/// Handles must drop before the manager; keep the manager alive longer.
+/// A running suite: mixer, clock, conductor, scheduler. Owns every handle
+/// but not the mixer that made them ([`ClockedMixer`]: a kira
+/// `AudioManager`, or the browser's worklet) — the caller owns that, which
+/// is what lets the offline harness drive the same session. Handles must
+/// drop before the manager; keep the manager alive longer.
 pub struct SuiteSession {
     pub mixer: BusMixer,
-    pub clock: ClockHandle,
+    pub clock: MixClock,
     pub conductor: Conductor,
     pub scheduler: Scheduler,
     preroll_samples: u64,
-    /// Reintegration timeline map: `suite_sample = raw_clock_sample -
-    /// timeline_offset`. The clock never rewinds; a seam that returns the
+    /// The timeline map: `suite_sample = raw_clock_sample -
+    /// timeline_offset`. The clock never rewinds; a jump that returns the
     /// suite to an earlier section adjusts this offset instead. 0 until the
-    /// first seam.
+    /// first jump.
     timeline_offset: i64,
-    /// A seam whose audio is already scheduled but whose musical-time jump
-    /// hasn't been reached yet: `(raw_sample_of_seam, new_offset)`. Committed
+    /// A jump whose audio is already scheduled but whose musical-time move
+    /// hasn't been reached yet: `(raw_sample_of_jump, new_offset)`. Committed
     /// by `pump` when the clock arrives.
     pending_jump: Option<(i64, i64)>,
 }
@@ -105,9 +105,9 @@ impl SuiteSession {
     /// Load the stems of every bus the manifest declares, schedule them for one shared clock tick,
     /// and start the clock. Validate the manifest before calling; playback
     /// assumes a well-formed suite.
-    pub fn start<B: Backend>(
+    pub fn start(
         manifest: &SuiteManifest,
-        manager: &mut AudioManager<B>,
+        mixer: &mut dyn ClockedMixer,
         stems: &dyn StemResolver,
         latency_ms: Option<f64>,
     ) -> Result<Self> {
@@ -128,17 +128,15 @@ impl SuiteSession {
         let preroll_samples =
             (PREROLL_BEATS * manifest.sample_rate as f64 * 60.0 / anchor.bpm).round() as u64;
 
-        let mut clock = manager
-            .add_clock(ClockSpeed::TicksPerSecond(manifest.sample_rate as f64))
-            .map_err(|e| FlintError::AudioError(format!("failed to create clock: {e}")))?;
-        let start_at = StartTime::ClockTime(ClockTime::from_ticks_u64(&clock, preroll_samples));
+        let mut clock = mixer.add_clock(manifest.sample_rate as f64)?;
+        let start_at = Start::Tick(preroll_samples);
 
         // The manifest's buses in the order it declares them (not the
         // BTreeMap's alphabetical order): the order they mix and list in.
         let mut loaded = Vec::new();
         let mut playable = 0usize;
         for (name, decl) in manifest.buses_in_order() {
-            let data = stems.load(name, decl)?;
+            let data = stems.load(name, decl)?.map(|d| mixer.add_stem(&d));
             playable += data.is_some() as usize;
             loaded.push((name.to_string(), data));
         }
@@ -147,16 +145,16 @@ impl SuiteSession {
                 "manifest declares no playable buses".into(),
             ));
         }
-        let mut mixer = BusMixer::build(manager, loaded, start_at)?;
+        let mut buses = BusMixer::build(mixer, &clock, loaded, start_at)?;
 
         // Composed degraded alternates (ADR 0032): full-length muted voices
         // started at the same shared tick — sample-locked by construction.
         for alt in &manifest.degraded_alternates {
             match stems.load_alternate(&alt.bus, &alt.file)? {
                 Some(data) => {
-                    mixer.attach_alternate(
+                    buses.attach_alternate(
                         &alt.bus,
-                        data,
+                        mixer.add_stem(&data),
                         alt.from_sample,
                         alt.to_sample,
                         start_at,
@@ -173,7 +171,7 @@ impl SuiteSession {
 
         clock.start();
         Ok(Self {
-            mixer,
+            mixer: buses,
             clock,
             conductor: Conductor::new(manifest, latency_ms),
             scheduler: Scheduler::new(Scheduler::default_horizon(manifest.sample_rate)),
@@ -184,16 +182,15 @@ impl SuiteSession {
     }
 
     /// Monotonic clock position in samples past pre-roll (negative during
-    /// pre-roll). Never rewinds; seam bookkeeping lives on this timeline.
+    /// pre-roll). Never rewinds; jump bookkeeping lives on this timeline.
     pub fn raw_clock_sample(&self) -> i64 {
-        let t = self.clock.time();
-        (t.ticks as f64 + t.fraction - self.preroll_samples as f64).floor() as i64
+        (self.clock.ticks() - self.preroll_samples as f64).floor() as i64
     }
 
     /// Suite sample position implied by the clock: the raw clock position
-    /// mapped through the reintegration timeline offset. This is the sample
-    /// every musical consumer (conductor, judge, chart eval, replay) sees;
-    /// it jumps backwards exactly once per seam.
+    /// mapped through the timeline offset. This is the sample every musical
+    /// consumer (the conductor, and a layer's judge or replay) sees; it moves
+    /// exactly once per jump.
     pub fn clock_sample(&self) -> i64 {
         self.raw_clock_sample() - self.timeline_offset
     }
@@ -207,23 +204,23 @@ impl SuiteSession {
         self.timeline_offset
     }
 
-    /// The kira clock time at a raw clock sample (raw = ticks − pre-roll).
-    pub fn clock_time_at_raw(&self, raw: i64) -> kira::clock::ClockTime {
-        kira::clock::ClockTime::from_ticks_u64(
-            &self.clock,
-            (raw + self.preroll_samples as i64).max(0) as u64,
-        )
+    /// The clock tick a change starts on at a raw clock sample (raw =
+    /// ticks − pre-roll).
+    pub fn start_at_raw(&self, raw: i64) -> Start {
+        Start::Tick((raw + self.preroll_samples as i64).max(0) as u64)
     }
 
-    /// Schedule a reintegration seam: fade the current timeline to silence
-    /// over `fade_ms` ending exactly at seam time `seam_suite_sample` (a
-    /// sample on the *current* suite timeline, far enough ahead for the
-    /// fade), re-play every stem from `re_entry_sample` at that same clock
-    /// tick with per-bus entry levels, and queue the musical-time jump,
-    /// which `pump` commits when the clock reaches the seam. The caller
-    /// flushes the scheduler and owns the reassembly ramps; this method owns
-    /// only sample-accurate mechanics.
-    pub fn schedule_seam(
+    /// Jump the suite's timeline without a hard cut (#1041; it was
+    /// `schedule_seam`): fade the current timeline to silence over `fade_ms`
+    /// ending exactly at `seam_suite_sample` (a sample on the *current* suite
+    /// timeline, far enough ahead for the fade), re-play every stem from
+    /// `re_entry_sample` at that same clock tick with per-bus entry levels,
+    /// and queue the musical-time move, which `pump` commits when the clock
+    /// reaches the seam. The caller flushes the scheduler and owns any ramp
+    /// back in; this method owns only sample-accurate mechanics. A rhythm
+    /// game's return after a full fail is one caller
+    /// (`flint_rhythm::Reintegrator`).
+    pub fn schedule_jump(
         &mut self,
         re_entry_sample: i64,
         seam_suite_sample: i64,
@@ -239,15 +236,11 @@ impl SuiteSession {
         }
         let sample_rate = self.conductor.tempo().sample_rate() as f64;
         let fade_samples = ms_to_samples(fade_ms.max(0.0), sample_rate);
-        let fade = kira::Tween {
-            start_time: StartTime::ClockTime(self.clock_time_at_raw(seam_raw - fade_samples)),
-            duration: std::time::Duration::from_secs_f64(fade_ms.max(0.0) / 1000.0),
-            ..Default::default()
-        };
-        let start_at = StartTime::ClockTime(kira::clock::ClockTime::from_ticks_u64(
-            &self.clock,
-            seam_tick as u64,
-        ));
+        let fade = Ramp::at(
+            self.start_at_raw(seam_raw - fade_samples),
+            fade_ms.max(0.0) / 1000.0,
+        );
+        let start_at = Start::Tick(seam_tick as u64);
         self.mixer.stop_all(fade);
         self.mixer
             .replay_all_at(re_entry_sample as u64, start_at, entry_db)?;
@@ -259,10 +252,7 @@ impl SuiteSession {
     /// shares with others, dropping its handles doesn't stop its sounds, so
     /// a host stops them first.
     pub fn stop(&mut self, fade_ms: f64) {
-        self.mixer.stop_all(kira::Tween {
-            duration: std::time::Duration::from_secs_f64(fade_ms.max(0.0) / 1000.0),
-            ..Default::default()
-        });
+        self.mixer.stop_all(Ramp::now(fade_ms.max(0.0) / 1000.0));
     }
 
     /// Latency-compensated musical position ("what the ear hears now").
@@ -280,7 +270,7 @@ impl SuiteSession {
     }
 
     /// Issue scheduled events entering the lookahead horizon, committing any
-    /// pending seam jump the clock has reached. Call regularly (each poll
+    /// pending timeline jump the clock has reached. Call regularly (each poll
     /// tick live; each chunk offline).
     pub fn pump(&mut self) -> Vec<FiredEvent> {
         if let Some((seam_raw, offset)) = self.pending_jump {
@@ -291,8 +281,7 @@ impl SuiteSession {
         }
         let now = self.clock_sample();
         let tick_base = self.preroll_samples as i64 + self.timeline_offset;
-        self.scheduler
-            .pump(now, &self.clock, tick_base, &mut self.mixer)
+        self.scheduler.pump(now, tick_base, &mut self.mixer)
     }
 }
 

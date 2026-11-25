@@ -1,5 +1,7 @@
 # Animation
 
+> **Package:** `engine`: every game has it. Its animation is grouped in the engine's manifest as the package it becomes in a later phase, with no switch yet ([Packages](packages.md)).
+
 Flint's animation system provides two tiers of animation through the `flint-animation` crate: **property tweens** for simple transform animations defined in TOML, and **skeletal animation** for character rigs imported from glTF files with GPU vertex skinning.
 
 ## Tier 1: Property Animation
@@ -8,7 +10,7 @@ Property animations are the simplest form --- animate any transform property (po
 
 ### Animation Clips
 
-Clips are `.anim.toml` files in an `animations/` directory the scene can see ([where the engine looks](assets.md#where-the-engine-looks-for-a-file)); the demos' are in `examples/animations/`:
+Clips are `.anim.toml` files in an `animations/` directory the scene can see ([where the engine looks](assets.md#where-the-engine-looks-for-a-file)); the demos' are in [`flint-examples/animations/`](https://github.com/chrischaps/flint-examples/tree/main/animations):
 
 ```toml
 # animations/door_swing.anim.toml
@@ -137,9 +139,21 @@ playing = true
 loop = true
 blend_target = "walk"      # Crossfade into this clip
 blend_duration = 0.3       # Over 0.3 seconds
+blend_easing = "ease_in_out"  # How the weight moves (omit = linear)
 ```
 
 Blending uses slerp for rotation quaternions and lerp for translation/scale, producing smooth pose interpolation.
+
+The crossfade's weight climbs from the old clip to the new one as
+`blend_easing` says: `"linear"` (the default, and what an animator that
+doesn't write it gets), `"smooth"`, `"ease_in"`, `"ease_out"` or
+`"ease_in_out"`, the engine's one set of easings (#734, #1248). Only the
+weight is eased; the new clip's own time runs at its speed from the start of
+the fade, and the fade lands at `blend_duration` whatever the easing.
+`blend_easing` is read when a crossfade starts and stays written, so it is a
+dial: `blend_to(entity, clip, seconds, easing)` and a sequence's `blend` step
+with an `easing` write it, and later crossfades that name none ease the same
+way.
 
 **The engine clears `blend_target` when the crossfade completes.** It is a
 request, not a state — once the fade lands, the field is retired and the clip
@@ -240,7 +254,10 @@ A posed joint and everything past it draw orange in the skeleton overlay.
 
 A layer's `weight` is a live dial, so a script that sets it pops the pose. To
 ramp instead, set `fade_target` and `fade_duration` on the layer table (or call
-`fade_anim_layer(entity, index, weight, seconds)`). The engine owns the weight
+`fade_anim_layer(entity, index, weight, seconds)`). A ramp is linear unless the
+layer's `fade_easing` says otherwise (`fade_anim_layer(entity, index, weight,
+seconds, easing)`: `"linear"`, `"smooth"`, `"ease_in"`, `"ease_out"` or
+`"ease_in_out"`, the engine's one set of easings, #734). The engine owns the weight
 while the ramp runs: it writes the ramped value back to `layers[i].weight`
 every frame and zeroes `fade_duration` when it arrives, so the next
 `sync_from_world` doesn't re-arm it — the same contract as `blend_target`. Any
@@ -279,6 +296,7 @@ mode = "additive"
 mask = "head"
 weight = 1.0
 fade = 0.3                # ramp the weight over 0.3 s (omit = instant)
+easing = "ease_in_out"    # how the ramp moves (omit = linear)
 
 [[events]]
 time = 4.0
@@ -298,8 +316,15 @@ kind = "cue"              # named marker for scripts
 name = "done"
 ```
 
-Event kinds: `blend { clip, duration }`, `layer { index, clip?, weight?, fade,
-mode?, mask? }`, `speed { value }`, `cue { name }`. Events are sorted by time
+Event kinds: `blend { clip, duration, easing? }`, `layer { index, clip?,
+weight?, fade, easing?, mode?, mask? }`, `speed { value }`, `cue { name }`.
+A `layer` step's `easing` is the layer's `fade_easing` (linear when omitted);
+a `blend` step's is the animator's `blend_easing` (when omitted the crossfade
+eases as that already says). Either is one of `linear`, `smooth`, `ease_in`,
+`ease_out`, `ease_in_out`, and a name that is none of them is a load error
+naming the file and the step: `animations/wave.sequence.toml: event 3 (the
+layer step at 2.5 s): no easing `wobbly`; one of linear, smooth, ease_in,
+ease_out, ease_in_out`. Events are sorted by time
 (stable, so same-time events keep authored order) and each fires exactly once
 when the playhead reaches its time. Sequences run before the
 skeletal tier each frame, so their writes land the same frame.
@@ -427,18 +452,23 @@ drift. `flint render` runs the pass once before its frame.
 
 ## Animator Schema
 
-The `animator` component controls playback for both tiers:
+The `animator` component controls playback for every kind of clip, and each
+kind follows it by the same rules: a property clip, a node clip and a skinned
+clip all cut to a new `clip`, pause and resume on `playing`, replay a finished
+one-shot and keep an `autoplay` going. (`blend_target` and `layers` are
+composed only on skinned models.)
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `clip` | string | "" | Current animation clip name |
-| `playing` | bool | false | Whether the animation is playing |
+| `clip` | string | "" | Current animation clip name. Writing a new one cuts to it from its start; the engine writes the clip a crossfade lands on |
+| `playing` | bool | false | Whether the clip is playing: `false` holds the current frame, `true` resumes (and replays a finished one-shot). The engine sets it `false` when a one-shot ends, and `true` when `autoplay` starts a clip |
 | `autoplay` | bool | false | Start playing on scene load |
 | `loop` | bool | true | Loop when the clip ends |
 | `speed` | f32 | 1.0 | Playback speed (-10.0 to 10.0) |
 | `blend_target` | string | "" | Clip to crossfade into (cleared by the engine when the fade completes) |
 | `blend_duration` | f32 | 0.3 | Crossfade duration in seconds |
-| `layers` | array of tables | [] | Animation layers `{ clip, weight, mode, mask, speed, fade_target, fade_duration }`, composed in order |
+| `blend_easing` | enum | (linear) | How a crossfade's weight moves: `linear`, `smooth`, `ease_in`, `ease_out` or `ease_in_out`; read when a crossfade starts |
+| `layers` | array of tables | [] | Animation layers `{ clip, weight, mode, mask, speed, fade_target, fade_duration, fade_easing }`, composed in order |
 | `sequence` | string | "" | Name of a `*.sequence.toml` from the scene's `animations/` directory driving this animator. Set by `play_sequence()`, cleared by the engine when a non-looping sequence finishes |
 | `layer_clip` | string | "" | Legacy alias for `layers[0]` (additive, unmasked) |
 | `layer_weight` | f32 | 1.0 | Legacy alias for `layers[0].weight` |
@@ -458,14 +488,16 @@ Animations can be controlled from [Rhai scripts](scripting.md) by writing direct
 
 | Function | Description |
 |----------|-------------|
-| `play_clip(entity_id, clip_name)` | Start playing a named animation clip |
-| `stop_clip(entity_id)` | Stop the current animation |
-| `blend_to(entity_id, clip, duration)` | Crossfade to another clip over the given duration |
+| `play_clip(entity_id, clip_name)` | Play a named clip: a new clip cuts to its start (cancelling a crossfade), a stopped one resumes, a finished one-shot replays |
+| `stop_clip(entity_id)` | Pause the clip on its current frame (layers keep their own clocks) |
+| `blend_to(entity_id, clip, duration)` | Crossfade to another clip over the given duration, eased as `blend_easing` says |
+| `blend_to(entity_id, clip, duration, easing)` | The same, eased: `linear`, `smooth`, `ease_in`, `ease_out` or `ease_in_out` (written as `blend_easing`, so later crossfades keep it) |
 | `set_anim_speed(entity_id, speed)` | Set animation playback speed |
 | `set_anim_layer(entity_id, index, clip, weight)` | Play `clip` on a layer (additive, unmasked) |
 | `set_anim_layer(entity_id, index, clip, weight, #{mode, mask})` | Same with a `mode` (`"additive"`/`"override"`) and a root-joint `mask` |
 | `set_anim_layer_weight(entity_id, index, weight)` | Set a layer's weight instantly (cancels a fade) |
 | `fade_anim_layer(entity_id, index, weight, seconds)` | Ramp a layer's weight over `seconds` |
+| `fade_anim_layer(entity_id, index, weight, seconds, easing)` | The same, eased: `linear`, `smooth`, `ease_in`, `ease_out` or `ease_in_out` |
 | `clear_anim_layer(entity_id, index)` | Leave an inactive slot |
 | `play_sequence(entity_id, name)` / `stop_sequence(entity_id)` | Drive the animator from a `*.sequence.toml` |
 | `on_sequence_cue(sequence, cue)` | Callback: a sequence passed a `cue` event |

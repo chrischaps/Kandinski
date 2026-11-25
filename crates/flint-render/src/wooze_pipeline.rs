@@ -14,29 +14,26 @@
 //! Normals aren't bent: at a few centimetres over a metre, it's about a degree or
 //! two of shading for three times the noise.
 
+use crate::gpu_counts::CountedDevice;
+use crate::TrustedShader;
 use bytemuck::{Pod, Zeroable};
 
 use crate::pipeline::{BlendMode, RenderPipeline, ADDITIVE_BLEND, MULTIPLY_BLEND};
 use crate::primitives::{SkinnedVertex, Vertex};
 use crate::skinned_pipeline::SkinnedPipeline;
 
-/// The shallow wooze vertex stages, with the noise they share.
-pub(crate) const VERTEX_SOURCE: &str = concat!(
-    include_str!("wooze_noise.wgsl"),
-    "\n",
-    include_str!("wooze_vertex.wgsl")
-);
+/// The shallow wooze vertex stages, with the noise they share and the
+/// meshes' vertex products, drift on (`wgsl_sources::wooze_vertex`, #1244).
+fn vertex_source() -> String {
+    crate::wgsl_sources::wooze_vertex()
+}
 
 /// The shadow pass's, with the same noise, so a shadow moves with what casts it.
-pub(crate) const SHADOW_SOURCE: &str = concat!(
-    include_str!("wooze_noise.wgsl"),
-    "\n",
-    include_str!("wooze_shadow_shader.wgsl")
-);
+pub(crate) const SHADOW_SOURCE: &str = crate::wgsl_sources::WOOZE_SHADOW;
 
-/// The shortest wavelength, in metres. Under this it stops reading as drift and
-/// starts tearing a mesh's triangles apart.
-pub const WAVELENGTH_MIN: f32 = 0.05;
+/// What a host hands over for each woozy entity (`FrameInputs::shallow_wooze`)
+/// is plain data in the core (#1330), so the renderer links nothing of the field.
+pub use flint_core::field_frame::{ShallowWoozeDraw, WAVELENGTH_MIN};
 
 /// How far the noise's domain is wrapped, in lattice cells: far more than the
 /// jump between targets, and small enough to keep its precision in an `f32`.
@@ -52,23 +49,13 @@ fn domain_offset(index: u64) -> [f32; 3] {
     [at(G), at(G * G), at(G * G * G)]
 }
 
-/// What one entity's draws do this frame.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct ShallowWoozeDraw {
-    /// Metres at full swing on each axis: what's authored, times the field's
-    /// amplitude where the entity stands.
-    pub amplitude: f32,
-    /// Metres from one swell of the noise to the next. Far above the mesh's size it
-    /// moves as a whole; near it, it changes shape.
-    pub wavelength: f32,
-    /// The target being held or left.
-    pub index: u64,
-    /// How far toward the next target, 0 to 1.
-    pub weight: f32,
+/// A draw's drift as the wooze shaders take it.
+pub(crate) trait DriftUniforms {
+    fn uniforms(&self) -> ShallowWoozeUniforms;
 }
 
-impl ShallowWoozeDraw {
-    pub(crate) fn uniforms(&self) -> ShallowWoozeUniforms {
+impl DriftUniforms for ShallowWoozeDraw {
+    fn uniforms(&self) -> ShallowWoozeUniforms {
         let [ax, ay, az] = domain_offset(self.index);
         let [bx, by, bz] = domain_offset(self.index.wrapping_add(1));
         ShallowWoozeUniforms {
@@ -136,13 +123,13 @@ impl Stages<'_> {
         cull_mode: Option<wgpu::Face>,
         depth_write_enabled: bool,
     ) -> wgpu::RenderPipeline {
-        device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        device.create_render_pipeline_counted(&wgpu::RenderPipelineDescriptor {
             label: Some(self.label),
             layout: Some(self.layout),
             vertex: wgpu::VertexState {
                 module: self.vertex_module,
                 entry_point: Some(self.vertex_entry),
-                buffers: std::slice::from_ref(&self.vertex_layout),
+                buffers: &[Some(self.vertex_layout.clone())],
                 compilation_options: Default::default(),
             },
             fragment: Some(wgpu::FragmentState {
@@ -166,8 +153,8 @@ impl Stages<'_> {
             },
             depth_stencil: Some(wgpu::DepthStencilState {
                 format: wgpu::TextureFormat::Depth32Float,
-                depth_write_enabled,
-                depth_compare: wgpu::CompareFunction::Less,
+                depth_write_enabled: Some(depth_write_enabled),
+                depth_compare: Some(wgpu::CompareFunction::Less),
                 stencil: wgpu::StencilState::default(),
                 bias: wgpu::DepthBiasState::default(),
             }),
@@ -175,7 +162,7 @@ impl Stages<'_> {
                 count: self.sample_count,
                 ..Default::default()
             },
-            multiview: None,
+            multiview_mask: None,
             cache: None,
         })
     }
@@ -193,10 +180,12 @@ impl Stages<'_> {
     }
 }
 
-fn vertex_module(device: &wgpu::Device) -> wgpu::ShaderModule {
-    device.create_shader_module(wgpu::ShaderModuleDescriptor {
+/// The module of [`vertex_source`]: `vs_wooze` and `vs_skinned_wooze`. The
+/// veils pair them with their own fragment stages too (#1241).
+pub(crate) fn vertex_module(device: &wgpu::Device) -> wgpu::ShaderModule {
+    device.create_trusted_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("Shallow Wooze Vertex Shader"),
-        source: wgpu::ShaderSource::Wgsl(VERTEX_SOURCE.into()),
+        source: wgpu::ShaderSource::Wgsl(vertex_source().into()),
     })
 }
 
@@ -296,16 +285,16 @@ mod tests {
 
     #[test]
     fn the_shaders_validate() {
-        validated(VERTEX_SOURCE, "wooze_vertex.wgsl");
+        validated(&vertex_source(), "wooze_vertex.wgsl");
         validated(SHADOW_SOURCE, "wooze_shadow_shader.wgsl");
     }
 
     /// The variants hand their outputs to fragment stages they don't own.
     #[test]
     fn a_woozy_vertex_stage_hands_over_what_its_plain_twin_does() {
-        let woozy = validated(VERTEX_SOURCE, "wooze_vertex.wgsl");
-        let plain = naga::front::wgsl::parse_str(include_str!("shader.wgsl")).unwrap();
-        let skinned = naga::front::wgsl::parse_str(include_str!("skinned_shader.wgsl")).unwrap();
+        let woozy = validated(&vertex_source(), "wooze_vertex.wgsl");
+        let plain = naga::front::wgsl::parse_str(crate::wgsl_sources::SCENE).unwrap();
+        let skinned = naga::front::wgsl::parse_str(crate::wgsl_sources::SKINNED).unwrap();
         assert_eq!(
             entry_stage_io(&woozy, "vs_wooze"),
             entry_stage_io(&plain, "vs_main")
@@ -406,45 +395,42 @@ mod tests {
         color: wgpu::Texture,
         color_view: wgpu::TextureView,
         depth_view: wgpu::TextureView,
+        /// The binary's shared device, held while the rig lives (#1275).
+        _gpu: crate::shared_gpu::Lease,
     }
 
     fn rig() -> Option<Rig> {
-        pollster::block_on(async {
-            let instance = crate::gpu_select::instance();
-            let adapter = crate::gpu_select::request_adapter(&instance, None).await?;
-            let (device, queue) = adapter
-                .request_device(&wgpu::DeviceDescriptor::default(), None)
-                .await
-                .ok()?;
-            let target = |format, usage| {
-                device.create_texture(&wgpu::TextureDescriptor {
-                    label: None,
-                    size: wgpu::Extent3d {
-                        width: SIZE,
-                        height: SIZE,
-                        depth_or_array_layers: 1,
-                    },
-                    mip_level_count: 1,
-                    sample_count: 1,
-                    dimension: wgpu::TextureDimension::D2,
-                    format,
-                    usage,
-                    view_formats: &[],
-                })
-            };
-            let attach = wgpu::TextureUsages::RENDER_ATTACHMENT;
-            let color = target(FORMAT, attach | wgpu::TextureUsages::COPY_SRC);
-            let depth = target(
-                wgpu::TextureFormat::Depth32Float,
-                attach | wgpu::TextureUsages::TEXTURE_BINDING,
-            );
-            Some(Rig {
-                color_view: color.create_view(&Default::default()),
-                depth_view: depth.create_view(&Default::default()),
-                color,
-                device,
-                queue,
+        let gpu = crate::shared_gpu::lease()?;
+        let (device, queue) = (gpu.gpu.device.clone(), gpu.gpu.queue.clone());
+        let target = |format, usage| {
+            device.create_texture_counted(&wgpu::TextureDescriptor {
+                label: None,
+                size: wgpu::Extent3d {
+                    width: SIZE,
+                    height: SIZE,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format,
+                usage,
+                view_formats: &[],
             })
+        };
+        let attach = wgpu::TextureUsages::RENDER_ATTACHMENT;
+        let color = target(FORMAT, attach | wgpu::TextureUsages::COPY_SRC);
+        let depth = target(
+            wgpu::TextureFormat::Depth32Float,
+            attach | wgpu::TextureUsages::TEXTURE_BINDING,
+        );
+        Some(Rig {
+            color_view: color.create_view(&Default::default()),
+            depth_view: depth.create_view(&Default::default()),
+            color,
+            device,
+            queue,
+            _gpu: gpu,
         })
     }
 
@@ -463,17 +449,27 @@ mod tests {
     impl Rig {
         /// Draw a frame and read it back, tightly packed.
         fn image(&self, renderer: &mut SceneRenderer, world: &FlintWorld) -> Vec<u8> {
+            self.image_from(renderer, world, &Camera::default())
+        }
+
+        /// [`image`](Self::image) through `camera`.
+        fn image_from(
+            &self,
+            renderer: &mut SceneRenderer,
+            world: &FlintWorld,
+            camera: &Camera,
+        ) -> Vec<u8> {
             renderer.update_from_world(world, &self.device);
             renderer.render_to(
                 &self.device,
                 &self.queue,
                 &self.depth_view,
-                &Camera::default(),
+                camera,
                 &self.color_view,
             );
             let row = (SIZE * 4).div_ceil(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT)
                 * wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
-            let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            let buffer = self.device.create_buffer_counted(&wgpu::BufferDescriptor {
                 label: None,
                 size: (row * SIZE) as u64,
                 usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
@@ -482,9 +478,9 @@ mod tests {
             let mut encoder = self.device.create_command_encoder(&Default::default());
             encoder.copy_texture_to_buffer(
                 self.color.as_image_copy(),
-                wgpu::ImageCopyBuffer {
+                wgpu::TexelCopyBufferInfo {
                     buffer: &buffer,
-                    layout: wgpu::ImageDataLayout {
+                    layout: wgpu::TexelCopyBufferLayout {
                         offset: 0,
                         bytes_per_row: Some(row),
                         rows_per_image: None,
@@ -500,8 +496,11 @@ mod tests {
             buffer
                 .slice(..)
                 .map_async(wgpu::MapMode::Read, |r| r.unwrap());
-            self.device.poll(wgpu::Maintain::Wait);
-            let data = buffer.slice(..).get_mapped_range();
+            let _ = crate::wait_for_gpu(&self.device);
+            let data = buffer
+                .slice(..)
+                .get_mapped_range()
+                .expect("mapped buffer range");
             let mut out = Vec::with_capacity((SIZE * SIZE * 4) as usize);
             for y in 0..SIZE {
                 let start = (row * y) as usize;
@@ -693,6 +692,84 @@ mod tests {
         }
     }
 
+    /// A woozy pane of glass in fog (#1241). The composite fogs a translucent
+    /// draw at the depth the fog veil gives it, and the veil redraws it, so the
+    /// veil has to move it as the main pass did: at its rest pose the pane was
+    /// fogged as the far ground behind where it was drawn, and a fogless ghost
+    /// of it hung where it had drifted from. Now it reads exactly as a plain
+    /// pane moved there by hand, as `tests/runtime_mesh.rs`'s
+    /// `a_translucent_draw_is_fogged_at_its_own_depth` fogs one.
+    #[test]
+    fn a_woozy_translucent_is_fogged_where_it_is_drawn() {
+        let rig = rig_or_skip!();
+        const FOG: [f32; 3] = [0.30, 0.34, 0.42];
+        let mut renderer = SceneRenderer::new_headless(
+            &rig.device,
+            &rig.queue,
+            FORMAT,
+            SIZE,
+            SIZE,
+            RendererConfig::default(),
+        );
+        renderer.set_clear_color([FOG[0], FOG[1], FOG[2], 1.0]);
+        renderer.set_ambient([0.0; 3], [0.0; 3]);
+        // 4 m over dark ground, looking at its far edge, 3 m from a pane
+        // standing across the view
+        let camera = Camera {
+            position: flint_core::Vec3::new(0.0, 4.0, 6.0),
+            target: flint_core::Vec3::new(0.0, 4.0, 0.0),
+            aspect: 1.0,
+            ..Camera::default()
+        };
+        let (ground, indices) = square(40.0);
+        renderer.load_procedural_mesh(&rig.device, "ground", &ground, &indices, material("ground"));
+        let v = |x: f32, y: f32| MeshVertex {
+            position: [x, y, 0.0],
+            normal: [0.0, 0.0, 1.0],
+            color: [1.0, 0.45, 0.1, 1.0],
+            uv: [0.0, 0.0],
+        };
+        let pane = [v(-1.0, 0.5), v(1.0, 0.5), v(1.0, 8.0), v(-1.0, 8.0)];
+        let both_faces = [0, 1, 2, 0, 2, 3, 0, 2, 1, 0, 3, 2];
+        renderer.load_procedural_mesh(&rig.device, "pane", &pane, &both_faces, material("pane"));
+        let mut world = FlintWorld::new();
+        let spawn = |world: &mut FlintWorld, name: &str, at: [f32; 3]| {
+            let id = world.spawn(name).unwrap();
+            place(world, id, at);
+            let mut model = toml::Table::new();
+            model.insert("asset".into(), name.into());
+            model.insert("runtime".into(), true.into());
+            world.set_component(id, "model", model.into()).unwrap();
+            id
+        };
+        spawn(&mut world, "ground", [0.0; 3]);
+        let rest = [0.0_f32, 0.0, 3.0];
+        let glass = spawn(&mut world, "pane", rest);
+        let mut look = toml::Table::new();
+        look.insert("opacity".into(), 0.4.into());
+        world.set_component(glass, "material", look.into()).unwrap();
+        let mut config = renderer.post_process_config().clone();
+        config.fog_enabled = true;
+        config.fog_color = FOG;
+        config.fog_density = 0.09;
+        config.fog_start = 4.0;
+        renderer.set_post_process_config(config);
+
+        let (draw, moved) = whole_sheet_draw();
+        let still = rig.image_from(&mut renderer, &world, &camera);
+        let by_hand: [f32; 3] = std::array::from_fn(|i| rest[i] + moved[i]);
+        place(&mut world, glass, by_hand);
+        let moved_by_hand = rig.image_from(&mut renderer, &world, &camera);
+        place(&mut world, glass, rest);
+        renderer.set_shallow_wooze([(glass, draw)]);
+        let woozy = rig.image_from(&mut renderer, &world, &camera);
+
+        let told_apart = differing(&still, &moved_by_hand);
+        assert!(told_apart > 200, "only {told_apart} pixels moved");
+        let off = differing(&woozy, &moved_by_hand);
+        assert!(off <= 6, "{off} of {told_apart} pixels fogged off");
+    }
+
     #[test]
     fn at_no_amplitude_the_variant_draws_what_the_plain_pipeline_does() {
         let rig = rig_or_skip!();
@@ -737,7 +814,7 @@ mod tests {
 
         // Naming something with no draws builds nothing either.
         let draw = whole_sheet_draw().0;
-        renderer.set_shallow_wooze([(EntityId::new(), draw)]);
+        renderer.set_shallow_wooze([(EntityId::from_raw(1), draw)]);
         rig.image(&mut renderer, &world);
         assert_eq!(renderer.wooze_built(), (false, false, false));
 

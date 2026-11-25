@@ -57,7 +57,9 @@ use crate::user_files;
 use flint_core::project::Project;
 use flint_core::vfs;
 use flint_runtime::{check_slot_name, SaveBackend, SaveText, DEFAULT_SLOT};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, MutexGuard};
 use web_time::Instant;
 
 use super::PlayerApp;
@@ -162,7 +164,7 @@ fn web_suffix(game_id: &str) -> String {
 /// can't be one. An id is whatever the manifest says, so it is checked
 /// here rather than trusted: letters, digits, `_`, `-`, `.` and spaces, no
 /// leading dot, no trailing dot or space, none of Windows' device names.
-fn user_folder_name(id: &str) -> Result<&str, String> {
+pub(super) fn user_folder_name(id: &str) -> Result<&str, String> {
     let name = id.trim();
     let ok_char = |c: char| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | ' ');
     if name.is_empty() || name.len() > 64 {
@@ -189,7 +191,7 @@ fn user_folder_name(id: &str) -> Result<&str, String> {
 
 /// The id saves are keyed on: the manifest's, else the input config's
 /// `game_id` when a game set one (`flint` is the engine's default).
-fn save_id<'a>(project: &'a Project, input_game_id: &'a str) -> Option<&'a str> {
+pub(super) fn save_id<'a>(project: &'a Project, input_game_id: &'a str) -> Option<&'a str> {
     let input = Some(input_game_id.trim()).filter(|id| !id.is_empty() && *id != "flint");
     project.id.as_deref().or(input)
 }
@@ -379,6 +381,66 @@ impl SaveBackend for SaveFiles {
     }
 }
 
+/// A playtest's slots (#714, #1193): kept in memory for the run, so a
+/// script can switch slots and `persist_save()` and nothing is read from
+/// or written to the player's saves. The default slot can begin as a file's
+/// text (`--save-from`), read once before the run and handed over here:
+/// that file is never read again, written or set aside. A seed that doesn't
+/// parse is set aside in memory, so scripts see `persist_corrupt()` as they
+/// would in play, with the file left where it is.
+pub(super) struct MemorySaves {
+    /// Each slot's text and where it came from, by slot.
+    slots: Mutex<BTreeMap<String, (String, String)>>,
+}
+
+impl MemorySaves {
+    pub(super) fn new(seed: Option<SaveText>) -> Self {
+        let mut slots = BTreeMap::new();
+        if let Some(seed) = seed {
+            slots.insert(DEFAULT_SLOT.to_string(), (seed.text, seed.from));
+        }
+        Self {
+            slots: Mutex::new(slots),
+        }
+    }
+
+    fn held(&self) -> MutexGuard<'_, BTreeMap<String, (String, String)>> {
+        self.slots.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+impl SaveBackend for MemorySaves {
+    fn read(&self, slot: &str) -> Result<Option<SaveText>, String> {
+        Ok(self.held().get(slot).map(|(text, from)| SaveText {
+            text: text.clone(),
+            from: from.clone(),
+            old_place: false,
+        }))
+    }
+
+    fn write(&self, slot: &str, text: &str) -> Result<(), String> {
+        self.held()
+            .insert(slot.to_string(), (text.to_string(), self.place(slot)));
+        Ok(())
+    }
+
+    fn set_aside(&self, slot: &str) -> Result<String, String> {
+        // Out of the slot's way, as a file is renamed `.bak` in play
+        let Some((_, from)) = self.held().remove(slot) else {
+            return Err(format!("nothing is saved for slot '{slot}'"));
+        };
+        Ok(format!("{from}.bak (in memory; the file is left as it is)"))
+    }
+
+    fn slots(&self) -> Vec<String> {
+        self.held().keys().cloned().collect()
+    }
+
+    fn place(&self, slot: &str) -> String {
+        format!("memory:{slot}")
+    }
+}
+
 impl PlayerApp {
     /// Decide where this run's saves are kept, tell the store, and read
     /// the default slot. A missing file is not an error and creates
@@ -387,6 +449,22 @@ impl PlayerApp {
     /// saved over.
     pub(super) fn load_persistent_store(&mut self) {
         self.refresh_project();
+        if self.launch.saves_in_memory {
+            // Slots in memory: nothing on disk is read but the seed, which
+            // was read before the run, and nothing is written anywhere
+            self.core
+                .store
+                .set_game_version(self.core.project.save_version);
+            let saves = MemorySaves::new(self.launch.save_seed.clone());
+            tracing::info!("persist: saves are kept in memory for this run");
+            self.core.store.set_backend(Box::new(saves));
+            let loaded = self.core.store.load();
+            // A corrupt seed is what such a run is for, not an error of
+            // the run: the playtest's report says what the load found
+            tracing::info!("persist: {loaded}");
+            self.saves.loaded = Some(loaded);
+            return;
+        }
         let files = SaveFiles::locate(
             &self.core.project,
             &self.core.scene_path,
@@ -416,7 +494,16 @@ impl PlayerApp {
             self.core.store.mark_clean();
             return;
         }
-        match self.core.store.save() {
+        // The write is on the frame thread (temp file, `sync_all`, rename:
+        // 4 to 70 ms here), so a hitch it makes names it (#1119)
+        let saved = {
+            let _note =
+                flint_core::frame_notes::begin(flint_core::frame_notes::NoteKind::Save, || {
+                    reason.to_string()
+                });
+            self.core.store.save()
+        };
+        match saved {
             Ok(place) => {
                 self.saves.error = None;
                 tracing::info!(
@@ -448,10 +535,19 @@ impl PlayerApp {
         if self.core.store.is_dirty() {
             self.saves.debounce.note_dirty(now);
         }
-        let force = force || self.core.store.take_flush_request();
-        if self.saves.debounce.should_flush(now, force) {
+        let asked = self.core.store.take_flush_request();
+        // A script's `persist_save()` is named as such, in the log line and
+        // the frame note, rather than as the debounce it rode in on
+        let reason = if asked && !force {
+            "persist_save"
+        } else {
+            reason
+        };
+        if self.saves.debounce.should_flush(now, force || asked) {
             self.save_persistent_store(reason);
         }
+        // The player's bus volumes ride the same three moments (#1217)
+        self.flush_user_audio(force);
     }
 }
 
@@ -741,6 +837,7 @@ mod tests {
     /// Every file under `dir`, as a path from it with forward slashes, and
     /// its text.
     fn files_under(dir: &Path) -> Vec<(String, String)> {
+        #[allow(clippy::disallowed_methods)] // a test reads its own files off the disk
         fn walk(dir: &Path, base: &Path, out: &mut Vec<(String, String)>) {
             let Ok(entries) = std::fs::read_dir(dir) else {
                 return;
@@ -941,6 +1038,7 @@ fn on_init() {
     /// the slot's. The hard link is a second name for the old file's bytes;
     /// a write through the save path would change what it reads.
     #[test]
+    #[allow(clippy::disallowed_methods)] // a test reads its own files off the disk
     fn the_players_save_is_a_temp_file_renamed_over_the_old_one() {
         if flint_core::project::overridden().is_some() {
             return;
@@ -981,6 +1079,7 @@ fn on_init() {
     /// directory, the old file is left as it was, and the next run reads
     /// the new one.
     #[test]
+    #[allow(clippy::disallowed_methods)] // a test reads its own files off the disk
     fn the_player_reads_each_old_place_once_and_saves_to_the_user_directory() {
         if flint_core::project::overridden().is_some() {
             return;
@@ -1031,6 +1130,7 @@ fn on_init() {
     /// `--save-dir` is the whole answer: nothing is read from the project
     /// or the user directory, and nothing is written to either.
     #[test]
+    #[allow(clippy::disallowed_methods)] // a test reads its own files off the disk
     fn save_dir_overrides_everything() {
         if flint_core::project::overridden().is_some() {
             return;
@@ -1191,6 +1291,78 @@ fn on_init() {
                     "gold = 0\n\n[meta]\nversion = 2\n".to_string()
                 ),
             ]
+        );
+        let _ = std::fs::remove_dir_all(root.parent().unwrap());
+    }
+
+    /// #1119: a script that sets a key to the value it holds every frame
+    /// (the Ruins' `zone_*_unlocked`) leaves the store clean, so nothing is
+    /// written, not even by a forced flush; a save that does happen leaves
+    /// a `save` frame note naming why, with its time.
+    #[test]
+    #[allow(clippy::disallowed_methods)] // a test reads its own files off the disk
+    fn re_setting_a_key_every_frame_writes_nothing_and_a_save_says_so() {
+        use flint_core::frame_notes::{self, NoteKind};
+        if flint_core::project::overridden().is_some() {
+            return;
+        }
+        let (root, user) = project_on_disk(
+            "reset_1119",
+            &[
+                ("flint.toml", "[project]\nid = \"kart\"\n"),
+                ("scenes/menu.scene.toml", SCENE),
+            ],
+        );
+        let saves = user.join("kart").join("saves");
+        std::fs::create_dir_all(&saves).unwrap();
+        let file = saves.join("default.toml");
+        std::fs::write(&file, "coins = 7\nunlocked = true\n").unwrap();
+        let written = || std::fs::metadata(&file).unwrap().modified().unwrap();
+        let before = written();
+
+        let mut app = app_at(&root.join("scenes/menu.scene.toml"), &user);
+        app.load_persistent_store();
+        let _log = attach_recording_script(
+            &mut app,
+            "reset_1119",
+            r#"
+fn on_update() {
+    persist_set("unlocked", true);
+    persist_set("coins", 7);
+}
+"#,
+        );
+        for _ in 0..30 {
+            app.tick();
+        }
+        assert!(!app.core.store.is_dirty(), "the same values are no change");
+        assert!(!app.saves.debounce.is_pending(), "no save is waiting");
+        // A frame's own begin sets listening by the recorder: listen after
+        let mut notes = Vec::new();
+        frame_notes::listen(true);
+        app.flush_persistent_store(true, "transition");
+        frame_notes::take(&mut notes);
+        assert!(
+            notes.iter().all(|n| n.kind != NoteKind::Save),
+            "nothing was saved: {notes:?}"
+        );
+        assert_eq!(written(), before, "the file was not written");
+
+        set_coins(&mut app, 8);
+        app.flush_persistent_store(true, "transition");
+        frame_notes::take(&mut notes);
+        frame_notes::listen(false);
+        let saves_noted: Vec<_> = notes.iter().filter(|n| n.kind == NoteKind::Save).collect();
+        assert_eq!(saves_noted.len(), 1, "{notes:?}");
+        assert_eq!(saves_noted[0].detail, "transition");
+        assert!(saves_noted[0].ms.is_some(), "the write is timed");
+        assert_eq!(
+            saves_noted[0].to_string().split(',').next(),
+            Some("save transition")
+        );
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            "coins = 8\nunlocked = true\n"
         );
         let _ = std::fs::remove_dir_all(root.parent().unwrap());
     }

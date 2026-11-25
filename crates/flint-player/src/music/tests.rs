@@ -79,6 +79,7 @@ fn probe(game: &HeadlessGame, field: &str) -> toml::Value {
 }
 
 #[test]
+#[allow(clippy::disallowed_methods)] // a test asserts on the TOML exactly as written
 fn a_script_reads_the_beat_and_bar_of_a_suite_with_no_chart() {
     let (dir, scene) = project("beat");
     let mut world = FlintWorld::new();
@@ -86,7 +87,7 @@ fn a_script_reads_the_beat_and_bar_of_a_suite_with_no_chart() {
     world
         .set_component(
             id,
-            flint_core::components::MUSIC_SESSION,
+            flint_music::components::MUSIC_SESSION,
             table(&[("manifest", "music/probe.suite.toml".into())]),
         )
         .unwrap();
@@ -106,6 +107,13 @@ fn a_script_reads_the_beat_and_bar_of_a_suite_with_no_chart() {
         .unwrap();
     let project = flint_core::project::Project::for_scene(std::path::Path::new(&scene));
     let mut game = HeadlessGame::new(world, &scene, project);
+    game.start_subsystems(
+        Default::default(),
+        crate::CaptureStart {
+            scripts: true,
+            ..Default::default()
+        },
+    );
     game.start_scripts(true, None, (320.0, 180.0), &PostProcessConfig::default());
     let mut camera = Camera::new();
 

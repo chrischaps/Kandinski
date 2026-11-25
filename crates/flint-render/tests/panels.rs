@@ -5,6 +5,8 @@
 //!
 //! These need a GPU adapter. Without one each test prints a note and passes.
 
+#![allow(clippy::disallowed_methods)] // the test's own targets and read-backs, not the renderer's, so uncounted (#1091)
+
 mod shared_gpu;
 
 use flint_ecs::FlintWorld;
@@ -25,9 +27,10 @@ struct Gpu {
     _lease: shared_gpu::Lease,
 }
 
-/// The shared device (#598) alone: frames are drawn in an error scope.
+/// The shared device (#598), alongside the other tests holding it. Frames
+/// are drawn in an error scope, which since wgpu 28 is this thread's alone.
 fn gpu() -> Option<Gpu> {
-    let lease = shared_gpu::lease_alone()?;
+    let lease = shared_gpu::lease()?;
     let shared = lease.gpu;
     let device = &shared.device;
     let target = |format, usage| {
@@ -154,8 +157,13 @@ const TWO: &str = r#"
 
 impl Gpu {
     fn frame(&self, renderer: &mut SceneRenderer, world: &FlintWorld) -> Vec<u8> {
-        self.device.push_error_scope(wgpu::ErrorFilter::Validation);
-        renderer.update_from_world(world, self.device);
+        let scope = self.device.push_error_scope(wgpu::ErrorFilter::Validation);
+        renderer.prepare(
+            self.device,
+            self.queue,
+            world,
+            &flint_render::FrameInputs::default(),
+        );
         renderer.render_frame_to(
             self.device,
             self.queue,
@@ -165,7 +173,7 @@ impl Gpu {
             Some(world),
         );
         let pixels = self.read();
-        if let Some(e) = pollster::block_on(self.device.pop_error_scope()) {
+        if let Some(e) = pollster::block_on(scope.pop()) {
             panic!("validation error: {e}");
         }
         pixels
@@ -183,9 +191,9 @@ impl Gpu {
         let mut encoder = self.device.create_command_encoder(&Default::default());
         encoder.copy_texture_to_buffer(
             self.color.as_image_copy(),
-            wgpu::ImageCopyBuffer {
+            wgpu::TexelCopyBufferInfo {
                 buffer: &buffer,
-                layout: wgpu::ImageDataLayout {
+                layout: wgpu::TexelCopyBufferLayout {
                     offset: 0,
                     bytes_per_row: Some(row),
                     rows_per_image: None,
@@ -201,8 +209,11 @@ impl Gpu {
         buffer
             .slice(..)
             .map_async(wgpu::MapMode::Read, |r| r.unwrap());
-        self.device.poll(wgpu::Maintain::Wait);
-        let data = buffer.slice(..).get_mapped_range();
+        let _ = flint_render::wait_for_gpu(&self.device);
+        let data = buffer
+            .slice(..)
+            .get_mapped_range()
+            .expect("mapped buffer range");
         let mut out = Vec::with_capacity((W * H * 4) as usize);
         for y in 0..H {
             let at = (row * y) as usize;
@@ -222,8 +233,8 @@ fn frame_camera() -> Camera {
 
 /// `FLINT_PANELS_DUMP=<dir>` writes a frame there, to look at a failure.
 fn dump(name: &str, frame: &[u8]) {
-    if let Ok(dir) = std::env::var("FLINT_PANELS_DUMP") {
-        let path = std::path::Path::new(&dir).join(format!("{name}.png"));
+    if let Some(dir) = flint_core::env::PANELS_DUMP.path() {
+        let path = dir.join(format!("{name}.png"));
         image::save_buffer(path, frame, W, H, image::ColorType::Rgba8).unwrap();
     }
 }

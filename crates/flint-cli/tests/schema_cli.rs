@@ -4,7 +4,7 @@
 //! - `flint schema --list --json` names every component and archetype of
 //!   the schema directories, and a name that is neither exits non-zero.
 //! - `flint schema --format json-schema` emits a JSON Schema that every
-//!   scene under `examples/` validates against (and that a scene with a
+//!   frozen scene under `tests/fixtures/scenes/` validates against (and that a scene with a
 //!   mistake does not), checked with a JSON Schema validator.
 //! - `flint validate` fails on `ik_two_bone.target = "nope"`, naming the
 //!   field, and on a model that isn't there, listing the paths tried.
@@ -44,10 +44,21 @@ fn json(out: &Output) -> serde_json::Value {
     serde_json::from_str(&stdout(out)).unwrap_or_else(|e| panic!("{e}\n{}", stdout(out)))
 }
 
-/// The names under `[<header>.<name>]` in every file of the two layers.
+/// The directories the root `flint.toml` resolves to: the engine's
+/// `schemas`, each package's (#1332, brought by it), the examples' layer.
+fn layers() -> Vec<String> {
+    let mut dirs = vec!["schemas".to_string()];
+    for (package, _) in flint_core::project::package_schema_dirs(&repo().join("schemas")) {
+        dirs.push(format!("packages/{package}/schemas"));
+    }
+    dirs.push("schemas/examples".to_string());
+    dirs
+}
+
+/// The names under `[<header>.<name>]` in every file of the layers.
 fn declared(kind: &str, header: &str) -> BTreeSet<String> {
     let mut names = BTreeSet::new();
-    for dir in ["schemas", "schemas/examples"] {
+    for dir in layers() {
         let Ok(entries) = std::fs::read_dir(repo().join(dir).join(kind)) else {
             continue;
         };
@@ -67,6 +78,36 @@ fn declared(kind: &str, header: &str) -> BTreeSet<String> {
     names
 }
 
+/// The fields under `[component.<name>.fields]` in every file of the two
+/// layers, sorted as `--list --json` sorts them. Read from the files, never
+/// written out here: a list copied into this test went stale when #729 gave
+/// `collider` three fields, and the test stayed red on main for four days
+/// (#1285).
+fn declared_fields(name: &str) -> Vec<String> {
+    let mut fields = BTreeSet::new();
+    for dir in layers() {
+        let Ok(entries) = std::fs::read_dir(repo().join(dir).join("components")) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().is_some_and(|e| e == "toml") {
+                let doc: toml::Table = std::fs::read_to_string(&path).unwrap().parse().unwrap();
+                fields.extend(
+                    doc.get("component")
+                        .and_then(|t| t.get(name))
+                        .and_then(|t| t.get("fields"))
+                        .and_then(|t| t.as_table())
+                        .into_iter()
+                        .flat_map(|t| t.keys().cloned()),
+                );
+            }
+        }
+    }
+    assert!(!fields.is_empty(), "no file declares `{name}`'s fields");
+    fields.into_iter().collect()
+}
+
 fn names_in(list: &serde_json::Value, key: &str) -> BTreeSet<String> {
     list[key]
         .as_array()
@@ -84,10 +125,7 @@ fn list_json_names_every_component_and_archetype() {
     assert!(components.len() > 40 && archetypes.len() > 5);
     assert_eq!(names_in(&list, "components"), components);
     assert_eq!(names_in(&list, "archetypes"), archetypes);
-    assert_eq!(
-        list["schema_dirs"],
-        serde_json::json!(["schemas", "schemas/examples"])
-    );
+    assert_eq!(list["schema_dirs"], serde_json::json!(layers()));
     // `--format json` is the same flag
     assert_eq!(
         list,
@@ -105,24 +143,16 @@ fn list_json_names_every_component_and_archetype() {
             .clone()
     };
     assert_eq!(find("material_overrides")["open"], true);
-    // ...and `collider`, open until #792 moved its fields under `fields`
+    // ...and `collider`, open until #792 moved its fields under `fields`.
+    // Each names what its files declare, every one, sorted
     assert_eq!(find("collider")["open"], false);
-    assert_eq!(
-        find("collider")["fields"],
-        serde_json::json!([
-            "friction",
-            "is_sensor",
-            "offset",
-            "restitution",
-            "rotation",
-            "shape",
-            "size"
-        ])
-    );
-    assert_eq!(
-        find("ik_two_bone")["fields"],
-        serde_json::json!(["enabled", "pole", "target", "tip", "weight"])
-    );
+    for name in ["collider", "ik_two_bone"] {
+        assert_eq!(
+            find(name)["fields"],
+            serde_json::json!(declared_fields(name)),
+            "`{name}`'s fields"
+        );
+    }
 
     // The text list has the same names
     let text = stdout(&flint(&["schema", "--list"]));
@@ -217,8 +247,8 @@ fn the_json_schema_validates_every_example_scene() {
         .unwrap_or_else(|e| panic!("the JSON Schema does not compile: {e}"));
 
     let mut scenes = Vec::new();
-    scenes_under(&repo().join("examples"), &mut scenes);
-    assert!(scenes.len() > 60, "only {} example scenes", scenes.len());
+    scenes_under(&repo().join("tests/fixtures/scenes"), &mut scenes);
+    assert!(scenes.len() > 25, "only {} fixture scenes", scenes.len());
     let mut failures = Vec::new();
     for scene in &scenes {
         if let Err(e) = schemas.validate(&scene_as_json(scene), compiled) {
@@ -227,7 +257,7 @@ fn the_json_schema_validates_every_example_scene() {
     }
     assert!(
         failures.is_empty(),
-        "{} of {} example scenes do not validate:\n{}",
+        "{} of {} fixture scenes do not validate:\n{}",
         failures.len(),
         scenes.len(),
         failures.join("\n")
@@ -309,6 +339,72 @@ blend_mode = "additive"
     );
 }
 
+/// #1062: what taplo (Even Better TOML's engine) needs of the schema
+/// beyond a validator's. Its completion follows a `$ref` by setting the
+/// schema URL's fragment and reading it as a JSON pointer (taplo-common
+/// `reference_url` / `resolve_schema`), so every `$ref` is a local pointer
+/// that leads to a schema. It inserts a field's `default` as written, so a
+/// default is the decimal the schema meant, never an f32 widened
+/// (`0.03999999910593033` for 0.04).
+#[test]
+fn the_json_schema_is_one_taplo_can_follow() {
+    let schema = json(&flint(&["schema", "--format", "json-schema"]));
+    fn walk<'a>(
+        v: &'a serde_json::Value,
+        at: String,
+        out: &mut Vec<(String, &'a serde_json::Value)>,
+    ) {
+        match v {
+            serde_json::Value::Object(map) => {
+                for (k, x) in map {
+                    walk(x, format!("{at}/{k}"), out);
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for (i, x) in items.iter().enumerate() {
+                    walk(x, format!("{at}/{i}"), out);
+                }
+            }
+            _ => out.push((at, v)),
+        }
+    }
+    let mut leaves = Vec::new();
+    walk(&schema, String::new(), &mut leaves);
+
+    let refs: Vec<&str> = leaves
+        .iter()
+        .filter(|(at, _)| at.ends_with("/$ref"))
+        .filter_map(|(_, v)| v.as_str())
+        .collect();
+    assert!(refs.len() > 20, "only {} refs", refs.len());
+    for r in refs {
+        let pointer = r
+            .strip_prefix('#')
+            .unwrap_or_else(|| panic!("{r} is not local"));
+        assert!(
+            schema.pointer(pointer).is_some_and(|s| s.is_object()),
+            "{r} leads to no schema"
+        );
+    }
+
+    let noisy: Vec<String> = leaves
+        .iter()
+        .filter(|(at, _)| at.contains("/default"))
+        .filter_map(|(at, v)| v.as_f64().map(|n| (at, n)))
+        .filter(|(_, n)| n.to_string().len() > (*n as f32).to_string().len())
+        .map(|(at, n)| format!("{at} = {n}"))
+        .collect();
+    assert!(
+        noisy.is_empty(),
+        "defaults widened from f32:\n{}",
+        noisy.join("\n")
+    );
+    assert_eq!(
+        schema["definitions"]["tables"]["post_process"]["properties"]["bloom_intensity"]["default"],
+        serde_json::json!(0.04)
+    );
+}
+
 /// A small game outside the engine checkout (the system temp folder), with
 /// the engine's schemas named by flag and a layer of its own.
 struct Game {
@@ -328,16 +424,21 @@ impl Game {
     }
 
     fn validate(&self, scene: &str, extra: &[&str]) -> Output {
+        let mut args = vec!["validate", scene];
+        args.extend(extra);
+        self.flint(&args)
+    }
+
+    /// `flint <args>` in the game, over the engine's schemas and its own.
+    fn flint(&self, args: &[&str]) -> Output {
         let engine = repo().join("schemas");
-        let mut args = vec![
-            "validate",
-            scene,
+        let mut args = args.to_vec();
+        args.extend([
             "--schemas",
             engine.to_str().unwrap(),
             "--schemas",
             "schemas",
-        ];
-        args.extend(extra);
+        ]);
         Command::new(FLINT)
             .args(&args)
             .current_dir(&self.root)
@@ -438,6 +539,170 @@ fn json_of_failure(out: &Output) -> serde_json::Value {
     serde_json::from_str(&stdout(out)).unwrap_or_else(|e| panic!("{e}\n{}", stdout(out)))
 }
 
+/// #794's done-when: a game's file of a few lines adds a field to the
+/// engine's `material`, the scene using it validates with nothing said, and
+/// `flint schema material` names the layer of each field.
+#[test]
+fn a_game_adds_one_field_to_an_engine_component() {
+    const SCENE: &str = "[scene]\nname = \"Street\"\n\n\
+                         [entities.cobbles.material]\nroughness = 0.35\nwetness = 0.8\n";
+    let bare = Game::new(
+        "extend_bare",
+        &[
+            ("flint.toml", "[project]\nid = \"street\"\n"),
+            ("schemas/components/.gitkeep", ""),
+            ("scenes/street.scene.toml", SCENE),
+        ],
+    );
+    let out = bare.validate("scenes/street.scene.toml", &[]);
+    let text = stdout(&out);
+    assert!(
+        text.contains("`material` has no field `wetness`")
+            && text.contains("`[component.material]` with `extend = true`"),
+        "without the game's file the field is undeclared, and the hint says how: {text}"
+    );
+
+    let game = Game::new(
+        "extend",
+        &[
+            ("flint.toml", "[project]\nid = \"street\"\n"),
+            (
+                "schemas/components/material.toml",
+                "[component.material]\nextend = true\n\n\
+                 [component.material.fields]\nwetness = { type = \"f32\", default = 0.0 }\n",
+            ),
+            ("scenes/street.scene.toml", SCENE),
+        ],
+    );
+    let out = game.validate("scenes/street.scene.toml", &[]);
+    let text = stdout(&out);
+    assert!(out.status.success(), "{text}{}", stderr(&out));
+    assert!(text.starts_with("No problems found."), "{text}");
+
+    let out = game.flint(&["schema", "material"]);
+    let text = stdout(&out);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(
+        text.contains("\nExtended by: [2] schemas/components/material.toml\n"),
+        "{text}"
+    );
+    assert!(text.contains("\n  wetness : f32 = 0   [2]\n"), "{text}");
+    assert!(text.contains("\n  roughness : f32 = 0.7   [1]\n"), "{text}");
+
+    let out = game.flint(&["schema", "material", "--json"]);
+    let material = json(&out);
+    assert_eq!(
+        material["extended_by"],
+        serde_json::json!(["schemas/components/material.toml"])
+    );
+    assert_eq!(
+        material["fields"]["wetness"]["file"],
+        "schemas/components/material.toml"
+    );
+    assert!(material["declared_in"]
+        .as_str()
+        .unwrap()
+        .ends_with("schemas/components/material.toml"));
+    assert_eq!(
+        material["fields"]["roughness"]["file"],
+        material["declared_in"]
+    );
+}
+
+/// #1054: a game adds a component and its defaults to the engine's
+/// `player` archetype with a file of a few lines, and an entity of the
+/// archetype gets the engine's components and defaults and the game's.
+#[test]
+fn a_game_adds_a_component_to_an_engine_archetype() {
+    let game = Game::new(
+        "extend_archetype",
+        &[
+            ("flint.toml", "[project]\nid = \"run\"\n"),
+            (
+                "schemas/components/stamina.toml",
+                "[component.stamina]\ndescription = \"How long the player can sprint\"\n\n\
+                 [component.stamina.fields]\nmax = { type = \"f32\", default = 100.0, min = 0.0 }\n",
+            ),
+            (
+                "schemas/archetypes/player.toml",
+                "[archetype.player]\nextend = true\ncomponents = [\"stamina\"]\n\n\
+                 [archetype.player.defaults.stamina]\nmax = 120.0\n\n\
+                 [archetype.player.defaults.character_controller]\nmove_speed = 7.5\n",
+            ),
+            (
+                "scenes/run.scene.toml",
+                "[scene]\nname = \"Run\"\n\n[entities.hero]\narchetype = \"player\"\n",
+            ),
+        ],
+    );
+    let out = game.validate("scenes/run.scene.toml", &[]);
+    let text = stdout(&out);
+    assert!(out.status.success(), "{text}{}", stderr(&out));
+    assert!(text.starts_with("No problems found."), "{text}");
+
+    let out = game.flint(&["entity", "show", "hero", "--scene", "scenes/run.scene.toml"]);
+    let hero = json(&out);
+    let data = &hero["data"];
+    assert_eq!(
+        data["stamina"]["max"], 120.0,
+        "the game's component: {data}"
+    );
+    assert_eq!(
+        data["character_controller"]["move_speed"], 7.5,
+        "the game's default: {data}"
+    );
+    assert_eq!(
+        data["character_controller"]["jump_force"], 6.0,
+        "the engine's default beside it: {data}"
+    );
+    assert_eq!(
+        data["collider"]["shape"], "capsule",
+        "the engine's component: {data}"
+    );
+
+    let out = game.flint(&["schema", "player"]);
+    let text = stdout(&out);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(
+        text.contains("\nExtended by: [2] schemas/archetypes/player.toml\n"),
+        "{text}"
+    );
+    assert!(text.contains("\n  - transform   [1]\n"), "{text}");
+    assert!(text.contains("\n  - stamina   [2]\n"), "{text}");
+    assert!(text.contains("\n    move_speed = 7.5   [2]\n"), "{text}");
+    assert!(text.contains("\n    jump_force = 6   [1]\n"), "{text}");
+
+    let out = game.flint(&["schema", "player", "--json"]);
+    let player = json(&out);
+    assert_eq!(
+        player["extended_by"],
+        serde_json::json!(["schemas/archetypes/player.toml"])
+    );
+    assert_eq!(
+        player["components"],
+        serde_json::json!([
+            "transform",
+            "collider",
+            "rigidbody",
+            "character_controller",
+            "stamina"
+        ])
+    );
+    assert_eq!(
+        player["component_files"]["stamina"],
+        "schemas/archetypes/player.toml"
+    );
+    assert_eq!(player["component_files"]["collider"], player["declared_in"]);
+    assert_eq!(
+        player["default_files"]["character_controller"]["move_speed"],
+        "schemas/archetypes/player.toml"
+    );
+    assert_eq!(
+        player["default_files"]["character_controller"]["jump_force"],
+        player["declared_in"]
+    );
+}
+
 /// Decision 3 of ADR 0115: an old spelling is warned about in a game's
 /// schema file. The engine's files are inside an engine checkout, which is
 /// how they are told apart: nothing is said about them. (A field written
@@ -486,4 +751,92 @@ fn a_games_old_type_spelling_is_a_warning_naming_the_file() {
         !text.contains("collider") && !text.contains("rigidbody"),
         "the engine's own files are not the game's to fix:\n{text}"
     );
+}
+
+/// #1020: `flint schema <component>` shows the F3 panel its fields declare
+/// (#744), and `--format json` carries it as `panel`. The component is a
+/// fog bank a script rolls in and lifts: its panel rows and one tune row.
+#[test]
+fn a_components_panel_is_shown_and_exported() {
+    let game = Game::new(
+        "panel",
+        &[
+            ("flint.toml", "[project]\nid = \"fog\"\n"),
+            (
+                "schemas/components/fog_bank.toml",
+                r#"[component.fog_bank.fields]
+hold_hours = { type = "f32", default = 4.0, min = 0.5, max = 12.0, panel = { role = "tune", step = 0.25, presets = [["short", 1.0], ["long", 8.0]], commit = false } }
+trigger_fog = { type = "f32", default = -1.0, panel = { role = "trigger", label = "Fog now" } }
+end_now = { type = "bool", default = false, panel = { role = "trigger", label = "End now" } }
+phase = { type = "f32", default = 0.0, panel = { role = "status", labels = ["Idle", "Rolling in", "Fogbound", "Lifting"] } }
+fog = { type = "f32", default = 0.0, panel = { role = "status", format = "fog {:.2}" } }
+next_in_s = { type = "f32", default = -1.0, panel = { role = "status", format = "next in {:.0}s", unset = -1.0 } }
+debug_log = { type = "bool", default = false }
+"#,
+            ),
+        ],
+    );
+
+    let out = game.flint(&["schema", "fog_bank"]);
+    let text = stdout(&out);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(
+        text.contains(
+            "\nPanel \"Fog bank\": status phase, fog, next_in_s · tune hold_hours · \
+             trigger trigger_fog \"Fog now\", end_now\n"
+        ),
+        "{text}"
+    );
+    // `end_now`'s label is how its name reads anyway, so it isn't repeated;
+    // a component with no panel says nothing about one
+    let out = game.flint(&["schema", "transform"]);
+    assert!(!stdout(&out).contains("Panel"), "{}", stdout(&out));
+
+    let out = game.flint(&["schema", "fog_bank", "--format", "json"]);
+    let panel = &json(&out)["panel"];
+    assert_eq!(panel["title"], "Fog bank");
+    let rows = panel["rows"].as_array().unwrap();
+    let fields: Vec<&str> = rows.iter().map(|r| r["field"].as_str().unwrap()).collect();
+    assert_eq!(
+        fields,
+        [
+            "hold_hours",
+            "trigger_fog",
+            "end_now",
+            "phase",
+            "fog",
+            "next_in_s"
+        ],
+        "the rows keep the order the fields are written in"
+    );
+    assert_eq!(
+        rows[0],
+        serde_json::json!({
+            "field": "hold_hours", "role": "tune", "label": "Hold hours",
+            "step": 0.25, "min": 0.5, "max": 12.0,
+            "presets": [["short", 1.0], ["long", 8.0]], "commit": false,
+        })
+    );
+    assert_eq!(
+        rows[1],
+        serde_json::json!({ "field": "trigger_fog", "role": "trigger", "label": "Fog now", "press": 1.0 })
+    );
+    assert_eq!(rows[2]["press"], true);
+    assert_eq!(
+        rows[3]["labels"],
+        serde_json::json!(["Idle", "Rolling in", "Fogbound", "Lifting"])
+    );
+    assert_eq!(
+        rows[5],
+        serde_json::json!({
+            "field": "next_in_s", "role": "status", "label": "Next in s",
+            "format": "next in {:.0}s", "unset": -1.0,
+        })
+    );
+
+    // The whole export carries it too, and only where there is one
+    let out = game.flint(&["schema", "--format", "json"]);
+    let all = json(&out);
+    assert_eq!(all["components"]["fog_bank"]["panel"], *panel);
+    assert!(all["components"]["transform"].get("panel").is_none());
 }

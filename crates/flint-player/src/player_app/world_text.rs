@@ -18,7 +18,8 @@ use super::hud_render::to_color32;
 use super::text_halo::{stamp_offsets, wants_halo, HaloSpec, TextHalos};
 use bytemuck::{Pod, Zeroable};
 use flint_core::world_text::WorldText;
-use flint_render::world_line_pipeline::DEPTH_SLACK;
+use flint_render::TrustedShader;
+use flint_render::WORLD_LINE_DEPTH_SLACK as DEPTH_SLACK;
 use std::collections::HashSet;
 use std::ops::Range;
 
@@ -39,6 +40,13 @@ pub(super) struct TextView {
 /// whole pixels, held to this range. Whole pixels keep the font atlas to a
 /// few sizes as the camera moves.
 const PLANE_EM_PX: (f32, f32) = (4.0, 128.0);
+
+/// A size on a plane at least this many world units, whose em is longer
+/// than its distance from the camera, is taken for points and warned of
+/// (#1182):
+/// `size: 15.0` with `facing` asks for a 15 m em, which a camera a few
+/// metres off sees as a corner of one glyph, or not at all.
+const POINTS_LIKE_SIZE: f32 = 4.0;
 
 /// Where a label's layout, in points with its anchor at the origin and y
 /// down, goes in the frame.
@@ -123,12 +131,12 @@ pub(super) fn lay_out(
         if t.text.is_empty() || t.color[3] <= 0.0 || t.size <= 0.0 {
             continue;
         }
-        let Some((place, points, scale)) = place(t, view) else {
+        let Some((place, points, scale)) = place(t, view, warned) else {
             continue;
         };
         let font_id = resolve_font_id(points, t.font.as_deref(), fonts, warned);
         let galley = |color: egui::Color32| {
-            ctx.fonts(|f| {
+            ctx.fonts_mut(|f| {
                 f.layout_job(text_layout_job(
                     &t.text,
                     font_id.clone(),
@@ -182,8 +190,13 @@ pub(super) fn lay_out(
 }
 
 /// Where `t` goes, the font size to lay it out at in points, and how many
-/// points one of its own length units is (1 for a billboard).
-fn place(t: &WorldText, view: &TextView) -> Option<(Place, f32, f32)> {
+/// points one of its own length units is (1 for a billboard). A plane's
+/// size that reads as points is warned of once a label (`warned`).
+fn place(
+    t: &WorldText,
+    view: &TextView,
+    warned: &mut HashSet<String>,
+) -> Option<(Place, f32, f32)> {
     let [w, h] = view.screen;
     if w <= 0.0 || h <= 0.0 {
         return None;
@@ -214,6 +227,7 @@ fn place(t: &WorldText, view: &TextView) -> Option<(Place, f32, f32)> {
                 return None;
             }
             let (right, up) = plane.basis()?;
+            warn_if_points(t, view.eye, warned);
             let em_px = em_on_screen(t, right, up, view)?;
             let em_px = em_px.round().clamp(PLANE_EM_PX.0, PLANE_EM_PX.1);
             let points = em_px / view.px_per_point;
@@ -229,6 +243,36 @@ fn place(t: &WorldText, view: &TextView) -> Option<(Place, f32, f32)> {
             ))
         }
     }
+}
+
+/// The key `warned` holds for a label warned of as sized in points.
+fn points_key(text: &str) -> String {
+    format!("draw_world_text size: {text}")
+}
+
+/// Warn, once a label, when text on a plane is sized as if in points: at
+/// least [`POINTS_LIKE_SIZE`] world units and an em longer than the way
+/// from `eye` to it, so it spans about the screen's height or more and its
+/// corners often reach behind the camera. Nothing else says why such a
+/// label draws nothing (#1182). Asked before the em is projected, which
+/// fails when a corner is behind the camera.
+fn warn_if_points(t: &WorldText, eye: [f32; 3], warned: &mut HashSet<String>) {
+    let away = [t.at[0] - eye[0], t.at[1] - eye[1], t.at[2] - eye[2]];
+    let distance = (away[0] * away[0] + away[1] * away[1] + away[2] * away[2]).sqrt();
+    if t.size < POINTS_LIKE_SIZE || t.size <= distance || !warned.insert(points_key(&t.text)) {
+        return;
+    }
+    let [x, y, z] = t.at;
+    tracing::warn!(
+        target: "script",
+        "draw_world_text `{}` at ({x:.2}, {y:.2}, {z:.2}) has `facing`, so its size {} is the \
+         em in world units: letters {} m tall, {distance:.1} m from the camera. A billboard's \
+         size is points. For text painted on a surface give the em in metres (0.03 is a line \
+         on a screen, 0.3 a shop sign), or leave out `facing`",
+        t.text,
+        t.size,
+        t.size,
+    );
 }
 
 /// How many pixels `t`'s em spans on screen at its anchor, along whichever
@@ -356,7 +400,7 @@ impl WorldTextPipeline {
     /// `format` is the HUD's (non-sRGB) view of the surface; the pass is
     /// single sample against a `Depth32Float` depth view.
     pub fn new(device: &wgpu::Device, format: wgpu::TextureFormat) -> Self {
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        let shader = device.create_trusted_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("World Text Shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("world_text_shader.wgsl").into()),
         });
@@ -385,8 +429,8 @@ impl WorldTextPipeline {
         });
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("World Text Pipeline Layout"),
-            bind_group_layouts: &[&texture_layout],
-            push_constant_ranges: &[],
+            bind_group_layouts: &[Some(&texture_layout)],
+            immediate_size: 0,
         });
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("World Text Pipeline"),
@@ -394,7 +438,7 @@ impl WorldTextPipeline {
             vertex: wgpu::VertexState {
                 module: &shader,
                 entry_point: Some("vs_world_text"),
-                buffers: &[GlyphVertex::desc()],
+                buffers: &[Some(GlyphVertex::desc())],
                 compilation_options: Default::default(),
             },
             fragment: Some(wgpu::FragmentState {
@@ -426,13 +470,13 @@ impl WorldTextPipeline {
             },
             depth_stencil: Some(wgpu::DepthStencilState {
                 format: wgpu::TextureFormat::Depth32Float,
-                depth_write_enabled: false,
-                depth_compare: wgpu::CompareFunction::LessEqual,
+                depth_write_enabled: Some(false),
+                depth_compare: Some(wgpu::CompareFunction::LessEqual),
                 stencil: wgpu::StencilState::default(),
                 bias: wgpu::DepthBiasState::default(),
             }),
             multisample: wgpu::MultisampleState::default(),
-            multiview: None,
+            multiview_mask: None,
             cache: None,
         });
         Self {
@@ -477,6 +521,7 @@ impl WorldTextPipeline {
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                 view: target,
                 resolve_target: None,
+                depth_slice: None,
                 ops: wgpu::Operations {
                     load: wgpu::LoadOp::Load,
                     store: wgpu::StoreOp::Store,
@@ -492,6 +537,7 @@ impl WorldTextPipeline {
             }),
             timestamp_writes: None,
             occlusion_query_set: None,
+            multiview_mask: None,
         });
         pass.set_pipeline(&self.pipeline);
         pass.set_vertex_buffer(0, vertices.slice(..));
@@ -537,6 +583,7 @@ fn upload<'a>(
 mod tests {
     use super::*;
     use flint_core::world_text::TextPlane;
+    use flint_debug_ui::run_headless_frame;
 
     /// A camera at the origin looking down -z: 90° vertical fov, square
     /// 200-point screen, near 1, far 100. Column-major.
@@ -581,14 +628,15 @@ mod tests {
 
     fn context() -> egui::Context {
         let ctx = egui::Context::default();
-        let _ = ctx.run(Default::default(), |_| {});
+        let _ = run_headless_frame(&ctx, Default::default(), |_| {});
         ctx
     }
 
     fn build(texts: &[WorldText], v: &TextView) -> GlyphMesh {
         let ctx = context();
         let mut laid = Vec::new();
-        let _ = ctx.run(Default::default(), |ctx| {
+        let _ = run_headless_frame(&ctx, Default::default(), |ui| {
+            let ctx = &ui.ctx().clone();
             laid = lay_out(
                 ctx,
                 texts,
@@ -652,7 +700,9 @@ mod tests {
         assert!(!mesh.is_empty());
         let (lo, hi) = bounds(&mesh);
         let tall = hi[1] - lo[1];
-        assert!((0.2..0.6).contains(&tall), "{tall}");
+        // 0.21 on egui 0.30, 0.19 on 0.36, whose rasteriser (skrifa and
+        // vello_cpu) bounds each glyph's quad more tightly (#945)
+        assert!((0.15..0.6).contains(&tall), "{tall}");
         // Twice as far, half as big, give or take the glyphs' pixel of
         // empty padding and the em's rounding to whole pixels.
         let far = build(&[text([0.0, 0.0, -8.0], 1.0, facing_camera())], &v);
@@ -682,6 +732,149 @@ mod tests {
         let mut t = text([-2.0, 0.0, -1.5], 1.0, wall);
         t.text = "A very long name painted along the wall".into();
         assert!(build(&[t], &view()).is_empty());
+    }
+
+    /// A camera at `eye` looking at `target`, world up, 60° vertical fov on
+    /// a 320x180-point screen, near 0.1, far 100. Column-major, wgpu depth.
+    fn look_at(eye: [f32; 3], target: [f32; 3]) -> TextView {
+        let sub = |a: [f32; 3], b: [f32; 3]| [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
+        let dot = |a: [f32; 3], b: [f32; 3]| a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+        let cross = |a: [f32; 3], b: [f32; 3]| {
+            [
+                a[1] * b[2] - a[2] * b[1],
+                a[2] * b[0] - a[0] * b[2],
+                a[0] * b[1] - a[1] * b[0],
+            ]
+        };
+        let unit = |a: [f32; 3]| {
+            let l = dot(a, a).sqrt();
+            [a[0] / l, a[1] / l, a[2] / l]
+        };
+        let f = unit(sub(target, eye));
+        let s = unit(cross(f, [0.0, 1.0, 0.0]));
+        let u = cross(s, f);
+        // Row-major view, then projection, then their product.
+        let view = [
+            [s[0], s[1], s[2], -dot(s, eye)],
+            [u[0], u[1], u[2], -dot(u, eye)],
+            [-f[0], -f[1], -f[2], dot(f, eye)],
+            [0.0, 0.0, 0.0, 1.0],
+        ];
+        let (w, h, near, far) = (320.0f32, 180.0f32, 0.1f32, 100.0f32);
+        let t = 1.0 / (30.0f32.to_radians()).tan();
+        let proj = [
+            [t * h / w, 0.0, 0.0, 0.0],
+            [0.0, t, 0.0, 0.0],
+            [0.0, 0.0, far / (near - far), near * far / (near - far)],
+            [0.0, 0.0, -1.0, 0.0],
+        ];
+        let mut view_proj = [[0.0f32; 4]; 4];
+        for (col, out) in view_proj.iter_mut().enumerate() {
+            for (row, o) in out.iter_mut().enumerate() {
+                *o = (0..4).map(|k| proj[row][k] * view[k][col]).sum();
+            }
+        }
+        TextView {
+            view_proj,
+            eye,
+            screen: [w, h],
+            px_per_point: 1.0,
+        }
+    }
+
+    /// #1182's prompt: on a terminal's glass at x = 0, facing +x, a little
+    /// off its middle, left-aligned, the camera 1 to 5 m off on the +x side.
+    fn prompt(size: f32) -> WorldText {
+        let mut t = text(
+            [0.06, 1.06, 0.12],
+            size,
+            Some(TextPlane {
+                normal: [1.0, 0.0, 0.0],
+                up: [0.0, 1.0, 0.0],
+            }),
+        );
+        t.text = "> _".into();
+        t.color = [0.02, 0.2, 0.08, 0.95];
+        t.align = 0;
+        t
+    }
+
+    fn lay_out_warned(texts: &[WorldText], v: &TextView) -> HashSet<String> {
+        let ctx = context();
+        let mut warned = HashSet::new();
+        let _ = run_headless_frame(&ctx, Default::default(), |ui| {
+            let ctx = &ui.ctx().clone();
+            lay_out(
+                ctx,
+                texts,
+                v,
+                &HashSet::new(),
+                &mut warned,
+                &mut TextHalos::default(),
+            );
+        });
+        warned
+    }
+
+    /// The cameras #1182 drew from: 1 to 5 m off the glass, some square
+    /// on, some from the side and above.
+    fn prompt_cameras() -> Vec<TextView> {
+        let glass = [0.0, 1.0, 0.0];
+        [
+            [1.0, 1.0, 0.0],
+            [2.0, 1.3, 0.6],
+            [3.5, 1.8, -1.2],
+            [5.0, 1.0, 0.2],
+        ]
+        .into_iter()
+        .map(|eye| look_at(eye, glass))
+        .collect()
+    }
+
+    #[test]
+    fn a_prompt_sized_in_points_on_a_plane_is_warned_of() {
+        // `size: 15.0` with `facing` is a 15 m em: the issue's call. It's
+        // warned of from every one of its cameras, once a label.
+        for v in prompt_cameras() {
+            let warned = lay_out_warned(&[prompt(15.0), prompt(15.0)], &v);
+            assert_eq!(warned.len(), 1, "{warned:?}");
+            assert!(warned.contains(&points_key("> _")), "{warned:?}");
+        }
+        // A billboard's 15 is points, and a plane's 0.03 is metres: neither.
+        let v = &prompt_cameras()[1];
+        let mut billboard = prompt(15.0);
+        billboard.plane = None;
+        assert!(lay_out_warned(&[billboard, prompt(0.03)], v).is_empty());
+        // A big sign seen whole isn't taken for points.
+        let mut sign = prompt(6.0);
+        sign.at = [0.0, 3.0, -40.0];
+        sign.plane = facing_camera();
+        assert!(lay_out_warned(&[sign], &look_at([0.0, 3.0, 10.0], [0.0, 3.0, 0.0])).is_empty());
+    }
+
+    #[test]
+    fn a_prompt_in_metres_lies_on_the_glass_and_reads_from_plus_x() {
+        for v in prompt_cameras() {
+            let mesh = build(&[prompt(0.03)], &v);
+            assert!(!mesh.is_empty(), "nothing drawn from {:?}", v.eye);
+            assert!(mesh.vertices.iter().all(|g| g.position[3] > 0.0));
+            // On screen, near the anchor: a few percent of the screen.
+            let (lo, hi) = bounds(&mesh);
+            assert!(hi[0] - lo[0] < 0.5 && hi[1] - lo[1] < 0.3, "{lo:?} {hi:?}");
+            let anchor = project(&v.view_proj, [0.06, 1.06, 0.12]);
+            let ax = anchor[0] / anchor[3];
+            // Left-aligned and read left to right: it starts at the anchor
+            // and runs to its right, `>` before `_`, not mirrored.
+            assert!((lo[0] - ax).abs() < 0.05, "starts at {} not {ax}", lo[0]);
+            let x = |g: &GlyphVertex| g.position[0] / g.position[3];
+            let n = mesh.vertices.len();
+            let first = mesh.vertices[..4].iter().map(x).sum::<f32>() / 4.0;
+            let last = mesh.vertices[n - 4..].iter().map(x).sum::<f32>() / 4.0;
+            assert!(first < last, "`>` at {first}, `_` at {last}");
+        }
+        // From behind the glass, nothing.
+        let behind = look_at([-3.0, 1.2, 0.5], [0.0, 1.0, 0.0]);
+        assert!(build(&[prompt(0.03)], &behind).is_empty());
     }
 
     #[test]
@@ -718,5 +911,151 @@ mod tests {
     #[test]
     fn vertex_layout_matches_the_shader() {
         assert_eq!(std::mem::size_of::<GlyphVertex>(), 28);
+    }
+
+    /// A texel of an egui texture reaches the HUD's view as egui-wgpu's own
+    /// shader would put it there: egui 0.31+'s textures are Rgba8Unorm, so
+    /// the sample is already gamma. The shader used to decode it once more,
+    /// as 0.30's sRGB textures needed, which paled glows and strokes on world
+    /// text (#949).
+    #[test]
+    fn a_texel_draws_as_egui_draws_it() {
+        let Some(gpu) = super::super::scene_entry_tests::gpu() else {
+            flint_render::gpu_select::skip_without_gpu("world text texel test");
+            return;
+        };
+        let (device, queue) = (&gpu.device, &gpu.queue);
+        let format = wgpu::TextureFormat::Rgba8Unorm;
+        let texel = [200u8, 100, 50, 255];
+        let mut egui_renderer =
+            egui_wgpu::Renderer::new(device, format, egui_wgpu::RendererOptions::default());
+        let id = egui::TextureId::User(949);
+        egui_renderer.update_texture(
+            device,
+            queue,
+            id,
+            &egui::epaint::ImageDelta::full(
+                egui::ColorImage::new(
+                    [1, 1],
+                    vec![egui::Color32::from_rgba_premultiplied(
+                        texel[0], texel[1], texel[2], texel[3],
+                    )],
+                ),
+                egui::TextureOptions::NEAREST,
+            ),
+        );
+        // One quad over the whole target, white, sampling the one texel
+        let white = u32::from_le_bytes([255; 4]);
+        let corner = |x: f32, y: f32| GlyphVertex {
+            position: [x, y, 0.5, 1.0],
+            uv: [0.5, 0.5],
+            color: white,
+        };
+        let mesh = GlyphMesh {
+            vertices: vec![
+                corner(-1.0, -1.0),
+                corner(1.0, -1.0),
+                corner(1.0, 1.0),
+                corner(-1.0, 1.0),
+            ],
+            indices: vec![0, 1, 2, 0, 2, 3],
+            draws: vec![(id, 0..6)],
+        };
+        let size = wgpu::Extent3d {
+            width: 4,
+            height: 4,
+            depth_or_array_layers: 1,
+        };
+        let texture = |label, format, usage| {
+            device.create_texture(&wgpu::TextureDescriptor {
+                label: Some(label),
+                size,
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format,
+                usage,
+                view_formats: &[],
+            })
+        };
+        let target = texture(
+            "world text texel test",
+            format,
+            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        );
+        let depth = texture(
+            "world text texel test depth",
+            wgpu::TextureFormat::Depth32Float,
+            wgpu::TextureUsages::RENDER_ATTACHMENT,
+        );
+        let target_view = target.create_view(&Default::default());
+        let depth_view = depth.create_view(&Default::default());
+        let mut encoder = device.create_command_encoder(&Default::default());
+        // Clear both: the text pass loads what's there
+        encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("clear"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &target_view,
+                resolve_target: None,
+                depth_slice: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                view: &depth_view,
+                depth_ops: Some(wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(1.0),
+                    store: wgpu::StoreOp::Store,
+                }),
+                stencil_ops: None,
+            }),
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+        let mut pipeline = WorldTextPipeline::new(device, format);
+        pipeline.draw(
+            device,
+            queue,
+            &mut encoder,
+            &target_view,
+            &depth_view,
+            &mesh,
+            &egui_renderer,
+        );
+        let row = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+        let readback = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("world text texel test readback"),
+            size: u64::from(row) * 4,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        encoder.copy_texture_to_buffer(
+            target.as_image_copy(),
+            wgpu::TexelCopyBufferInfo {
+                buffer: &readback,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(row),
+                    rows_per_image: Some(4),
+                },
+            },
+            size,
+        );
+        queue.submit([encoder.finish()]);
+        let slice = readback.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |r| {
+            let _ = tx.send(r);
+        });
+        let _ = flint_render::wait_for_gpu(device);
+        rx.recv().unwrap().unwrap();
+        let data = slice.get_mapped_range().expect("mapped");
+        let got = [data[0], data[1], data[2], data[3]];
+        drop(data);
+        let off = (0..4).map(|k| got[k].abs_diff(texel[k])).max().unwrap();
+        assert!(off <= 1, "drew {got:?} for the texel {texel:?}");
     }
 }

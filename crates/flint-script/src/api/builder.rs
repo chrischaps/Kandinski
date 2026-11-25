@@ -357,6 +357,15 @@ impl<'f, K: Kinds> Func<'f, K> {
         B: Fn(NativeCallContext, &mut [&mut Dynamic]) -> RhaiResult + Send + Sync + 'static,
     {
         let name = self.name;
+        // Every signature of the name is one record while a callback is
+        // profiled (#1100); off, one flag read
+        let id = crate::fn_times::engine_fn(name);
+        let body = Arc::new(
+            move |nctx: NativeCallContext, args: &mut [&mut Dynamic]| -> RhaiResult {
+                let _timed = crate::fn_times::enter_engine(id);
+                body(nctx, args)
+            },
+        );
         // Rhai looks a call up by its arguments' exact types first, then
         // tries every mix of `Dynamic` in their place (2^n lookups for n
         // parameters). The exact twin (floats for `Num`, ints for `Entity`)
@@ -511,16 +520,18 @@ fn error_at(func: &'static str, pos: Position, message: impl std::fmt::Display) 
     ))
 }
 
-/// A call into a module the host hasn't enabled (#698).
+/// A call into a module the host hasn't enabled (#698). Its text is tagged
+/// [`crate::errors::ONCE_A_SCENE`], so the error store logs it once a
+/// scene rather than at 1, 10, 100... calls (#856): a shared script calling
+/// the module each frame in a scene without it is the expected case.
 fn not_enabled(func: &'static str, gate: crate::module::Gate, pos: Position) -> CallError {
-    Box::new(EvalAltResult::ErrorRuntime(
-        format!(
-            "{func}: the {} module is not enabled here; it is enabled when {}",
-            gate.module, gate.enabled_when
-        )
-        .into(),
-        pos,
-    ))
+    let mut text: rhai::Dynamic = format!(
+        "{func}: the {} module is not enabled here; it is enabled when {}",
+        gate.module, gate.enabled_when
+    )
+    .into();
+    text.set_tag(crate::errors::ONCE_A_SCENE.into());
+    Box::new(EvalAltResult::ErrorRuntime(text, pos))
 }
 
 fn no_world(func: &'static str, pos: Position) -> CallError {
@@ -1135,9 +1146,11 @@ macro_rules! kinds_tuple {
                 F: Fn(&mut Call<'_>, Self::Out) -> R + Send + Sync + 'static,
                 R: ScriptReturn,
             {
+                let id = crate::fn_times::engine_fn(name);
                 engine.register_fn(
                     name,
                     move |nctx: NativeCallContext, $($a: $K::Typed),*| -> RhaiResult {
+                        let _timed = crate::fn_times::enter_engine(id);
                         let mut guard = crate::lock_or_recover(&ctx);
                         let mut call = Call::new(&mut guard, name, nctx.call_position());
                         let out = ($(

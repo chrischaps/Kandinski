@@ -8,21 +8,64 @@
 //!   into the caller's `EventBus`
 
 pub mod character;
+pub mod layers;
+pub mod nav;
 pub mod sync;
 pub mod world;
 
 #[cfg(test)]
+mod change_tests;
+#[cfg(test)]
+mod heightfield_tests;
+#[cfg(test)]
 mod joint_tests;
+#[cfg(test)]
+mod layer_tests;
+#[cfg(test)]
+mod nav_tests;
+#[cfg(test)]
+mod order_tests;
 
 use character::CharacterController;
 use flint_core::components as comp;
 use flint_core::{EntityId, Result, Vec3};
 use flint_ecs::FlintWorld;
 use flint_runtime::{EventBus, GameEvent, InputState};
+pub use layers::{CollisionLayers, LayerError, LayerMask};
+pub use nav::{NavGrid, NavSettings, NavStats};
 use rapier3d::control::{CharacterLength, KinematicCharacterController};
 use rapier3d::prelude::*;
+use std::sync::Arc;
 use sync::PhysicsSync;
 use world::PhysicsWorld;
+
+/// The triangles of a `mesh` or `convex` collider, in the entity's own
+/// space (where its model's vertices are drawn, before the entity's
+/// transform). A host reads them from the entity's model and hands them
+/// over with [`PhysicsSystem::set_collider_mesh`] (#729).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ColliderMesh {
+    pub positions: Vec<[f32; 3]>,
+    pub triangles: Vec<[u32; 3]>,
+}
+
+/// A grid of heights for a fixed heightfield collider
+/// ([`PhysicsSystem::register_static_heightfield`], #1219): the terrain's.
+/// Column 0 is at `origin` x, the last at `origin` x + `width`; row 0 at
+/// `origin` z, the last at + `depth`; each height is world Y less `origin` y.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct StaticHeightfield {
+    /// Samples along X.
+    pub columns: usize,
+    /// Samples along Z.
+    pub rows: usize,
+    /// Row by row: `heights[row * columns + column]`.
+    pub heights: Vec<f32>,
+    pub width: f32,
+    pub depth: f32,
+    /// Where column 0, row 0 at height 0 is in the world.
+    pub origin: [f32; 3],
+}
 
 /// Entity-level raycast result
 #[derive(Debug, Clone)]
@@ -45,10 +88,36 @@ pub struct MoveCharacterResult {
 /// Collider shape dimensions for an entity
 #[derive(Debug, Clone)]
 pub enum ColliderExtents {
-    Box { half_extents: [f32; 3] },
-    Sphere { radius: f32 },
-    Capsule { radius: f32, half_height: f32 },
-    Cylinder { radius: f32, half_height: f32 },
+    Box {
+        half_extents: [f32; 3],
+    },
+    Sphere {
+        radius: f32,
+    },
+    Capsule {
+        radius: f32,
+        half_height: f32,
+    },
+    Cylinder {
+        radius: f32,
+        half_height: f32,
+    },
+    /// A `mesh` collider: the half extents of its triangles' box, centred
+    /// where the box is (`centre`, in the body's frame)
+    Mesh {
+        half_extents: [f32; 3],
+        centre: [f32; 3],
+    },
+    /// A `convex` collider's hull, as `Mesh`
+    Convex {
+        half_extents: [f32; 3],
+        centre: [f32; 3],
+    },
+    /// A terrain's heightfield (#1219), as `Mesh`
+    Heightfield {
+        half_extents: [f32; 3],
+        centre: [f32; 3],
+    },
 }
 
 /// The physics simulation: initialized from the world when a scene is
@@ -113,6 +182,67 @@ impl PhysicsSystem {
         self.step_in_frame = 0;
     }
 
+    /// The collision layers colliders are read against: `default` and the
+    /// project's (`[project.physics] layers`). Set before the scene's
+    /// bodies are made ([`initialize`](Self::initialize)); a collider made
+    /// earlier keeps the layer it was given. Kept by [`clear`](Self::clear).
+    pub fn set_layers(&mut self, layers: CollisionLayers) {
+        self.sync.layers = layers;
+    }
+
+    /// The layers in use, `default` first.
+    /// A number that changes whenever a fixed collider comes, goes or
+    /// turns sensor, and differs between any two worlds: a
+    /// [`NavGrid`] bakes again when it does (#969).
+    pub fn static_generation(&self) -> u64 {
+        self.physics_world.static_generation()
+    }
+
+    pub fn layers(&self) -> &CollisionLayers {
+        &self.sync.layers
+    }
+
+    /// The mask of some layers by name, for [`raycast_masked`](Self::raycast_masked)
+    /// and [`move_character_masked`](Self::move_character_masked).
+    pub fn layer_mask<S: AsRef<str>>(
+        &self,
+        names: &[S],
+    ) -> std::result::Result<LayerMask, LayerError> {
+        self.sync.layers.mask(names)
+    }
+
+    /// The model an entity's `mesh` or `convex` collider takes its
+    /// triangles from, for each that wants some (see
+    /// [`PhysicsSync::mesh_requests`]): ask before the models load.
+    pub fn collider_mesh_requests(world: &FlintWorld) -> Vec<(EntityId, String)> {
+        PhysicsSync::mesh_requests(world)
+    }
+
+    /// Hand over an entity's collider triangles. Before its body is made
+    /// the body takes them; after (a procgen model that finished late, a
+    /// mesh a game uploaded at runtime, #1222) its collider is made again
+    /// from them at the next step.
+    pub fn set_collider_mesh(&mut self, entity_id: EntityId, mesh: Arc<ColliderMesh>) {
+        self.sync.set_mesh(entity_id, mesh);
+    }
+
+    /// Say an entity's collider triangles are coming (a procgen model still
+    /// on the queue): until they do, its collider is a box of `size` with
+    /// no warning, as a runtime mesh's is.
+    pub fn expect_collider_mesh(&mut self, entity_id: EntityId) {
+        self.sync.expect_mesh(entity_id);
+    }
+
+    /// The triangles last handed over for an entity's collider.
+    pub fn collider_mesh_of(&self, entity_id: EntityId) -> Option<&Arc<ColliderMesh>> {
+        self.sync.mesh_of(entity_id)
+    }
+
+    /// The entity a collider belongs to.
+    pub fn entity_of_collider(&self, handle: ColliderHandle) -> Option<EntityId> {
+        self.sync.entity_of(handle)
+    }
+
     /// Cast a ray and resolve the hit collider to an EntityId
     pub fn raycast(
         &self,
@@ -121,20 +251,32 @@ impl PhysicsSystem {
         max_distance: f32,
         exclude_entity: Option<EntityId>,
     ) -> Option<EntityRaycastHit> {
+        self.raycast_masked(origin, direction, max_distance, exclude_entity, None)
+    }
+
+    /// [`raycast`](Self::raycast) meeting only the colliders on a layer of
+    /// `mask` (`None`: every collider). The colliders' own masks don't
+    /// matter: a ray is on every layer.
+    pub fn raycast_masked(
+        &self,
+        origin: [f32; 3],
+        direction: [f32; 3],
+        max_distance: f32,
+        exclude_entity: Option<EntityId>,
+        mask: Option<LayerMask>,
+    ) -> Option<EntityRaycastHit> {
         let exclude_collider =
             exclude_entity.and_then(|eid| self.sync.collider_map.get(&eid).copied());
 
-        let hit = self
-            .physics_world
-            .cast_ray(origin, direction, max_distance, exclude_collider)?;
+        let hit = self.physics_world.cast_ray(
+            origin,
+            direction,
+            max_distance,
+            exclude_collider,
+            mask.map(LayerMask::query_groups),
+        )?;
 
-        // Resolve collider handle → EntityId
-        let entity_id = self
-            .sync
-            .collider_map
-            .iter()
-            .find(|(_, ch)| **ch == hit.collider_handle)
-            .map(|(eid, _)| *eid)?;
+        let entity_id = self.sync.entity_of(hit.collider_handle)?;
 
         Some(EntityRaycastHit {
             entity_id,
@@ -147,6 +289,7 @@ impl PhysicsSystem {
     /// Collision-corrected kinematic character movement using Rapier's shape-sweep.
     /// Scripts pass the desired movement delta; the engine resolves collisions and
     /// returns the corrected absolute position plus grounded status.
+    /// It meets what its own collider meets (`collider.layer` and `mask`).
     pub fn move_character_shape(
         &self,
         entity_id: EntityId,
@@ -154,11 +297,31 @@ impl PhysicsSystem {
         desired_delta: [f32; 3],
         dt: f32,
     ) -> Option<MoveCharacterResult> {
+        self.move_character_masked(entity_id, current_pos, desired_delta, dt, None)
+    }
+
+    /// [`move_character_shape`](Self::move_character_shape) meeting the
+    /// colliders on a layer of `mask` (whose own masks hold the
+    /// character's layer) instead of its collider's mask. `None` is its
+    /// collider's mask.
+    pub fn move_character_masked(
+        &self,
+        entity_id: EntityId,
+        current_pos: [f32; 3],
+        desired_delta: [f32; 3],
+        dt: f32,
+        mask: Option<LayerMask>,
+    ) -> Option<MoveCharacterResult> {
         let collider_handle = *self.sync.collider_map.get(&entity_id)?;
         let body_handle = *self.sync.body_map.get(&entity_id)?;
 
         let collider = self.physics_world.collider_set.get(collider_handle)?;
         let shape = collider.shape();
+        let own = collider.collision_groups();
+        let groups = match mask {
+            Some(mask) => InteractionGroups::new(own.memberships, mask.group()),
+            None => own,
+        };
 
         // Build isometry from the ECS position (freshest data from scripts)
         let position = Isometry::translation(current_pos[0], current_pos[1], current_pos[2]);
@@ -183,7 +346,8 @@ impl PhysicsSystem {
             desired,
             QueryFilter::default()
                 .exclude_rigid_body(body_handle)
-                .exclude_sensors(),
+                .exclude_sensors()
+                .groups(groups),
             |_| {},
         );
 
@@ -236,7 +400,32 @@ impl PhysicsSystem {
                 half_height: cyl.half_height,
             })
         } else {
-            None
+            let aabb = shape.compute_local_aabb();
+            let (half, centre) = (aabb.half_extents(), aabb.center());
+            let half_extents = [half.x, half.y, half.z];
+            let centre = [centre.x, centre.y, centre.z];
+            if shape.as_trimesh().is_some() {
+                Some(ColliderExtents::Mesh {
+                    half_extents,
+                    centre,
+                })
+            } else if shape.as_heightfield().is_some() {
+                // A heightfield is centred on its collider, which sits away
+                // from its body (`register_static_heightfield`)
+                let placed = collider.position_wrt_parent().copied().unwrap_or_default();
+                let c = placed * aabb.center();
+                Some(ColliderExtents::Heightfield {
+                    half_extents,
+                    centre: [c.x, c.y, c.z],
+                })
+            } else if shape.as_convex_polyhedron().is_some() {
+                Some(ColliderExtents::Convex {
+                    half_extents,
+                    centre,
+                })
+            } else {
+                None
+            }
         }
     }
 
@@ -253,13 +442,7 @@ impl PhysicsSystem {
             &shape,
             QueryFilter::default(),
             |handle| {
-                if let Some(eid) = self
-                    .sync
-                    .collider_map
-                    .iter()
-                    .find(|(_, ch)| **ch == handle)
-                    .map(|(eid, _)| *eid)
-                {
+                if let Some(eid) = self.sync.entity_of(handle) {
                     result.push(eid);
                 }
                 true // continue searching
@@ -308,6 +491,20 @@ impl PhysicsSystem {
         Some([vel.x, vel.y])
     }
 
+    /// A dynamic body's linear velocity in m/s, what the solver moved it
+    /// with. `None` for a kinematic or fixed body, or an entity with none:
+    /// those move by their transforms, which a reader differences itself.
+    /// The ocean's contact foam takes it (#749).
+    pub fn dynamic_velocity(&self, entity_id: EntityId) -> Option<[f32; 3]> {
+        let body_handle = self.sync.body_map.get(&entity_id)?;
+        let body = self.physics_world.get_rigid_body(*body_handle)?;
+        if !body.is_dynamic() {
+            return None;
+        }
+        let vel = body.linvel();
+        Some([vel.x, vel.y, vel.z])
+    }
+
     /// Sync specific new entities to Rapier (for chunk loading).
     pub fn sync_new_entities(&mut self, world: &mut FlintWorld, _entity_ids: &[EntityId]) {
         // sync_to_rapier already skips already-synced entities, so we can just re-run it
@@ -325,10 +522,12 @@ impl PhysicsSystem {
             self.physics_world.remove_impulse_joint(joint_handle);
             self.sync.joint_cache.remove(&entity_id);
         }
-        // Remove standalone collider if any
-        if let Some(collider_handle) = self.sync.collider_map.remove(&entity_id) {
+        // Remove standalone collider if any (one on the body went with it;
+        // removing its handle again is a no-op)
+        if let Some(collider_handle) = self.sync.remove_collider(entity_id) {
             self.physics_world.remove_collider(collider_handle);
         }
+        self.sync.meshes.remove(&entity_id);
         self.sync.synced_entities.remove(&entity_id);
     }
 
@@ -385,8 +584,36 @@ impl PhysicsSystem {
         );
     }
 
-    /// Run the character controller update (called from player app with input access)
+    /// Register a fixed heightfield collider (#1219): a terrain's. It takes
+    /// its entity's `collider` layer at the next sync, as a trimesh does.
+    pub fn register_static_heightfield(
+        &mut self,
+        entity_id: EntityId,
+        field: &StaticHeightfield,
+        friction: f32,
+        restitution: f32,
+    ) {
+        self.sync.register_static_heightfield(
+            entity_id,
+            &mut self.physics_world,
+            field,
+            friction,
+            restitution,
+        );
+    }
+
+    /// The character's share of a frame's input, once a frame before its
+    /// fixed steps, whether the frame runs none or several (#728): mouse
+    /// look turns the view, a jump press waits for the next step.
+    pub fn character_frame_input(&mut self, input: &InputState, world: &FlintWorld) {
+        self.character.frame_input(input, world);
+    }
+
+    /// One fixed step of the character: walk, fall, jump (called from the
+    /// player's fixed loop; look and jump presses come from
+    /// `character_frame_input`)
     pub fn update_character(&mut self, input: &InputState, world: &mut FlintWorld, dt: f64) {
+        flint_core::scope!("physics::character");
         self.character.update(
             input,
             world,
@@ -402,6 +629,7 @@ impl PhysicsSystem {
     /// Read the scene's bodies, colliders and joints, and find the player
     /// entity, when a scene is entered.
     pub fn initialize(&mut self, world: &mut FlintWorld) -> Result<()> {
+        flint_core::scope!("physics::initialize");
         // Initial sync of all entities with physics components, then joints
         self.sync.sync_to_rapier(world, &mut self.physics_world);
         self.sync.sync_joints(world, &mut self.physics_world);
@@ -411,6 +639,7 @@ impl PhysicsSystem {
             if let Some(components) = world.get_components(entity.id) {
                 if components.has(comp::CHARACTER_CONTROLLER) {
                     self.character.set_player_entity(entity.id);
+                    self.character.face_start(world);
                     break;
                 }
             }
@@ -429,48 +658,45 @@ impl PhysicsSystem {
         dt: f64,
         events: &mut EventBus,
     ) -> Result<()> {
-        // Sync any new entities to Rapier, then any joints whose bodies now exist
-        self.sync.sync_to_rapier(world, &mut self.physics_world);
-        self.sync.sync_joints(world, &mut self.physics_world);
+        flint_core::scope!("physics::fixed_update");
+        {
+            flint_core::scope!("physics::sync_in");
+            // Sync any new entities to Rapier, then any joints whose bodies now exist
+            self.sync.sync_to_rapier(world, &mut self.physics_world);
+            self.sync.sync_joints(world, &mut self.physics_world);
 
-        // Update kinematic bodies from ECS transforms (e.g., animated doors),
-        // moving them an even share of the frame's motion per step
-        self.sync.update_kinematic_bodies(
-            world,
-            &mut self.physics_world,
-            self.step_in_frame,
-            self.frame_span,
-        );
-        self.step_in_frame += 1;
+            // Update kinematic bodies from ECS transforms (e.g., animated doors),
+            // moving them an even share of the frame's motion per step
+            self.sync.update_kinematic_bodies(
+                world,
+                &mut self.physics_world,
+                self.step_in_frame,
+                self.frame_span,
+            );
+            self.step_in_frame += 1;
 
-        // Update sensor flags (e.g., dead enemies become non-solid)
-        self.sync
-            .update_sensor_flags(world, &mut self.physics_world);
+            // Sensor flags (dead enemies become non-solid), layers, masks
+            // and scales a script changed (#1221)
+            self.sync.update_colliders(world, &mut self.physics_world);
 
-        // Push script-written joint targets / limits into Rapier
-        self.sync
-            .update_joint_targets(world, &mut self.physics_world);
+            // Push script-written joint targets / limits into Rapier
+            self.sync
+                .update_joint_targets(world, &mut self.physics_world);
+        }
 
         // Step physics
-        self.physics_world.step(dt as f32);
+        {
+            flint_core::scope!("physics::step", self.physics_world.rigid_body_set.len());
+            self.physics_world.step(dt as f32);
+        }
 
         // This step's collisions and triggers, onto the caller's bus
         for event in self.physics_world.drain_collision_events() {
             match event {
                 rapier3d::prelude::CollisionEvent::Started(h1, h2, flags) => {
                     // Map collider handles back to entity IDs
-                    let e1 = self
-                        .sync
-                        .collider_map
-                        .iter()
-                        .find(|(_, ch)| **ch == h1)
-                        .map(|(eid, _)| *eid);
-                    let e2 = self
-                        .sync
-                        .collider_map
-                        .iter()
-                        .find(|(_, ch)| **ch == h2)
-                        .map(|(eid, _)| *eid);
+                    let e1 = self.sync.entity_of(h1);
+                    let e2 = self.sync.entity_of(h2);
                     if let (Some(a), Some(b)) = (e1, e2) {
                         if flags.contains(CollisionEventFlags::SENSOR) {
                             // Determine which is the sensor (trigger) and which is the entity
@@ -491,18 +717,8 @@ impl PhysicsSystem {
                     }
                 }
                 rapier3d::prelude::CollisionEvent::Stopped(h1, h2, flags) => {
-                    let e1 = self
-                        .sync
-                        .collider_map
-                        .iter()
-                        .find(|(_, ch)| **ch == h1)
-                        .map(|(eid, _)| *eid);
-                    let e2 = self
-                        .sync
-                        .collider_map
-                        .iter()
-                        .find(|(_, ch)| **ch == h2)
-                        .map(|(eid, _)| *eid);
+                    let e1 = self.sync.entity_of(h1);
+                    let e2 = self.sync.entity_of(h2);
                     if let (Some(a), Some(b)) = (e1, e2) {
                         if flags.contains(CollisionEventFlags::SENSOR) {
                             let a_is_sensor = self
@@ -525,6 +741,7 @@ impl PhysicsSystem {
         }
 
         // Sync transforms back from Rapier for dynamic bodies
+        flint_core::scope!("physics::sync_out");
         self.sync
             .project_kinematic_joints(&mut self.physics_world, dt as f32);
         self.sync.sync_from_rapier(world, &self.physics_world);
@@ -996,8 +1213,8 @@ mod tests {
         assert_eq!(
             said[0].hint.as_deref(),
             Some(
-                "did you mean `sphere`? allowed values: box, sphere, capsule, cylinder, sprite; \
-                 the default \"box\" is used"
+                "did you mean `sphere`? allowed values: box, sphere, capsule, cylinder, sprite, \
+                 mesh, convex; the default \"box\" is used"
             )
         );
     }
@@ -1106,5 +1323,126 @@ mod tests {
         let (wrong, reports) = metres_walked("move_speed = \"fast\"");
         assert_eq!(wrong, unset);
         assert_eq!(reports, 1);
+    }
+
+    /// A floor and a character standing on it after half a second, whose
+    /// `character_controller` is `settings`.
+    fn standing(settings: &str) -> (FlintWorld, PhysicsSystem, EntityId) {
+        let mut world = FlintWorld::new();
+        let mut sys = PhysicsSystem::new();
+        spawn_from_toml(
+            &mut world,
+            "floor",
+            "[transform]\nposition = [0, -0.5, 0]\n[rigidbody]\nbody_type = \"static\"\n\
+             [collider]\nshape = \"box\"\nsize = [200, 1, 200]",
+        );
+        let id = spawn_from_toml(
+            &mut world,
+            "player",
+            &format!(
+                "[transform]\nposition = [0, 1, 0]\n[rigidbody]\nbody_type = \"kinematic\"\n\
+                 [collider]\nshape = \"capsule\"\nsize = [0.6, 1.8, 0.6]\n\
+                 [character_controller]\n{settings}"
+            ),
+        );
+        sys.initialize(&mut world).unwrap();
+        let input = InputState::new();
+        for _ in 0..30 {
+            sys.character_frame_input(&input, &world);
+            sys.update_character(&input, &mut world, 1.0 / 60.0);
+            sys.step(&mut world, 1.0 / 60.0);
+        }
+        (world, sys, id)
+    }
+
+    /// Highest the character's feet rise over `steps` steps of 1/60 s.
+    fn rise(sys: &mut PhysicsSystem, world: &mut FlintWorld, id: EntityId, steps: usize) -> f32 {
+        let input = InputState::new();
+        let floor = world.get_transform(id).unwrap().position.y;
+        let mut top = floor;
+        for _ in 0..steps {
+            sys.character_frame_input(&input, world);
+            sys.update_character(&input, world, 1.0 / 60.0);
+            sys.step(world, 1.0 / 60.0);
+            top = top.max(world.get_transform(id).unwrap().position.y);
+        }
+        top - floor
+    }
+
+    #[test]
+    fn a_jump_pressed_on_a_frame_with_no_step_still_jumps() {
+        let (mut world, mut sys, id) = standing("");
+        // A 144 Hz frame that runs no fixed step: Space goes down and is
+        // cleared again at the frame's end, before any step reads it
+        let mut input = InputState::new();
+        input.process_key_down(flint_runtime::parse_key_code("Space").unwrap());
+        sys.character_frame_input(&input, &world);
+        input.end_frame();
+        assert!(!input.is_action_just_pressed("jump"));
+
+        let height = rise(&mut sys, &mut world, id, 30);
+        // jump_force 6 under 9.81: about 1.8 at the top
+        assert!(
+            height > 1.0,
+            "the press waited for the next step: rose {height}"
+        );
+    }
+
+    #[test]
+    fn a_frame_of_several_steps_turns_once() {
+        let (world, mut sys, _) = standing("");
+        let mut input = InputState::new();
+        input.process_mouse_raw_delta(100.0, 0.0);
+        sys.character_frame_input(&input, &world);
+        let turned = -sys.camera_yaw();
+        // 100 units at 0.172 degrees each, however many steps follow
+        assert!((turned - 17.2f32.to_radians()).abs() < 1e-5, "{turned}");
+    }
+
+    #[test]
+    fn a_character_starts_facing_its_start_yaw() {
+        let (world, sys, _) = standing("start_yaw = 90");
+        assert!((sys.camera_yaw() - std::f32::consts::FRAC_PI_2).abs() < 1e-6);
+        let eye = sys.camera_position(&world);
+        let ahead = sys.camera_target(eye) - eye;
+        assert!(
+            ahead.x > 0.999 && ahead.z.abs() < 1e-3,
+            "faces +X: {ahead:?}"
+        );
+
+        // Unset: +Z, as before
+        let (world, sys, _) = standing("");
+        let eye = sys.camera_position(&world);
+        let ahead = sys.camera_target(eye) - eye;
+        assert!(ahead.z > 0.999, "faces +Z: {ahead:?}");
+    }
+
+    #[test]
+    fn the_look_and_fall_settings_are_the_components() {
+        // Pitch held at 30 degrees, however far the mouse goes
+        let (world, mut sys, _) = standing("pitch_limit = 30");
+        let mut input = InputState::new();
+        input.process_mouse_raw_delta(0.0, -10_000.0);
+        sys.character_frame_input(&input, &world);
+        assert!((sys.camera_pitch() - 30f32.to_radians()).abs() < 1e-6);
+
+        // Twice the sensitivity, twice the turn
+        let (world, mut sys, _) = standing("look_sensitivity = 0.344");
+        let mut input = InputState::new();
+        input.process_mouse_raw_delta(100.0, 0.0);
+        sys.character_frame_input(&input, &world);
+        assert!((-sys.camera_yaw() - 34.4f32.to_radians()).abs() < 1e-5);
+
+        // Half the gravity, a jump about twice as high
+        let jump_height = |settings: &str| {
+            let (mut world, mut sys, id) = standing(settings);
+            let mut input = InputState::new();
+            input.process_key_down(flint_runtime::parse_key_code("Space").unwrap());
+            sys.character_frame_input(&input, &world);
+            rise(&mut sys, &mut world, id, 120)
+        };
+        let full = jump_height("");
+        let half = jump_height("gravity_scale = 0.5");
+        assert!((half / full - 2.0).abs() < 0.1, "{full} then {half}");
     }
 }

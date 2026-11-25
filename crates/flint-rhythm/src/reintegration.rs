@@ -19,12 +19,11 @@
 use crate::gradient::GradientOffsets;
 use crate::ladder::{Ladder, LadderDriver, LadderParams};
 use flint_core::{FlintError, Result};
-use flint_music::conductor::Grid;
-use flint_music::manifest::{Reintegration, SuiteManifest};
+use flint_music::clocked::Ramp;
+use flint_music::conductor::{Conductor, Grid};
+use flint_music::manifest::{Section, SuiteManifest};
 use flint_music::session::SuiteSession;
 use flint_music::tempo::ms_to_samples;
-use kira::Tween;
-use std::time::Duration;
 
 /// Authored seam fade (ms) — the envelope that carries the world out of the
 /// old timeline. An envelope, not a cut; tuned in E7, adjudicated by the
@@ -38,6 +37,93 @@ pub const ENTRY_DB: f32 = -60.0;
 const MIN_LEAD_MS: f64 = 100.0;
 /// Ramp for per-tick param moves while reassembly lerps the ladder back.
 const REASSEMBLY_RAMP_MS: f64 = 30.0;
+
+/// A rhythm suite's `[reintegration]` table: where a full fail re-enters
+/// and which bus leads it back. The rhythm layer's own table, read from
+/// the manifest's [`SuiteManifest::tables`] (flint-music keeps it whole and
+/// reads none of it, #1041).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Reintegration {
+    pub re_entry_sections: Vec<String>,
+    pub lead_bus: String,
+    pub reassembly_bars: i64,
+}
+
+impl Reintegration {
+    /// The table's name in a suite manifest.
+    pub const TABLE: &'static str = "reintegration";
+
+    /// Whether the manifest has the table, read or not: a suite that has it
+    /// is a rhythm suite.
+    pub fn declared(manifest: &SuiteManifest) -> bool {
+        manifest.tables.contains_key(Self::TABLE)
+    }
+
+    /// The manifest's table, `None` for a suite that only plays music, and
+    /// an error naming the key for one that is there but unreadable.
+    pub fn of(manifest: &SuiteManifest) -> Result<Option<Self>> {
+        let Some(value) = manifest.tables.get(Self::TABLE) else {
+            return Ok(None);
+        };
+        let bad = |what: &str| {
+            FlintError::ParseError(format!(
+                "suite manifest: bad or missing field: reintegration.{what}"
+            ))
+        };
+        let t = value.as_table().ok_or_else(|| bad("(not a table)"))?;
+        let re_entry_sections = t
+            .get("re_entry_sections")
+            .and_then(|v| v.as_array())
+            .ok_or_else(|| bad("re_entry_sections"))?
+            .iter()
+            .map(|v| {
+                v.as_str()
+                    .map(String::from)
+                    .ok_or_else(|| bad("re_entry_sections entry"))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Some(Self {
+            re_entry_sections,
+            lead_bus: t
+                .get("lead_bus")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| bad("lead_bus"))?
+                .to_string(),
+            reassembly_bars: t
+                .get("reassembly_bars")
+                .and_then(|v| v.as_integer())
+                .ok_or_else(|| bad("reassembly_bars"))?,
+        }))
+    }
+
+    /// Whether `section` is one a full fail re-enters at.
+    pub fn re_enters_at(&self, section: &str) -> bool {
+        self.re_entry_sections.iter().any(|s| s == section)
+    }
+
+    /// The checkpoint for a full fail at `sample`: the latest re-entry
+    /// section starting at or before it, falling back to the earliest one
+    /// when the fail lands before any (the validator guarantees
+    /// `re_entry_sections` is non-empty and resolvable).
+    pub fn previous_re_entry<'c>(
+        &self,
+        conductor: &'c Conductor,
+        sample: i64,
+    ) -> Option<&'c Section> {
+        let mut entries: Vec<&Section> = self
+            .re_entry_sections
+            .iter()
+            .filter_map(|name| conductor.section_by_name(name))
+            .collect();
+        entries.sort_by_key(|s| s.start_sample);
+        entries
+            .iter()
+            .rev()
+            .find(|s| s.start_sample <= sample)
+            .or(entries.first())
+            .copied()
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum SeqPhase {
@@ -124,7 +210,7 @@ impl Reintegrator {
     /// suite without one, which [`crate::validate_manifest`] reports as
     /// `MissingReintegration`.
     pub fn for_manifest(manifest: &SuiteManifest) -> Result<Self> {
-        let decl = manifest.reintegration.clone().ok_or_else(|| {
+        let decl = Reintegration::of(manifest)?.ok_or_else(|| {
             FlintError::ValidationError(format!(
                 "suite '{}' has no [reintegration] table, which a rhythm session needs",
                 manifest.id
@@ -316,9 +402,9 @@ impl Reintegrator {
         let sample_rate = session.conductor.tempo().sample_rate() as f64;
         let now_suite = session.clock_sample();
 
-        let checkpoint = session
-            .conductor
-            .previous_re_entry(now_suite, &self.decl)
+        let checkpoint = self
+            .decl
+            .previous_re_entry(&session.conductor, now_suite)
             .map(|s| s.start_sample)
             .unwrap_or(0);
         // Lead-in ("3, 4, go"): everything re-enters `lead_in_beats` before
@@ -355,26 +441,17 @@ impl Reintegrator {
         // record spun backwards, not an effect on one instrument — for
         // exactly `rewind_beats`, ending at the seam (clock-timed start;
         // the music simply continues until the gesture begins). Commanded on
-        // the OLD sounds, before `schedule_seam` swaps the handles;
+        // the OLD sounds, before `schedule_jump` swaps the handles;
         // sample-lock breaks during the ramp, which is fine — everything
         // re-plays locked at the seam.
         let gesture_start_suite = seam_suite - rewind_span;
         if rewind_span > 0 {
-            let start_time = kira::StartTime::ClockTime(
-                session.clock_time_at_raw(gesture_start_suite + session.timeline_offset()),
-            );
-            let dur = Duration::from_secs_f64(rewind_span as f64 / sample_rate);
+            let start_time = session.start_at_raw(gesture_start_suite + session.timeline_offset());
+            let secs = rewind_span as f64 / sample_rate;
             for name in crate::BUSES {
                 if let Some(bus) = session.mixer.bus_mut(name) {
                     if bus.state.playing {
-                        bus.set_detune(
-                            self.rewind_drop_st,
-                            Tween {
-                                start_time,
-                                duration: dur,
-                                ..Default::default()
-                            },
-                        );
+                        bus.set_detune(self.rewind_drop_st, Ramp::at(start_time, secs));
                     }
                 }
             }
@@ -394,7 +471,7 @@ impl Reintegrator {
         }
 
         let lead_bus = self.decl.lead_bus.clone();
-        session.schedule_seam(re_entry, seam_suite, self.fade_ms, &|bus| {
+        session.schedule_jump(re_entry, seam_suite, self.fade_ms, &|bus| {
             if bus == lead_bus {
                 0.0
             } else {
@@ -406,11 +483,7 @@ impl Reintegrator {
         // over the span, starting exactly at the seam. Per-sound volume, so
         // it never fights the ladder's track-gain trims.
         let seam_raw = seam_suite + session.timeline_offset();
-        let ramp = Tween {
-            start_time: kira::StartTime::ClockTime(session.clock_time_at_raw(seam_raw)),
-            duration: Duration::from_secs_f64(span as f64 / sample_rate),
-            ..Default::default()
-        };
+        let ramp = Ramp::at(session.start_at_raw(seam_raw), span as f64 / sample_rate);
         for name in crate::BUSES {
             if name == self.decl.lead_bus {
                 continue;
@@ -438,28 +511,20 @@ impl Reintegrator {
             span = span.min(available);
             if span > beat_samples / 4 {
                 let seam_raw_pre = seam_suite + session.timeline_offset();
-                let cue_start =
-                    kira::StartTime::ClockTime(session.clock_time_at_raw(seam_raw_pre - span));
-                let ramp = Tween {
-                    start_time: cue_start,
-                    duration: Duration::from_secs_f64(span as f64 / sample_rate),
-                    ..Default::default()
-                };
+                let cue_start = session.start_at_raw(seam_raw_pre - span);
+                let ramp = Ramp::at(cue_start, span as f64 / sample_rate);
                 // Fade completes AT the seam so the cue never doubles the
                 // ensemble's sample-pure downbeat entry.
                 let fade_samples = ms_to_samples(self.fade_ms, sample_rate);
-                let stop_at_seam = Tween {
-                    start_time: kira::StartTime::ClockTime(
-                        session.clock_time_at_raw(seam_raw_pre - fade_samples),
-                    ),
-                    duration: Duration::from_secs_f64(self.fade_ms / 1000.0),
-                    ..Default::default()
-                };
+                let stop_at_seam = Ramp::at(
+                    session.start_at_raw(seam_raw_pre - fade_samples),
+                    self.fade_ms / 1000.0,
+                );
                 if let Some(bus) = session.mixer.bus_mut(&self.decl.lead_bus) {
                     match bus.play_cue(re_entry as u64, cue_start, -18.0, self.rewind_drop_st) {
                         Ok(Some(mut cue)) => {
-                            cue.set_playback_rate(kira::PlaybackRate(1.0), ramp);
-                            cue.set_volume(kira::Decibels(0.0), ramp);
+                            cue.set_rate(1.0, ramp);
+                            cue.set_volume(0.0, ramp);
                             cue.stop(stop_at_seam);
                         }
                         Ok(None) => {}

@@ -24,6 +24,7 @@
 //! again when the ground changes. The fog isn't lit: the game gives it the
 //! colour the hour's light would.
 
+use crate::gpu_counts::{CountedDevice, CountedQueue};
 /// A ground fog's map over a world rectangle, for
 /// `SceneRenderer::set_ground_fog`.
 #[derive(Clone, Copy, Debug)]
@@ -159,9 +160,6 @@ pub struct GroundFogGpu {
     pub(crate) mip_count: u32,
     pub(crate) floor_base: f32,
     pub(crate) floor_top: f32,
-    /// Its [`gpu_id`](crate::bind_cache::gpu_id), for the composite's kept
-    /// bind group (#139).
-    pub(crate) id: u64,
 }
 
 /// The texture format: two half floats, filterable on every backend.
@@ -178,7 +176,7 @@ impl GroundFogGpu {
         let Some(mips) = mip_chain(fog) else {
             return Ok(None);
         };
-        let texture = device.create_texture(&wgpu::TextureDescriptor {
+        let texture = device.create_texture_counted(&wgpu::TextureDescriptor {
             label: Some("Ground Fog Map"),
             size: wgpu::Extent3d {
                 width: fog.width,
@@ -197,15 +195,15 @@ impl GroundFogGpu {
                 .iter()
                 .flat_map(|t| t.iter().flat_map(|&v| f16_bits(v).to_le_bytes()))
                 .collect();
-            queue.write_texture(
-                wgpu::ImageCopyTexture {
+            queue.write_texture_counted(
+                wgpu::TexelCopyTextureInfo {
                     texture: &texture,
                     mip_level: level as u32,
                     origin: wgpu::Origin3d::ZERO,
                     aspect: wgpu::TextureAspect::All,
                 },
                 &bytes,
-                wgpu::ImageDataLayout {
+                wgpu::TexelCopyBufferLayout {
                     offset: 0,
                     bytes_per_row: Some(w * 4),
                     rows_per_image: Some(*d),
@@ -226,7 +224,6 @@ impl GroundFogGpu {
             mip_count: mips.levels.len() as u32,
             floor_base: mips.floor_base,
             floor_top: mips.floor_top,
-            id: crate::bind_cache::gpu_id(),
         }))
     }
 }

@@ -2,15 +2,9 @@
 // Grass instanced rendering — stylized cross-quads with wind and bending
 //
 // wooze_noise.wgsl is prepended (grass_pipeline.rs), for the comb of woozy
-// grass (#252).
-
-struct TransformUniforms {
-    view_proj: mat4x4<f32>,
-    model: mat4x4<f32>,
-    model_inv_transpose: mat4x4<f32>,
-    camera_pos: vec3<f32>,
-    _pad: f32,
-};
+// grass (#252), and the lights' files (wgsl_sources.rs), local_lights.wgsl
+// among them for the lanterns (#1048). Group 0's transform and `clip_of` are
+// mesh_vertex.wgsl's (#1244).
 
 struct GrassRenderUniforms {
     wind_direction: vec3<f32>,
@@ -54,82 +48,11 @@ struct EntityPosition {
     _pad: f32,
 };
 
-// Must match LightUniforms layout in terrain_shader.wgsl and shader.wgsl
-struct DirectionalLight {
-    direction: vec3<f32>,
-    volumetric_intensity: f32,
-    color: vec3<f32>,
-    intensity: f32,
-    volumetric_color: vec3<f32>,
-    _pad1: f32,
-};
-
-struct PointLight {
-    position: vec3<f32>,
-    radius: f32,
-    color: vec3<f32>,
-    intensity: f32,
-    // Physical source radius (world units); 0 = punctual (ADR 0056).
-    // Struct grew 32 -> 48 B — must match the Rust PointLight in all six
-    // LightUniforms mirrors (light_uniforms_layout test).
-    source_radius: f32,
-    _pad0: f32,
-    _pad1: f32,
-    _pad2: f32,
-};
-
-struct SpotLight {
-    position: vec3<f32>,
-    radius: f32,
-    direction: vec3<f32>,
-    inner_angle: f32,
-    color: vec3<f32>,
-    outer_angle: f32,
-    intensity: f32,
-    _pad0: f32,
-    _pad1: f32,
-    _pad2: f32,
-};
-
-struct LightUniforms {
-    directional_lights: array<DirectionalLight, 4>,
-    point_lights: array<PointLight, 16>,
-    spot_lights: array<SpotLight, 8>,
-    directional_count: u32,
-    point_count: u32,
-    spot_count: u32,
-    _pad: u32,
-    ambient_sky: vec4<f32>,
-    ambient_ground: vec4<f32>,
-    // rgb = sheen tint, w = strength; zero = off (must match LightUniforms in pipeline.rs)
-    sheen_color_strength: vec4<f32>,
-};
-
-struct ShadowUniforms {
-    cascade_view_proj: array<mat4x4<f32>, 3>,
-    cascade_splits: vec4<f32>,
-    // PCSS (ADR 0057): xyz = per-cascade light-ortho depth range (world
-    // units), w = tan(sun angular size); w = 0 -> legacy 3x3 PCF verbatim.
-    pcss: vec4<f32>,
-};
-
-// Bind group 0: Transform (shared)
-@group(0) @binding(0)
-var<uniform> transform: TransformUniforms;
-
 // Bind group 1: Grass render uniforms
 @group(1) @binding(0)
 var<uniform> grass: GrassRenderUniforms;
 
-// Bind group 2: Lights (shared with terrain/PBR)
-@group(2) @binding(0)
-var<uniform> lights: LightUniforms;
-@group(2) @binding(1)
-var shadow_depth: texture_depth_2d_array;
-@group(2) @binding(2)
-var shadow_sampler: sampler_comparison;
-@group(2) @binding(3)
-var<uniform> shadow_uniforms: ShadowUniforms;
+// Bind group 2: Lights (light_bindings.wgsl, the scene shaders' own, #738)
 
 // Bind group 3: Instance data + entity positions
 @group(3) @binding(0)
@@ -149,6 +72,21 @@ struct VertexOutput {
     @location(2) color: vec3<f32>,
     @location(3) world_normal: vec3<f32>,
 };
+
+// How far round a blade a lantern's light wraps: a blade is lit through as
+// much as on its face, so light from low beside it still reaches it (#1048)
+const GRASS_LOCAL_WRAP: f32 = 0.5;
+
+// One point or spot light on a blade (#1048): a wrapped diffuse over PI, as
+// the ground's Lambert is, so a lantern's pool runs on from the ground into
+// the grass at the brightness it has on the ground; and the glow of a tip
+// with the lamp behind it, the sun's backlight (`sss` in fs_main) from the
+// side of the blade that faces away from the lamp.
+fn grass_local_light(l: LocalLight, N: vec3<f32>, V: vec3<f32>, tip: f32) -> vec3<f32> {
+    let wrapped = max((dot(N, l.L) + GRASS_LOCAL_WRAP) / (1.0 + GRASS_LOCAL_WRAP), 0.0);
+    let through = pow(max(dot(V, -l.L), 0.0), 4.0) * tip * 0.3;
+    return (wrapped / PI + through) * l.radiance;
+}
 
 fn hash21(p: vec2<f32>) -> f32 {
     var p3 = fract(vec3<f32>(p.x, p.y, p.x) * 0.1031);
@@ -217,7 +155,7 @@ fn vs_main(
     let normal = normalize(vec3<f32>(-wind_offset * wind_dir.x * 0.3, 1.0, -wind_offset * wind_dir.y * 0.3));
 
     var out: VertexOutput;
-    out.clip_pos = transform.view_proj * vec4<f32>(world_pos, 1.0);
+    out.clip_pos = clip_of(vec4<f32>(world_pos, 1.0));
     out.world_pos = world_pos;
     out.uv = vertex.uv;
     out.color = final_color;
@@ -237,23 +175,36 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 
     var color = in.color;
 
+    // The point and spot lights (#1048). With none, both loops run zero
+    // times and `lamps` adds nothing to the sums below.
+    var lamps = vec3<f32>(0.0);
+    let view_local = normalize(transform.camera_pos - in.world_pos);
+    for (var i = 0u; i < lights.point_count; i = i + 1u) {
+        lamps += grass_local_light(point_light_at(i, in.world_pos, in.world_normal, in.clip_pos.xy),
+            in.world_normal, view_local, in.uv.y);
+    }
+    for (var i = 0u; i < lights.spot_count; i = i + 1u) {
+        lamps += grass_local_light(spot_light_at(i, in.world_pos, in.world_normal, in.clip_pos.xy),
+            in.world_normal, view_local, in.uv.y);
+    }
+
     // Simple directional lighting
     if lights.directional_count > 0u {
         let light_dir = normalize(-lights.directional_lights[0].direction);
         let n_dot_l = max(dot(in.world_normal, light_dir), 0.0);
 
         // Shadow sampling (cascade 0 only for grass)
-        let shadow_pos = shadow_uniforms.cascade_view_proj[0] * vec4<f32>(in.world_pos, 1.0);
+        let shadow_pos = shadow.cascade_view_proj[0] * vec4<f32>(in.world_pos, 1.0);
         let shadow_ndc = shadow_pos.xyz / shadow_pos.w;
         let shadow_uv = shadow_ndc.xy * vec2<f32>(0.5, -0.5) + 0.5;
-        var shadow = 1.0;
+        var lit = 1.0;
         // A far plane of 0 is "shadows off" (the pass is skipped and its
         // maps are stale), as in the PBR shader.
-        if shadow_uniforms.cascade_splits.z > 0.0 && shadow_uv.x >= 0.0 && shadow_uv.x <= 1.0 && shadow_uv.y >= 0.0 && shadow_uv.y <= 1.0 {
-            shadow = textureSampleCompareLevel(shadow_depth, shadow_sampler, shadow_uv, 0, shadow_ndc.z - 0.002);
+        if shadow.cascade_splits.z > 0.0 && shadow_uv.x >= 0.0 && shadow_uv.x <= 1.0 && shadow_uv.y >= 0.0 && shadow_uv.y <= 1.0 {
+            lit = textureSampleCompareLevel(shadow_maps, shadow_sampler, shadow_uv, 0, shadow_ndc.z - 0.002);
         }
 
-        let diffuse = n_dot_l * lights.directional_lights[0].intensity * shadow;
+        let diffuse = n_dot_l * lights.directional_lights[0].intensity * lit;
 
         // Subsurface scattering approximation — backlit tips glow
         let view_dir = normalize(transform.camera_pos - in.world_pos);
@@ -262,10 +213,10 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         let light_color = lights.directional_lights[0].color;
         // Use ambient_sky as ambient color with unit intensity
         let ambient = mix(lights.ambient_ground.rgb, lights.ambient_sky.rgb, 0.5);
-        color *= (diffuse + sss) * light_color + ambient;
+        color *= (diffuse + sss) * light_color + ambient + lamps;
     } else {
         let ambient = mix(lights.ambient_ground.rgb, lights.ambient_sky.rgb, 0.5);
-        color *= ambient;
+        color *= ambient + lamps;
     }
 
     return vec4<f32>(color, 1.0);
@@ -307,5 +258,5 @@ fn vs_shadow(
     let world_pos = inst.position + local_pos;
 
     // Shadow uses transform.view_proj which will be set to the shadow cascade VP
-    return transform.view_proj * vec4<f32>(world_pos, 1.0);
+    return clip_of(vec4<f32>(world_pos, 1.0));
 }

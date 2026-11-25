@@ -22,9 +22,10 @@
 //! points: on a 2x display it takes one more level, so the halo keeps its
 //! size against the glyph cells beside it.
 
+use crate::gpu_counts::{CountedDevice, CountedQueue};
 use super::kit;
 use super::{
-    StyleDescriptor, StyleDevice, StyleFrame, StyleHint, StyleInput, StyleParam, StylePass,
+    StyleDescriptor, StyleDevice, StyleFrame, StyleInput, StyleParam, StylePass,
     StyleStage,
 };
 use bytemuck::{Pod, Zeroable};
@@ -60,39 +61,22 @@ pub(super) static STYLE: StyleDescriptor = StyleDescriptor::new(
 // Glow over the finished frame, crossing styles as light does (#384)
 .draws_over_entities()
 .params(&[
-    StyleParam::new("intensity", 1.5, 0.0..=4.0),
-    StyleParam::new("threshold", 0.55, 0.0..=1.0),
-    StyleParam::new("knee", 0.25, 0.0..=1.0),
-    StyleParam::new("levels", 5.0, 1.0..=7.0),
-    StyleParam::new("saturation", 1.0, 0.0..=1.0),
-])
-.hints(&[
-    StyleHint::new(
-        "intensity",
-        "Intensity",
-        "How much halo is added over the picture",
-    ),
-    StyleHint::new(
-        "threshold",
-        "Threshold",
-        "The display value (0-1) a pixel's brightest channel must pass to glow",
-    ),
-    StyleHint::new(
-        "knee",
-        "Knee",
-        "How softly the threshold starts, as a share of it",
-    ),
-    StyleHint::new(
-        "levels",
-        "Reach",
-        "Mip levels: each doubles how far the halo spreads (in points)",
-    )
-    .integer(),
-    StyleHint::new(
-        "saturation",
-        "Saturation",
-        "1 keeps the glowing pixel's hue, 0 glows white",
-    ),
+    StyleParam::new("intensity", 1.5, 0.0..=4.0)
+        .label("Intensity")
+        .help("How much halo is added over the picture"),
+    StyleParam::new("threshold", 0.55, 0.0..=1.0)
+        .label("Threshold")
+        .help("The display value (0-1) a pixel's brightest channel must pass to glow"),
+    StyleParam::new("knee", 0.25, 0.0..=1.0)
+        .label("Knee")
+        .help("How softly the threshold starts, as a share of it"),
+    StyleParam::new("levels", 5.0, 1.0..=7.0)
+        .label("Reach")
+        .help("Mip levels: each doubles how far the halo spreads (in points)")
+        .integer(),
+    StyleParam::new("saturation", 1.0, 0.0..=1.0)
+        .label("Saturation")
+        .help("1 keeps the glowing pixel's hue, 0 glows white"),
 ])
 // A display style draws after bloom; it is the bloom here
 .feeds_bloom(false);
@@ -104,7 +88,7 @@ fn create(d: &StyleDevice) -> Box<dyn StylePass> {
     let module = kit::shader(
         device,
         "Display Bloom Shader",
-        kit::wgsl!("display_bloom.wgsl"),
+        kit::wgsl!("prelude_core.wgsl", "display_bloom.wgsl"),
     );
     let chain_layouts = [&uniform_bgl, &sampled_bgl];
     let pipeline = |label: &str, entry: &str, format, blend, layouts: &[_]| {
@@ -147,7 +131,7 @@ fn create(d: &StyleDevice) -> Box<dyn StylePass> {
             None,
             &[&uniform_bgl, &sampled_bgl, &sampled_bgl],
         ),
-        uniforms: device.create_buffer(&wgpu::BufferDescriptor {
+        uniforms: device.create_buffer_counted(&wgpu::BufferDescriptor {
             label: Some("Display Bloom Uniforms"),
             size: SLOTS as u64 * SLOT_STRIDE,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
@@ -173,10 +157,10 @@ struct BloomUniforms {
 }
 
 struct DisplayBloom {
-    threshold: wgpu::RenderPipeline,
-    down: wgpu::RenderPipeline,
-    up: wgpu::RenderPipeline,
-    composite: wgpu::RenderPipeline,
+    threshold: std::sync::Arc<wgpu::RenderPipeline>,
+    down: std::sync::Arc<wgpu::RenderPipeline>,
+    up: std::sync::Arc<wgpu::RenderPipeline>,
+    composite: std::sync::Arc<wgpu::RenderPipeline>,
     uniforms: wgpu::Buffer,
     uniform_bgl: wgpu::BindGroupLayout,
     sampled_bgl: wgpu::BindGroupLayout,
@@ -253,11 +237,11 @@ impl StylePass for DisplayBloom {
             put(levels + i, texel(mips[i + 1].width, mips[i + 1].height));
         }
         put(composite_slot, texel(width, height));
-        frame.queue.write_buffer(&self.uniforms, 0, &slots);
+        frame.queue.write_buffer_counted(&self.uniforms, 0, &slots);
 
         let uniform = |slot: usize| {
             frame.bind("display_bloom.uniform", slot as u64, || {
-                frame.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                frame.device.create_bind_group_counted(&wgpu::BindGroupDescriptor {
                     label: Some("Display Bloom Uniform BG"),
                     layout: &self.uniform_bgl,
                     entries: &[wgpu::BindGroupEntry {
@@ -278,7 +262,7 @@ impl StylePass for DisplayBloom {
         // its targets
         let mip = |i: usize| {
             frame.bind("display_bloom.mip", i as u64, || {
-                frame.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                frame.device.create_bind_group_counted(&wgpu::BindGroupDescriptor {
                     label: Some("Display Bloom Mip BG"),
                     layout: &self.sampled_bgl,
                     entries: &[

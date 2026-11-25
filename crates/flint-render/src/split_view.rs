@@ -7,6 +7,8 @@
 //! way, and a pixel arrives exactly as the second drawing made it. That's what
 //! lets each half of a split match a whole frame drawn the same way.
 
+use crate::gpu_counts::CountedDevice;
+use crate::TrustedShader;
 /// The second drawing and what copies it in.
 pub struct SplitView {
     width: u32,
@@ -44,16 +46,16 @@ impl SplitView {
                 count: None,
             }],
         });
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        let shader = device.create_trusted_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Split View Copy"),
             source: wgpu::ShaderSource::Wgsl(SHADER.into()),
         });
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("Split View Pipeline Layout"),
-            bind_group_layouts: &[&layout],
-            push_constant_ranges: &[],
+            bind_group_layouts: &[Some(&layout)],
+            immediate_size: 0,
         });
-        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        let pipeline = device.create_render_pipeline_counted(&wgpu::RenderPipelineDescriptor {
             label: Some("Split View Copy"),
             layout: Some(&pipeline_layout),
             vertex: wgpu::VertexState {
@@ -75,7 +77,7 @@ impl SplitView {
             primitive: wgpu::PrimitiveState::default(),
             depth_stencil: None,
             multisample: wgpu::MultisampleState::default(),
-            multiview: None,
+            multiview_mask: None,
             cache: None,
         });
         let (texture, scene_view, bind_group) = Self::target(
@@ -112,7 +114,7 @@ impl SplitView {
         } else {
             &[]
         };
-        let texture = device.create_texture(&wgpu::TextureDescriptor {
+        let texture = device.create_texture_counted(&wgpu::TextureDescriptor {
             label: Some("Split View Texture"),
             size: wgpu::Extent3d {
                 width,
@@ -131,7 +133,7 @@ impl SplitView {
             format: Some(copy_format),
             ..Default::default()
         });
-        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        let bind_group = device.create_bind_group_counted(&wgpu::BindGroupDescriptor {
             label: Some("Split View Bind Group"),
             layout,
             entries: &[wgpu::BindGroupEntry {
@@ -194,6 +196,7 @@ impl SplitView {
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                 view: target,
                 resolve_target: None,
+                depth_slice: None,
                 ops: wgpu::Operations {
                     load: wgpu::LoadOp::Load,
                     store: wgpu::StoreOp::Store,
@@ -202,6 +205,7 @@ impl SplitView {
             depth_stencil_attachment: None,
             timestamp_writes: None,
             occlusion_query_set: None,
+            multiview_mask: None,
         });
         pass.set_scissor_rect(from_x, 0, to_x - from_x, self.height);
         pass.set_pipeline(&self.pipeline);

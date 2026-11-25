@@ -5,14 +5,14 @@
 //! - Center: egui-snarl node graph canvas
 //! - Right: output texture preview with channel browser
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use clap::Args;
-use egui_snarl::ui::{PinInfo, SnarlStyle, SnarlViewer};
+use egui_snarl::ui::{PinInfo, SnarlPin, SnarlStyle, SnarlViewer};
 use egui_snarl::{InPinId, NodeId, OutPinId, Snarl};
 use flint_procgen::generators::texture::node_graph::{self, TextureNode};
 use flint_procgen::generators::texture::pipeline::{self, op_param_schema, ALL_OP_TYPES};
@@ -20,14 +20,12 @@ use flint_procgen::{
     parse_param_schema, ImageData, ProcGenSpec, SeedConfig, SeedMode, SeededRng, TextureField,
     TextureMapParams,
 };
-use flint_render::RenderContext;
-use notify_debouncer_mini::{new_debouncer, notify::RecursiveMode};
-use winit::application::ApplicationHandler;
-use winit::dpi::PhysicalSize;
+use flint_viewer::host::{
+    self, Editor, Flow, Gpu, HostOptions, InitCx, StillOptions, Target, Tick,
+};
 use winit::event::{ElementState, WindowEvent};
-use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
-use winit::window::{Window, WindowId};
+use winit::window::Window;
 
 use super::gen_preview_common::{self, random_seed};
 
@@ -51,7 +49,20 @@ pub struct TexEditArgs {
     pub height: u32,
 }
 
+/// `flint tex-edit <spec>`: the node editor in a window.
 pub fn run(args: TexEditArgs) -> Result<()> {
+    let options = HostOptions {
+        width: args.width,
+        height: args.height,
+        camera: Default::default(),
+        auto_orbit: false,
+    };
+    host::run(editor(args)?, options)
+}
+
+/// The texture pipeline's node editor, for [`flint_viewer::host`] to open
+/// in a window or draw as a `--render` still (#712).
+pub fn editor(args: TexEditArgs) -> Result<TexEditApp> {
     let spec_path = PathBuf::from(&args.spec);
     let mut spec = ProcGenSpec::from_file(&spec_path)
         .with_context(|| format!("failed to load spec from {}", spec_path.display()))?;
@@ -110,41 +121,12 @@ pub fn run(args: TexEditArgs) -> Result<()> {
         }
     }
 
-    // File watcher
-    let reload_flag = Arc::new(Mutex::new(false));
-    let _watcher = {
-        let flag = Arc::clone(&reload_flag);
-        let (tx, rx) = std::sync::mpsc::channel();
-        let mut debouncer = new_debouncer(Duration::from_millis(500), tx)?;
-        debouncer
-            .watcher()
-            .watch(spec_path.as_ref(), RecursiveMode::NonRecursive)?;
-        std::thread::spawn(move || {
-            for result in rx {
-                match result {
-                    Ok(_) => {
-                        if let Ok(mut f) = flag.lock() {
-                            *f = true;
-                        }
-                    }
-                    Err(e) => tracing::warn!("Watch error: {:?}", e),
-                }
-            }
-        });
-        Some(debouncer)
-    };
-
-    let event_loop = EventLoop::new()?;
-    event_loop.set_control_flow(ControlFlow::Poll);
-
     let current_seed = spec.seed.value.unwrap_or(42);
 
     let mut app = TexEditApp {
         spec,
         spec_path,
         map_params,
-        reload_flag,
-        _watcher,
 
         snarl,
         selected_node: None,
@@ -170,21 +152,14 @@ pub fn run(args: TexEditArgs) -> Result<()> {
         texture_tiled: false,
 
         // Window / GPU
-        args,
         window: None,
         render_context: None,
 
         // egui
         egui_ctx: egui::Context::default(),
-        egui_winit: None,
-        egui_renderer: None,
         egui_textures: Vec::new(),
         show_ui: true,
-
-        // FPS
-        frame_times: VecDeque::new(),
         fps: 0.0,
-        last_fps_update: Instant::now(),
 
         // Undo
         undo_stack: Vec::new(),
@@ -197,20 +172,15 @@ pub fn run(args: TexEditArgs) -> Result<()> {
 
     // Auto-assign IDs to any nodes that don't have them (upgrades legacy specs)
     app.ensure_all_ids();
-
-    event_loop.run_app(&mut app)?;
-    Ok(())
+    Ok(app)
 }
 
 // ─── App state ──────────────────────────────────────────────────────────────
 
-struct TexEditApp {
+pub struct TexEditApp {
     spec: ProcGenSpec,
     spec_path: PathBuf,
     map_params: TextureMapParams,
-    reload_flag: Arc<Mutex<bool>>,
-    #[allow(dead_code)]
-    _watcher: Option<notify_debouncer_mini::Debouncer<notify::RecommendedWatcher>>,
 
     // Node graph
     snarl: Snarl<TextureNode>,
@@ -238,21 +208,16 @@ struct TexEditApp {
     texture_tiled: bool,
 
     // Window / GPU
-    args: TexEditArgs,
     window: Option<Arc<Window>>,
-    render_context: Option<RenderContext>,
+    /// The host's GPU (#712)
+    render_context: Option<Gpu>,
 
     // egui
     egui_ctx: egui::Context,
-    egui_winit: Option<egui_winit::State>,
-    egui_renderer: Option<egui_wgpu::Renderer>,
     egui_textures: Vec<(String, egui::TextureHandle)>,
     show_ui: bool,
-
-    // FPS
-    frame_times: VecDeque<Instant>,
+    /// The host's frames-a-second readout
     fps: f32,
-    last_fps_update: Instant,
 
     // Undo
     undo_stack: Vec<UndoSnapshot>,
@@ -271,37 +236,15 @@ struct UndoSnapshot {
 // ─── Initialization ─────────────────────────────────────────────────────────
 
 impl TexEditApp {
-    fn initialize(&mut self, event_loop: &ActiveEventLoop) {
-        let title = format!("Flint Tex Edit \u{2014} {}", self.spec.meta.name);
-
-        let window = Arc::new(
-            event_loop
-                .create_window(
-                    Window::default_attributes()
-                        .with_title(&title)
-                        .with_inner_size(PhysicalSize::new(self.args.width, self.args.height)),
-                )
-                .expect("Failed to create window"),
-        );
-
-        let context = pollster::block_on(RenderContext::new(window.clone()))
-            .expect("Failed to create render context");
-
-        // egui
-        let egui_winit = egui_winit::State::new(
-            self.egui_ctx.clone(),
-            egui::ViewportId::ROOT,
-            &window,
-            Some(window.scale_factor() as f32),
-            None,
-            None,
-        );
-        let egui_renderer =
-            egui_wgpu::Renderer::new(&context.device, context.config.format, None, 1, false);
-        self.egui_winit = Some(egui_winit);
-        self.egui_renderer = Some(egui_renderer);
-        self.render_context = Some(context);
-        self.window = Some(window);
+    /// The window's or the still's GPU is here (#712): the pipeline run
+    /// once, so the first frame has its outputs.
+    fn initialize(&mut self, cx: InitCx) -> Result<()> {
+        self.egui_ctx = cx.egui.clone();
+        self.window = cx.window;
+        self.render_context = Some(cx.gpu.clone());
+        self.dirty = false;
+        self.regenerate();
+        Ok(())
     }
 
     /// Generate a unique node ID for an op type, given a set of existing IDs.
@@ -830,9 +773,8 @@ impl<'a> SnarlViewer<TextureNode> for TexEditViewer<'a> {
         &mut self,
         pin: &egui_snarl::InPin,
         ui: &mut egui::Ui,
-        _scale: f32,
         snarl: &mut Snarl<TextureNode>,
-    ) -> PinInfo {
+    ) -> impl SnarlPin + 'static {
         let node = &snarl[pin.id.node];
         let channels = node.input_channels();
         let channel = channels.get(pin.id.input).copied().unwrap_or("?");
@@ -845,9 +787,8 @@ impl<'a> SnarlViewer<TextureNode> for TexEditViewer<'a> {
         &mut self,
         pin: &egui_snarl::OutPin,
         ui: &mut egui::Ui,
-        _scale: f32,
         snarl: &mut Snarl<TextureNode>,
-    ) -> PinInfo {
+    ) -> impl SnarlPin + 'static {
         let node = &snarl[pin.id.node];
         let channels = node.output_channels();
         let channel = channels.get(pin.id.output).copied().unwrap_or("?");
@@ -862,9 +803,10 @@ impl<'a> SnarlViewer<TextureNode> for TexEditViewer<'a> {
         _inputs: &[egui_snarl::InPin],
         _outputs: &[egui_snarl::OutPin],
         ui: &mut egui::Ui,
-        scale: f32,
         snarl: &mut Snarl<TextureNode>,
     ) {
+        // egui-snarl 0.7+ zooms the Ui itself, so sizes here are unscaled (#945)
+        let scale = 1.0_f32;
         ui.vertical(|ui| {
             // Show preview thumbnail if available
             if let Some(handle) = self.app.node_preview_textures.get(&node) {
@@ -952,7 +894,6 @@ impl<'a> SnarlViewer<TextureNode> for TexEditViewer<'a> {
         &mut self,
         pos: egui::Pos2,
         ui: &mut egui::Ui,
-        _scale: f32,
         snarl: &mut Snarl<TextureNode>,
     ) {
         ui.label("Add Op");
@@ -976,7 +917,7 @@ impl<'a> SnarlViewer<TextureNode> for TexEditViewer<'a> {
                     self.app.push_undo();
                     snarl.insert_node(pos, node);
                     self.app.mark_dirty();
-                    ui.close_menu();
+                    ui.close();
                 }
             }
         }
@@ -988,7 +929,6 @@ impl<'a> SnarlViewer<TextureNode> for TexEditViewer<'a> {
         _inputs: &[egui_snarl::InPin],
         _outputs: &[egui_snarl::OutPin],
         ui: &mut egui::Ui,
-        _scale: f32,
         snarl: &mut Snarl<TextureNode>,
     ) {
         if matches!(&snarl[node], TextureNode::Op { .. }) {
@@ -999,288 +939,168 @@ impl<'a> SnarlViewer<TextureNode> for TexEditViewer<'a> {
                     self.app.selected_node = None;
                 }
                 self.app.mark_dirty();
-                ui.close_menu();
+                ui.close();
             }
         }
     }
 }
 
-// ─── ApplicationHandler ────────────────────────────────────────────────────
+// ─── The host's editor (#712) ───────────────────────────────────────────────
 
-impl ApplicationHandler for TexEditApp {
-    fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        if self.window.is_none() {
-            self.initialize(event_loop);
+impl Editor for TexEditApp {
+    fn title(&self) -> String {
+        format!("Flint Tex Edit \u{2014} {}", self.spec.meta.name)
+    }
+
+    fn init(&mut self, cx: InitCx) -> Result<()> {
+        self.initialize(cx)
+    }
+
+    fn watched_files(&self) -> Vec<PathBuf> {
+        vec![self.spec_path.clone()]
+    }
+
+    /// The spec changed on disk, unless by our own save.
+    fn on_file_changed(&mut self) {
+        if let Some(until) = self.watcher_paused_until {
+            if Instant::now() < until {
+                return;
+            }
+            self.watcher_paused_until = None;
+        }
+        self.reload_from_disk();
+    }
+
+    fn resized(&mut self, gpu: &Gpu) {
+        self.render_context = Some(gpu.clone());
+    }
+
+    fn event(&mut self, event: &WindowEvent) -> Flow {
+        let WindowEvent::KeyboardInput { event, .. } = event else {
+            return Flow::Pass;
+        };
+        if event.state != ElementState::Pressed {
+            return Flow::Pass;
+        }
+        match event.physical_key {
+            PhysicalKey::Code(KeyCode::Tab) => {
+                self.show_ui = !self.show_ui;
+            }
+            PhysicalKey::Code(KeyCode::KeyR) => {
+                self.current_seed = random_seed();
+                self.mark_dirty();
+            }
+            PhysicalKey::Code(KeyCode::KeyS) if self.egui_ctx.input(|i| i.modifiers.ctrl) => {
+                self.save_spec();
+            }
+            PhysicalKey::Code(KeyCode::KeyE) if self.egui_ctx.input(|i| i.modifiers.ctrl) => {
+                self.export_textures();
+            }
+            PhysicalKey::Code(KeyCode::KeyZ)
+                if self
+                    .egui_ctx
+                    .input(|i| i.modifiers.ctrl && !i.modifiers.shift) =>
+            {
+                self.undo();
+            }
+            PhysicalKey::Code(KeyCode::KeyZ)
+                if self
+                    .egui_ctx
+                    .input(|i| i.modifiers.ctrl && i.modifiers.shift) =>
+            {
+                self.redo();
+            }
+            PhysicalKey::Code(KeyCode::Delete) => {
+                if let Some(node_id) = self.selected_node {
+                    if matches!(self.snarl.get_node(node_id), Some(TextureNode::Op { .. })) {
+                        self.push_undo();
+                        self.snarl.remove_node(node_id);
+                        self.selected_node = None;
+                        self.mark_dirty();
+                    }
+                }
+            }
+            _ => return Flow::Pass,
+        }
+        Flow::Handled
+    }
+
+    fn update(&mut self, tick: Tick) {
+        self.fps = tick.fps;
+        // Debounced regeneration
+        if self.dirty && self.last_change.elapsed() >= Duration::from_millis(self.debounce_ms) {
+            self.dirty = false;
+            self.regenerate();
         }
     }
 
-    fn window_event(
-        &mut self,
-        event_loop: &ActiveEventLoop,
-        _window_id: WindowId,
-        event: WindowEvent,
-    ) {
-        // Pass events to egui
-        if let Some(egui_winit) = &mut self.egui_winit {
-            if let Some(window) = &self.window {
-                let resp = egui_winit.on_window_event(window.as_ref(), &event);
-                if resp.consumed {
-                    return;
-                }
-            }
+    /// The node editor is all panels, over dark grey.
+    fn draw(&mut self, target: &Target) {
+        target.clear([0.12, 0.12, 0.14]);
+    }
+
+    fn ui(&mut self, ui: &mut egui::Ui) {
+        self.draw_ui(ui);
+    }
+
+    /// The pipeline's output maps side by side, in the order it names them.
+    fn still(&mut self, _options: &StillOptions) -> Result<Option<image::RgbaImage>> {
+        if self.last_images.is_empty() {
+            let why = self
+                .status_message
+                .as_ref()
+                .map_or("it made no images".to_string(), |(m, _)| m.clone());
+            anyhow::bail!("'{}': {why}", self.spec_path.display());
         }
+        let (width, height) = self
+            .render_context
+            .as_ref()
+            .map_or((1, 1), |gpu| (gpu.width, gpu.height));
+        let images: Vec<image::RgbaImage> = self
+            .last_images
+            .iter()
+            .filter_map(|img| image::RgbaImage::from_raw(img.width, img.height, img.pixels.clone()))
+            .collect();
+        Ok(Some(host::image_sheet(
+            &images,
+            width,
+            height,
+            [31, 31, 36],
+        )))
+    }
 
-        match event {
-            WindowEvent::CloseRequested => event_loop.exit(),
-
-            WindowEvent::Resized(new_size) => {
-                if let Some(ctx) = &mut self.render_context {
-                    if new_size.width > 0 && new_size.height > 0 {
-                        ctx.config.width = new_size.width;
-                        ctx.config.height = new_size.height;
-                        ctx.surface.configure(&ctx.device, &ctx.config);
-                    }
-                }
-            }
-
-            WindowEvent::KeyboardInput { event, .. } => {
-                if event.state == ElementState::Pressed {
-                    match event.physical_key {
-                        PhysicalKey::Code(KeyCode::Tab) => {
-                            self.show_ui = !self.show_ui;
-                        }
-                        PhysicalKey::Code(KeyCode::KeyR) => {
-                            self.current_seed = random_seed();
-                            self.mark_dirty();
-                        }
-                        PhysicalKey::Code(KeyCode::KeyS)
-                            if self.egui_ctx.input(|i| i.modifiers.ctrl) =>
-                        {
-                            self.save_spec();
-                        }
-                        PhysicalKey::Code(KeyCode::KeyE)
-                            if self.egui_ctx.input(|i| i.modifiers.ctrl) =>
-                        {
-                            self.export_textures();
-                        }
-                        PhysicalKey::Code(KeyCode::KeyZ)
-                            if self
-                                .egui_ctx
-                                .input(|i| i.modifiers.ctrl && !i.modifiers.shift) =>
-                        {
-                            self.undo();
-                        }
-                        PhysicalKey::Code(KeyCode::KeyZ)
-                            if self
-                                .egui_ctx
-                                .input(|i| i.modifiers.ctrl && i.modifiers.shift) =>
-                        {
-                            self.redo();
-                        }
-                        PhysicalKey::Code(KeyCode::Delete) => {
-                            if let Some(node_id) = self.selected_node {
-                                if matches!(
-                                    self.snarl.get_node(node_id),
-                                    Some(TextureNode::Op { .. })
-                                ) {
-                                    self.push_undo();
-                                    self.snarl.remove_node(node_id);
-                                    self.selected_node = None;
-                                    self.mark_dirty();
-                                }
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-            }
-
-            WindowEvent::RedrawRequested => {
-                self.frame_times.push_back(Instant::now());
-                while self
-                    .frame_times
-                    .front()
-                    .is_some_and(|t| t.elapsed() > Duration::from_secs(1))
-                {
-                    self.frame_times.pop_front();
-                }
-                if self.last_fps_update.elapsed() > Duration::from_millis(500) {
-                    self.fps = self.frame_times.len() as f32;
-                    self.last_fps_update = Instant::now();
-                }
-
-                // Check file watcher
-                let should_reload = if let Some(until) = self.watcher_paused_until {
-                    if Instant::now() > until {
-                        self.watcher_paused_until = None;
-                        false
-                    } else {
-                        false
-                    }
-                } else if let Ok(mut flag) = self.reload_flag.lock() {
-                    if *flag {
-                        *flag = false;
-                        true
-                    } else {
-                        false
-                    }
-                } else {
-                    false
-                };
-                if should_reload {
-                    self.reload_from_disk();
-                }
-
-                // Debounced regeneration
-                if self.dirty
-                    && self.last_change.elapsed() >= Duration::from_millis(self.debounce_ms)
-                {
-                    self.dirty = false;
-                    self.regenerate();
-                }
-
-                self.render_frame();
-            }
-            _ => {}
-        }
-
-        // Request continuous redraw
-        if let Some(window) = &self.window {
-            window.request_redraw();
-        }
+    fn still_note(&self) -> Option<String> {
+        let names: Vec<String> = self
+            .last_images
+            .iter()
+            .map(|img| format!("{:?}", img.channel_semantics))
+            .collect();
+        Some(format!("maps, left to right: {}", names.join(", ")))
     }
 }
-
-// ─── Rendering ──────────────────────────────────────────────────────────────
 
 impl TexEditApp {
-    fn render_frame(&mut self) {
-        if self.render_context.is_none() || self.window.is_none() {
-            return;
-        }
-
-        // Take egui input before draw_ui so we don't hold borrows across it
-        let window = self.window.clone().unwrap();
-        let raw_input = self
-            .egui_winit
-            .as_mut()
-            .unwrap()
-            .take_egui_input(window.as_ref());
-        self.egui_ctx.begin_pass(raw_input);
-        self.draw_ui();
-        let full_output = self.egui_ctx.end_pass();
-
-        self.egui_winit
-            .as_mut()
-            .unwrap()
-            .handle_platform_output(window.as_ref(), full_output.platform_output);
-
-        let paint_jobs = self
-            .egui_ctx
-            .tessellate(full_output.shapes, self.egui_ctx.pixels_per_point());
-
-        let ctx = self.render_context.as_ref().unwrap();
-
-        let surface_texture = match ctx.surface.get_current_texture() {
-            Ok(t) => t,
-            Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
-                ctx.surface.configure(&ctx.device, &ctx.config);
-                return;
-            }
-            Err(e) => {
-                tracing::warn!("Surface error: {e}");
-                return;
-            }
-        };
-
-        let view = surface_texture
-            .texture
-            .create_view(&wgpu::TextureViewDescriptor::default());
-
-        let screen_descriptor = egui_wgpu::ScreenDescriptor {
-            size_in_pixels: [ctx.config.width, ctx.config.height],
-            pixels_per_point: window.scale_factor() as f32,
-        };
-
-        // Take renderer out to avoid borrow conflicts (same pattern as gen_preview)
-        let mut egui_renderer = self.egui_renderer.take().unwrap();
-
-        for (id, delta) in &full_output.textures_delta.set {
-            egui_renderer.update_texture(&ctx.device, &ctx.queue, *id, delta);
-        }
-
-        let mut encoder = ctx
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("tex_edit_encoder"),
-            });
-
-        egui_renderer.update_buffers(
-            &ctx.device,
-            &ctx.queue,
-            &mut encoder,
-            &paint_jobs,
-            &screen_descriptor,
-        );
-
-        {
-            let render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("tex_edit_egui_pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: 0.12,
-                            g: 0.12,
-                            b: 0.14,
-                            a: 1.0,
-                        }),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-            });
-
-            let mut render_pass = render_pass.forget_lifetime();
-            egui_renderer.render(&mut render_pass, &paint_jobs, &screen_descriptor);
-        }
-
-        ctx.queue.submit(std::iter::once(encoder.finish()));
-        surface_texture.present();
-
-        for id in &full_output.textures_delta.free {
-            egui_renderer.free_texture(id);
-        }
-
-        self.egui_renderer = Some(egui_renderer);
-    }
-
-    fn draw_ui(&mut self) {
+    fn draw_ui(&mut self, ui: &mut egui::Ui) {
         if !self.show_ui {
             return;
         }
 
-        let ctx = self.egui_ctx.clone();
-
         // ── Left panel: Node Properties ──
-        egui::SidePanel::left("properties_panel")
-            .default_width(280.0)
-            .show(&ctx, |ui| {
+        egui::Panel::left("properties_panel")
+            .default_size(280.0)
+            .show(ui, |ui| {
                 self.draw_properties_panel(ui);
             });
 
         // ── Right panel: Output Preview ──
-        egui::SidePanel::right("preview_panel")
-            .default_width(320.0)
-            .show(&ctx, |ui| {
+        egui::Panel::right("preview_panel")
+            .default_size(320.0)
+            .show(ui, |ui| {
                 self.draw_preview_panel(ui);
             });
 
         // ── Center: Node Graph Canvas ──
-        egui::CentralPanel::default().show(&ctx, |ui| {
+        egui::CentralPanel::default().show(ui, |ui| {
             self.draw_graph_panel(ui);
         });
     }
@@ -1570,7 +1390,9 @@ impl TexEditApp {
 
     fn draw_graph_panel(&mut self, ui: &mut egui::Ui) {
         // Check for node selection via click
-        let selected = Snarl::<TextureNode>::get_selected_nodes("tex_edit_snarl", ui);
+        // The id `Snarl::show` gives the graph below, on this same Ui
+        let selected =
+            egui_snarl::ui::get_selected_nodes(ui.make_persistent_id("tex_edit_snarl"), ui.ctx());
         if let Some(&node_id) = selected.first() {
             self.selected_node = Some(node_id);
         }

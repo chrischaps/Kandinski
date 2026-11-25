@@ -3,12 +3,12 @@
 //!
 //! Only flags whose semantics *and* help text are identical across the
 //! commands belong here — a flag whose doc comment differs per command
-//! (e.g. `--ladder`, whose replay-chart help documents the `--render`
+//! (e.g. `--ladder`, whose `chart replay` help documents the `--render`
 //! coupling) stays declared on each command so `--help` keeps saying the
 //! right thing.
 
-/// The manifest/chart/base-dir trio shared by `play-chart` and
-/// `replay-chart`.
+/// The manifest/chart/base-dir trio shared by `music chart play` and
+/// `music chart replay`.
 #[derive(clap::Args)]
 pub struct ChartCommonArgs {
     /// Path to the suite manifest (.suite.toml)
@@ -44,29 +44,34 @@ pub struct StyleArgs {
 }
 
 impl StyleArgs {
-    /// Check every `--style` word against the registry. The value parser
-    /// lets an unknown name through, since a user-authored style (#274) is
-    /// registered only once the scene's folder is known; call this after
-    /// `stylize::custom::load_dir`.
-    pub fn check(&self) -> Result<(), String> {
+    /// Check every `--style` word against `styles`. The value parser lets
+    /// an unknown name through, since a user-authored style (#274) is known
+    /// only once the scene's folder is: call this with the scene's registry
+    /// (`SceneBinding::styles`).
+    pub fn check(&self, styles: &flint_render::stylize::StyleRegistry) -> Result<(), String> {
         for spec in &self.styles {
-            flint_render::stylize::StyleSpec::parse(spec)?;
+            flint_render::stylize::StyleSpec::parse(spec, styles)?;
         }
         Ok(())
     }
 
     /// Write every `--style` word into `config`, in order.
-    pub fn apply(&self, config: &mut flint_render::PostProcessConfig) {
+    pub fn apply(
+        &self,
+        config: &mut flint_render::PostProcessConfig,
+        styles: &flint_render::stylize::StyleRegistry,
+    ) {
         for spec in &self.styles {
-            if let Err(e) = flint_render::stylize::apply_style_spec(config, spec) {
+            if let Err(e) = flint_render::stylize::apply_style_spec(config, spec, styles) {
                 eprintln!("warning: --style {spec}: {e}");
             }
         }
     }
 
     /// Apply the words to `renderer`'s config and build the styles they
-    /// turned on; set the post time. A no-op without either flag, so a
-    /// capture without them is unchanged.
+    /// turned on. A no-op without any, so a capture without them is
+    /// unchanged. The post time goes in with the frame's inputs
+    /// ([`look_time`](Self::look_time)).
     pub fn apply_to_renderer(
         &self,
         renderer: &mut flint_render::SceneRenderer,
@@ -74,18 +79,21 @@ impl StyleArgs {
     ) {
         if !self.styles.is_empty() {
             let mut config = renderer.post_process_config().clone();
-            self.apply(&mut config);
+            self.apply(&mut config, renderer.styles());
             renderer.set_post_process_config(config);
             renderer.ensure_style_resources(device);
         }
-        if let Some(t) = self.style_time {
-            renderer.ocean_time = t as f64;
-        }
+    }
+
+    /// `--style-time` as the frame's `look_time`: the post time animated
+    /// styles see, held there (#328); none leaves it at the frame's clock.
+    pub fn look_time(&self) -> Option<f64> {
+        self.style_time.map(f64::from)
     }
 }
 
 fn parse_style_spec(s: &str) -> Result<String, String> {
-    match flint_render::stylize::StyleSpec::parse(s) {
+    match flint_render::stylize::StyleSpec::parse(s, &flint_render::stylize::StyleRegistry::new()) {
         Ok(_) => Ok(s.to_string()),
         // Maybe a user style the scene's styles/ folder registers (#274):
         // StyleArgs::check decides once it is loaded
@@ -196,6 +204,33 @@ pub fn load_schemas(
     }
 }
 
+/// The scene at `path`, for a command: [`flint_scene::load_scene`] whose
+/// failure names the file ([`flint_scene::load_failed`], #1044), so an
+/// agent running a command over a folder of scenes knows which one to
+/// open. Every command loads its scene through this, or through
+/// [`load_settled`].
+pub fn load_scene(
+    path: &str,
+    registry: &flint_schema::SchemaRegistry,
+) -> anyhow::Result<(flint_ecs::FlintWorld, flint_scene::SceneFile)> {
+    use anyhow::Context;
+    flint_scene::load_scene(path, registry).with_context(|| flint_scene::load_failed(path))
+}
+
+/// [`load_scene`], then living props' tables checked and the preset
+/// `[wooze] preset` names filled in (`flint_procgen::settle_scene`), as the
+/// player loads one: a scene loaded for drawing.
+pub fn load_settled(
+    path: &str,
+    registry: &flint_schema::SchemaRegistry,
+) -> anyhow::Result<(flint_ecs::FlintWorld, flint_scene::SceneFile)> {
+    use anyhow::Context;
+    let (world, mut scene_file) = load_scene(path, registry)?;
+    flint_procgen::settle_scene(&mut scene_file, std::path::Path::new(path))
+        .with_context(|| flint_scene::load_failed(path))?;
+    Ok((world, scene_file))
+}
+
 /// TEMPORARY, for one release (ADR 0114 decision 3, #765): say on stderr
 /// which `schemas/` beside the scene this command used to add to its
 /// `--schemas` flags and no longer does. For the commands that did add
@@ -206,10 +241,33 @@ pub fn warn_dropped_schemas(dirs: &flint_schema::SchemaDirs) {
     }
 }
 
+/// The value of a `--max-cost` flag: dollars, `$` allowed, not negative.
+/// Here, not in `ai_costs`, so the flag parses alike in a build without the
+/// ai package (#1333), whose command then names the package.
+pub fn parse_usd(s: &str) -> std::result::Result<f64, String> {
+    let v: f64 = s
+        .trim()
+        .trim_start_matches('$')
+        .parse()
+        .map_err(|_| format!("'{s}' isn't an amount in USD (e.g. 0.50)"))?;
+    if !v.is_finite() || v < 0.0 {
+        return Err(format!("--max-cost must be a non-negative amount, not {s}"));
+    }
+    Ok(v)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use flint_render::DebugMode;
+
+    #[test]
+    fn usd_amounts_parse() {
+        assert_eq!(parse_usd("1.00"), Ok(1.0));
+        assert_eq!(parse_usd("$0.50"), Ok(0.5));
+        assert!(parse_usd("-1").is_err());
+        assert!(parse_usd("lots").is_err());
+    }
 
     /// #308: `wireframe-overlay` was matched in render.rs and refused here.
     /// Now there is one table; this holds it to the renderer's modes: every

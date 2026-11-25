@@ -11,7 +11,7 @@
 //!
 //! They lived in flint-scene until #686, as fields of `SceneFile`; the move
 //! changed where they are, not what they do. Their schemas are
-//! `schemas/scene/living.toml` and `schemas/scene/wooze.toml`.
+//! `packages/living/schemas/scene/living.toml` and `wooze.toml`.
 
 mod commit;
 mod wooze;
@@ -47,6 +47,24 @@ impl LivingTables {
             living: read_table(scene, "living")?,
             wooze: read_table(scene, "wooze")?,
         })
+    }
+
+    /// Each of the two tables that doesn't fit its type, by name, with what
+    /// serde said: what [`of`](Self::of) stops at, but for both tables, so a
+    /// check can report each (#807).
+    pub fn problems(scene: &SceneFile) -> Vec<(&'static str, String)> {
+        let living = read_table::<LivingDef>(scene, "living").err();
+        let wooze = read_table::<WoozeDef>(scene, "wooze").err();
+        [("living", living), ("wooze", wooze)]
+            .into_iter()
+            .filter_map(|(name, problem)| {
+                let said = problem?;
+                let said = said
+                    .strip_prefix(&format!("[{name}]: "))
+                    .map_or(said.clone(), str::to_string);
+                Some((name, said))
+            })
+            .collect()
     }
 
     /// [`of`](Self::of) for a scene that has been through [`settle_scene`],
@@ -178,6 +196,14 @@ pub struct LivingDef {
     /// the body fades where it turns away from the eye. 0 is a hard edge.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub softness: Option<f32>,
+    /// How fast every prop's boil ticks (#529), times each spec's `jitter.step`
+    /// pace, 0 (held) to 8: 2 is twice as fast, 0.5 half.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jitter_rate: Option<f32>,
+    /// How fast every form's words drift along their lines (#576), times each
+    /// spec's `row_pace`, 0 (held) to 8: 2 is twice as fast.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub row_rate: Option<f32>,
     /// Faint time-offset copies of every prop. Fields left unset are each spec's.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub echoes: Option<LivingEchoesDef>,
@@ -216,6 +242,13 @@ pub struct LivingSpeciesDef {
     /// How soft its silhouette is, 0 to 1 (#582).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub softness: Option<f32>,
+    /// How fast its boil ticks, times its spec's pace (#529).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jitter_rate: Option<f32>,
+    /// How fast its words drift along their lines, times its spec's
+    /// `row_pace` (#576).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub row_rate: Option<f32>,
     /// Its echoes, a field at a time.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub echoes: Option<LivingEchoesDef>,

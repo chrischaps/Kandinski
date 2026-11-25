@@ -29,6 +29,26 @@ nul
 # Test screenshots and render output
 screenshots/
 renders/
+# Frame captures for the frame debugger (#1086): renders of a game's content;
+# and what `flint capture` writes beside a shot list by default (#722)
+captures/
+# The scope recorder's traces (#1097): Shift+F3 and --trace-on-hitch write
+# them to traces/ at the project's root; they name a game's scripts and assets
+traces/
+# ...but not the hand-made ones `flint profile`'s tests read (#1098)
+!/tests/fixtures/traces/
+# What a `flint render` with no --output writes to the working directory,
+# one frame or a sequence (#760)
+render.png
+render_[0-9][0-9][0-9][0-9].png
+/test.png
+
+# Coverage runs (LLVM writes default_*.profraw beside each test process) and
+# Git Bash crash dumps (#760)
+*.profraw
+*.profdata
+lcov.info
+*.stackdump
 
 # Raw/source assets (untracked)
 raw_assets/
@@ -52,11 +72,14 @@ arch-data.json
 
 # trunk output for the web spike (crates/flint-player/index.html)
 /crates/flint-player/dist/
-# `flint export web examples/` (#106) and `flint bundle demo` write here
-/examples/dist/
+# The examples' repository, cloned into the checkout (#984): every
+# `flint-examples/<path>` in the tree is a path once it's here
+/flint-examples/
 
 # Procgen outputs kept between runs (#181); rebuilt on demand
 **/.flint/procgen-cache/
+# What `flint edit` saves write for an agent to read (#679)
+**/.flint/viewer-edits.jsonl
 
-# Python bytecode (tools/showcase)
+# Python bytecode
 __pycache__/

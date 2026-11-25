@@ -60,9 +60,11 @@
 //! them, stretched along the dash, its ink the strip's dark or opaque
 //! texels. Both are read through [`images`](super::images) with no
 //! sampler; with none named the procedural paper and dashes draw exactly
-//! as before. One paper and one strip a frame: the scene table's, else the
-//! first entity's that names one; a row naming another draws procedurally
-//! (warned once).
+//! as before. Each entity may name its own (#547): the papers a frame
+//! uses are stacked as layers of one texture array, and the strips as
+//! another, up to [`MAX_LAYERS`] of each, each row carrying the layer it
+//! reads; a row naming one more draws procedurally (warned once, naming
+//! its entity, #740).
 //!
 //! ## Tone from the light (#869)
 //!
@@ -99,11 +101,25 @@
 //! screen cross-faded with the next as a mip chain does, so strokes keep
 //! their size on screen at any distance; `direction` is not used (the sky
 //! keeps the screen's hatching), `angle` turns the strokes in each plane.
+//!
+//! World strokes stay put while the camera moves, so a prop moving through
+//! the world (a rolling cask) slides under them. `grid = "local"` (#544)
+//! hatches the same stripes on the styled root's own position: its row
+//! carries the root's world-to-local matrix (the held one under a motion
+//! hold), and the draw pass takes the world position, its derivatives and
+//! the normal into that space first. A rigid prop's strokes ride on it
+//! exactly, its children's too while they move with it; a skinned mesh's
+//! surfaces move within that frame, so its strokes still swim (that would
+//! need a rest-pose position from the scene pass). The whole frame's row
+//! has no root, so a table's `local` is `world`.
 
-use super::images::{ImageSlot, ImageUse, StyleImage};
+use crate::gpu_counts::{CountedDevice, CountedQueue};
+pub use super::images::{names_image, NO_IMAGE};
+use super::images::{ImageStack, ImageUse, LayerInfo, Stacked, StackedImages, MAX_LAYERS};
 use super::kit;
+use super::variant_table::{report_drop, storage_entry, VariantTable};
 use super::{
-    StyleDescriptor, StyleDevice, StyleFrame, StyleHint, StyleInput, StyleOption, StyleParam,
+    StyleDescriptor, StyleDevice, StyleFrame, StyleInput, StyleOption, StyleParam,
     StylePass, StyleStage,
 };
 use bytemuck::{Pod, Zeroable};
@@ -115,9 +131,10 @@ pub const DIRECTIONS: &[&str] = &["surface", "screen", "tensor"];
 /// What a `[post_process.styles.pencil]` table covers (as ASCII's).
 pub const SCOPES: &[&str] = &["screen", "entities"];
 
-/// Where a variant's hatching is anchored: ASCII's two grids, and `world`,
-/// strokes laid on the surfaces themselves (#389).
-pub const GRIDS: &[&str] = &["screen", "object", "world"];
+/// Where a variant's hatching is anchored: ASCII's two grids, `world`,
+/// strokes laid on the surfaces themselves (#389), and `local`, laid on
+/// them in the entity's own space, so they ride on a moving prop (#544).
+pub const GRIDS: &[&str] = &["screen", "object", "world", "local"];
 
 /// Where the tone comes from (#869): the picture's luminance, or the light
 /// alone (the picture over its albedo).
@@ -126,12 +143,6 @@ pub const TONES: &[&str] = &["picture", "light"];
 /// How a blend below 1 shows the drawing (#879): a cross-fade of every
 /// pixel, or drawn on, outlines first, then hatching, then the paper.
 pub const TRANSITIONS: &[&str] = &["fade", "draw"];
-
-/// Rows one frame's variant table holds, the whole frame's included.
-pub const MAX_VARIANTS: usize = 64;
-
-/// Mask ids the table covers.
-pub const MAX_IDS: usize = 256;
 
 /// The scratch target pass 1 writes: tone, contour, flow.
 pub const PREP_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
@@ -143,39 +154,87 @@ pub const FLOW_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rg16Float;
 const TENSOR: f32 = 2.0;
 
 const PARAMS: &[StyleParam] = &[
-    StyleParam::new("spacing", 6.0, 2.0..=24.0),
-    StyleParam::new("thickness", 1.0, 0.25..=4.0),
-    StyleParam::new("layers", 3.0, 0.0..=4.0),
-    StyleParam::new("angle", 50.0, 0.0..=180.0),
-    StyleParam::new("brightness", 0.0, -1.0..=1.0),
-    StyleParam::new("contrast", 1.2, 0.0..=4.0),
-    StyleParam::new("darkness", 0.85, 0.0..=1.0),
-    StyleParam::new("shade", 0.25, 0.0..=1.0),
-    StyleParam::new("contour", 1.0, 0.0..=2.0),
-    StyleParam::new("contour_width", 1.25, 0.5..=4.0),
-    StyleParam::new("depth", 1.0, 0.0..=4.0),
-    StyleParam::new("grazing", 0.0, 0.0..=1.0),
-    StyleParam::new("clutter", 0.0, 0.0..=1.0),
-    StyleParam::new("crease", 1.0, 0.0..=4.0),
-    StyleParam::new("detail", 0.35, 0.0..=2.0),
-    StyleParam::new("wobble", 1.5, 0.0..=8.0),
-    StyleParam::new("sketchy", 0.6, 0.0..=1.0),
-    StyleParam::new("grain", 0.5, 0.0..=1.0),
-    StyleParam::new("color", 0.0, 0.0..=1.0),
-    StyleParam::new("seed", 0.0, 0.0..=9999.0),
-    StyleParam::new("boil", 0.0, 0.0..=24.0),
-    StyleParam::new("paper_r", 0.95, 0.0..=1.0),
+    StyleParam::new("spacing", 6.0, 2.0..=24.0)
+        .label("Spacing (pt)")
+        .help("Hatch line spacing in points"),
+    StyleParam::new("thickness", 1.0, 0.25..=4.0)
+        .label("Stroke width (pt)")
+        .help("Hatch stroke width in points"),
+    StyleParam::new("layers", 3.0, 0.0..=4.0)
+        .label("Hatch layers")
+        .help("Up to four; each joins, crossing the last, as the tone darkens")
+        .integer(),
+    StyleParam::new("angle", 50.0, 0.0..=180.0)
+        .label("Angle (deg)")
+        .help("The base hatch angle; where surface or tensor directions are unsure it shows through"),
+    StyleParam::new("brightness", 0.0, -1.0..=1.0)
+        .label("Brightness")
+        .help("Shifts the tone before it picks hatch layers"),
+    StyleParam::new("contrast", 1.2, 0.0..=4.0)
+        .label("Contrast")
+        .help("Spreads the tone around mid-grey before it picks hatch layers"),
+    StyleParam::new("darkness", 0.85, 0.0..=1.0)
+        .label("Stroke darkness")
+        .help("How dark one hatch stroke is"),
+    StyleParam::new("shade", 0.25, 0.0..=1.0)
+        .label("Rubbed shade")
+        .help("Soft graphite under the strokes, in the darks"),
+    StyleParam::new("contour", 1.0, 0.0..=2.0).label("Outline").help("Outline strength; 0 = none"),
+    StyleParam::new("contour_width", 1.25, 0.5..=4.0)
+        .label("Outline width (pt)")
+        .help("Outline width in points"),
+    StyleParam::new("depth", 1.0, 0.0..=4.0)
+        .label("Silhouettes")
+        .help("Outline sensitivity to depth steps"),
+    StyleParam::new("grazing", 0.0, 0.0..=1.0)
+        .label("Spare grazing planes")
+        .help("1 draws a silhouette only at a true step, so a floor seen edge-on doesn't ink the horizon in a band; 0 = every depth step"),
+    StyleParam::new("clutter", 0.0, 0.0..=1.0)
+        .label("Spare clutter")
+        .help("1 drops the lines of a field of small silhouettes (a meadow's blades) where they would merge into a black fill, keeping near blades and true outlines; 0 = every line"),
+    StyleParam::new("crease", 1.0, 0.0..=4.0)
+        .label("Creases")
+        .help("Outline sensitivity to where the surface turns"),
+    StyleParam::new("detail", 0.35, 0.0..=2.0)
+        .label("Texture lines")
+        .help("Outlines from the picture's own luminance edges"),
+    StyleParam::new("wobble", 1.5, 0.0..=8.0)
+        .label("Wobble (pt)")
+        .help("How far lines wander off true"),
+    StyleParam::new("sketchy", 0.6, 0.0..=1.0)
+        .label("Sketchy")
+        .help("A second, offset outline beside the first"),
+    StyleParam::new("grain", 0.5, 0.0..=1.0)
+        .label("Paper grain")
+        .help("Paper grain, and how much its tooth breaks the strokes"),
+    StyleParam::new("color", 0.0, 0.0..=1.0)
+        .label("Colour")
+        .help("0 draws on paper; 1 draws over the scene's own colour (coloured pencil)"),
+    StyleParam::new("seed", 0.0, 0.0..=9999.0)
+        .label("Seed")
+        .help("Another whole number is another hand; the same seed draws the same picture")
+        .integer(),
+    StyleParam::new("boil", 0.0, 0.0..=24.0)
+        .label("Boil (per s)")
+        .help("Redraws a second, for animated lines; 0 = still"),
+    StyleParam::new("paper_r", 0.95, 0.0..=1.0)
+        .label("Paper")
+        .help("Paper colour (display values)"),
     StyleParam::new("paper_g", 0.93, 0.0..=1.0),
     StyleParam::new("paper_b", 0.88, 0.0..=1.0),
-    StyleParam::new("lead_r", 0.16, 0.0..=1.0),
+    StyleParam::new("lead_r", 0.16, 0.0..=1.0)
+        .label("Lead")
+        .help("Graphite colour (display values)"),
     StyleParam::new("lead_g", 0.16, 0.0..=1.0),
     StyleParam::new("lead_b", 0.19, 0.0..=1.0),
-    StyleParam::new("paper_scale", 1.0, 0.25..=8.0),
-    StyleParam::new("stroke_rows", 1.0, 1.0..=16.0),
+    StyleParam::new("paper_scale", 1.0, 0.25..=8.0)
+        .label("Paper scale (pt)")
+        .help("Points one texel of the paper image covers"),
+    StyleParam::new("stroke_rows", 1.0, 1.0..=16.0)
+        .label("Strokes in strip")
+        .help("How many strokes the strip stacks, top to bottom")
+        .integer(),
 ];
-
-/// The value of `paper_image` / `stroke_image` that names no image.
-pub const NO_IMAGE: &str = "none";
 
 /// The papers to offer: none, then every paper the scene can see
 /// (`papers/`, by the project's search).
@@ -194,62 +253,39 @@ fn stroke_choices(scope: &super::ChoiceScope<'_>) -> Vec<String> {
     )
 }
 
-/// Whether an image option's value names an image.
-pub fn names_image(value: &str) -> bool {
-    !value.is_empty() && value != NO_IMAGE
-}
-
 const OPTIONS: &[StyleOption] = &[
-    StyleOption::new("direction", "surface", DIRECTIONS),
-    StyleOption::new("scope", "screen", SCOPES),
-    StyleOption::new("grid", "screen", GRIDS),
-    StyleOption::new("tone", "picture", TONES),
-    StyleOption::new("transition", "fade", TRANSITIONS),
-    StyleOption::new("paper_image", NO_IMAGE, &[]).discovered(paper_choices),
-    StyleOption::new("stroke_image", NO_IMAGE, &[]).discovered(stroke_choices),
-];
-
-const HINTS: &[StyleHint] = &[
-    StyleHint::new("direction", "Stroke direction", "surface: round the form, along iso-depth lines; screen: all at the angle; tensor: along the picture's edges"),
-    StyleHint::new("scope", "Scope", "screen: the table draws the whole frame; entities: it is only the preset for pencil_style entities"),
-    StyleHint::new("grid", "Hatch anchor", "screen: hatching fixed to the screen; object: pinned to each entity's origin, so strokes travel with it; world: laid on the surfaces, so they hold as the camera moves"),
-    StyleHint::new("tone", "Tone from", "picture: hatch where the picture is dark, dark paint included; light: hatch where the light falls off (the picture over each mesh's own colour), so a dark floor in the sun stays blank and a white prop in shadow is hatched"),
-    StyleHint::new("transition", "Transition", "How a blend below 1 shows the drawing: fade cross-fades every pixel, faint all over; draw draws it on, the outlines growing along their length up to the blend, the hatching a stroke at a time after them, the paper's wash last"),
-    StyleHint::new("spacing", "Spacing (pt)", "Hatch line spacing in points"),
-    StyleHint::new("thickness", "Stroke width (pt)", "Hatch stroke width in points"),
-    StyleHint::new("layers", "Hatch layers", "Up to four; each joins, crossing the last, as the tone darkens").integer(),
-    StyleHint::new("angle", "Angle (deg)", "The base hatch angle; where surface or tensor directions are unsure it shows through"),
-    StyleHint::new("brightness", "Brightness", "Shifts the tone before it picks hatch layers"),
-    StyleHint::new("contrast", "Contrast", "Spreads the tone around mid-grey before it picks hatch layers"),
-    StyleHint::new("darkness", "Stroke darkness", "How dark one hatch stroke is"),
-    StyleHint::new("shade", "Rubbed shade", "Soft graphite under the strokes, in the darks"),
-    StyleHint::new("contour", "Outline", "Outline strength; 0 = none"),
-    StyleHint::new("contour_width", "Outline width (pt)", "Outline width in points"),
-    StyleHint::new("depth", "Silhouettes", "Outline sensitivity to depth steps"),
-    StyleHint::new("grazing", "Spare grazing planes", "1 draws a silhouette only at a true step, so a floor seen edge-on doesn't ink the horizon in a band; 0 = every depth step"),
-    StyleHint::new("clutter", "Spare clutter", "1 drops the lines of a field of small silhouettes (a meadow's blades) where they would merge into a black fill, keeping near blades and true outlines; 0 = every line"),
-    StyleHint::new("crease", "Creases", "Outline sensitivity to where the surface turns"),
-    StyleHint::new("detail", "Texture lines", "Outlines from the picture's own luminance edges"),
-    StyleHint::new("wobble", "Wobble (pt)", "How far lines wander off true"),
-    StyleHint::new("sketchy", "Sketchy", "A second, offset outline beside the first"),
-    StyleHint::new("grain", "Paper grain", "Paper grain, and how much its tooth breaks the strokes"),
-    StyleHint::new("color", "Colour", "0 draws on paper; 1 draws over the scene's own colour (coloured pencil)"),
-    StyleHint::new("seed", "Seed", "Another whole number is another hand; the same seed draws the same picture").integer(),
-    StyleHint::new("boil", "Boil (per s)", "Redraws a second, for animated lines; 0 = still"),
-    StyleHint::new("paper", "Paper", "Paper colour (display values)"),
-    StyleHint::new("lead", "Lead", "Graphite colour (display values)"),
-    StyleHint::new("paper_image", "Paper image", "A scanned paper (papers/<name>.png): its relief is the tooth, its hue tints the paper; none = procedural"),
-    StyleHint::new("paper_scale", "Paper scale (pt)", "Points one texel of the paper image covers"),
-    StyleHint::new("stroke_image", "Stroke image", "A strip of real strokes (strokes/<name>.png), one stretched along each dash; none = drawn bars"),
-    StyleHint::new("stroke_rows", "Strokes in strip", "How many strokes the strip stacks, top to bottom").integer(),
+    StyleOption::new("direction", "surface", DIRECTIONS)
+        .label("Stroke direction")
+        .help("surface: round the form, along iso-depth lines; screen: all at the angle; tensor: along the picture's edges"),
+    StyleOption::new("scope", "screen", SCOPES)
+        .label("Scope")
+        .help("screen: the table draws the whole frame; entities: it is only the preset for pencil_style entities"),
+    StyleOption::new("grid", "screen", GRIDS)
+        .label("Hatch anchor")
+        .help("screen: hatching fixed to the screen; object: pinned to each entity's origin, so strokes travel with it; world: laid on the surfaces, so they hold as the camera moves; local: laid on each entity's surfaces in its own space, so they ride on it as it moves and turns too"),
+    StyleOption::new("tone", "picture", TONES)
+        .label("Tone from")
+        .help("picture: hatch where the picture is dark, dark paint included; light: hatch where the light falls off (the picture over each mesh's own colour), so a dark floor in the sun stays blank and a white prop in shadow is hatched"),
+    StyleOption::new("transition", "fade", TRANSITIONS)
+        .label("Transition")
+        .help("How a blend below 1 shows the drawing: fade cross-fades every pixel, faint all over; draw draws it on, the outlines growing along their length up to the blend, the hatching a stroke at a time after them, the paper's wash last"),
+    StyleOption::new("paper_image", NO_IMAGE, &[])
+        .discovered(paper_choices)
+        .label("Paper image")
+        .help("A scanned paper (papers/<name>.png): its relief is the tooth, its hue tints the paper; none = procedural"),
+    StyleOption::new("stroke_image", NO_IMAGE, &[])
+        .discovered(stroke_choices)
+        .label("Stroke image")
+        .help("A strip of real strokes (strokes/<name>.png), one stretched along each dash; none = drawn bars"),
 ];
 
 pub(super) static STYLE: StyleDescriptor =
     StyleDescriptor::new("pencil", "Pencil", StyleStage::Display, create)
         .params(PARAMS)
         .options(OPTIONS)
-        .hints(HINTS)
         .uses_albedo(super::MaskUse::When(reads_albedo))
+        // The contour's depth steps and creases (#743)
+        .needs(&[super::StyleNeed::Edges])
         .draws_blend(draws_on)
         .component("pencil_style");
 
@@ -312,7 +348,24 @@ fn reads_albedo(
 
 fn create(d: &StyleDevice) -> Box<dyn StylePass> {
     let device = d.device;
-    let uniform_bgl = kit::uniform_layout(device, "Pencil Uniform BGL");
+    // The uniform, then the variant table's rows and slots (#740)
+    let uniform_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("Pencil Uniform BGL"),
+        entries: &[
+            wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            storage_entry(1),
+            storage_entry(2),
+        ],
+    });
     let input_bgl = kit::sampled_layout(device, "Pencil Input BGL");
     let prep_bgl = prep_layout(device);
     let geometry_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -338,14 +391,17 @@ fn create(d: &StyleDevice) -> Box<dyn StylePass> {
                 },
                 count: None,
             },
-            image_entry(2),
-            image_entry(3),
+            // The paper and stroke stacks (#547)
+            image_stack_entry(2),
+            image_stack_entry(3),
             // The style albedo (#869), or the blank stand-in
             image_entry(4),
+            // The shared edges (#743), or the blank stand-in
+            image_entry(5),
         ],
     });
     // Bound while no entity asks for the style: one unstyled pixel
-    let no_mask = device.create_texture(&wgpu::TextureDescriptor {
+    let no_mask = device.create_texture_counted(&wgpu::TextureDescriptor {
         label: Some("Pencil No Mask"),
         size: wgpu::Extent3d {
             width: 1,
@@ -361,7 +417,7 @@ fn create(d: &StyleDevice) -> Box<dyn StylePass> {
     });
     let no_mask_view = no_mask.create_view(&Default::default());
     // Bound while no row reads the light: one texel where no mesh was drawn
-    let no_albedo = device.create_texture(&wgpu::TextureDescriptor {
+    let no_albedo = device.create_texture_counted(&wgpu::TextureDescriptor {
         label: Some("Pencil No Albedo"),
         size: wgpu::Extent3d {
             width: 1,
@@ -376,6 +432,22 @@ fn create(d: &StyleDevice) -> Box<dyn StylePass> {
         view_formats: &[],
     });
     let no_albedo_view = no_albedo.create_view(&Default::default());
+    // Bound if the shared edge pass couldn't be built: one texel of no edge
+    let no_edges = device.create_texture_counted(&wgpu::TextureDescriptor {
+        label: Some("Pencil No Edges"),
+        size: wgpu::Extent3d {
+            width: 1,
+            height: 1,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: super::edges::EDGE_FORMAT,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING,
+        view_formats: &[],
+    });
+    let no_edges_view = no_edges.create_view(&Default::default());
     let blit = kit::Blit::new(device, "Pencil Blit", &input_bgl, d.format);
     let flow_shader = kit::shader(device, "Pencil Flow Shader", FLOW_SHADER);
     let flow_pipeline = |label: &str, entry: &str| {
@@ -421,17 +493,37 @@ fn create(d: &StyleDevice) -> Box<dyn StylePass> {
         no_mask_view,
         _no_albedo: no_albedo,
         no_albedo_view,
+        _no_edges: no_edges,
+        no_edges_view,
         blit,
-        warned: Mutex::new(false),
+        table: Mutex::new(VariantTable::new(
+            device,
+            "Pencil",
+            std::mem::size_of::<PencilRow>(),
+        )),
         images: Mutex::new(Images {
-            paper: ImageSlot::new(ImageUse::Paper, "pencil paper"),
-            stroke: ImageSlot::new(ImageUse::Stroke, "pencil stroke"),
-            warned: false,
+            paper: ImageStack::new(ImageUse::Paper, "pencil paper"),
+            stroke: ImageStack::new(ImageUse::Stroke, "pencil stroke"),
         }),
     })
 }
 
-/// A style image's binding: read with `textureLoad`, no sampler.
+/// A stack of style images' binding (#547, [`StackedImages`]): a
+/// `texture_2d_array` read with `textureLoad`, no sampler.
+pub(super) fn image_stack_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::FRAGMENT,
+        ty: wgpu::BindingType::Texture {
+            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+            view_dimension: wgpu::TextureViewDimension::D2Array,
+            multisampled: false,
+        },
+        count: None,
+    }
+}
+
+/// A texture read with `textureLoad`, no sampler.
 pub(super) fn image_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
     wgpu::BindGroupLayoutEntry {
         binding,
@@ -446,11 +538,21 @@ pub(super) fn image_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
 }
 
 const PREP_SHADER: kit::Wgsl = kit::wgsl!(
+    "prelude_core.wgsl",
+    "edges_read.wgsl",
+    "style_image_layer.wgsl",
+    "mask_read.wgsl",
+    "mask_slot.wgsl",
     "pencil_common.wgsl",
     "pencil_prep.wgsl"
 );
 const DRAW_SHADER: kit::Wgsl = kit::wgsl!(
+    "prelude_core.wgsl",
     "pencil_fade.wgsl",
+    "style_image_layer.wgsl",
+    "noise.wgsl",
+    "mask_read.wgsl",
+    "mask_slot.wgsl",
     "pencil_common.wgsl",
     "style_image.wgsl",
     "pencil.wgsl"
@@ -460,12 +562,21 @@ const DRAW_SHADER: kit::Wgsl = kit::wgsl!(
 /// path in the same function moved pencil-full's pixels by a level, the
 /// driver reassociating the strokes' products round it).
 const DRAW_ON_SHADER: kit::Wgsl = kit::wgsl!(
+    "prelude_core.wgsl",
     "pencil_draw_on.wgsl",
+    "style_image_layer.wgsl",
+    "noise.wgsl",
+    "mask_read.wgsl",
+    "mask_slot.wgsl",
     "pencil_common.wgsl",
     "style_image.wgsl",
     "pencil.wgsl"
 );
 const FLOW_SHADER: kit::Wgsl = kit::wgsl!(
+    "prelude_core.wgsl",
+    "style_image_layer.wgsl",
+    "mask_read.wgsl",
+    "mask_slot.wgsl",
     "pencil_common.wgsl",
     "pencil_flow.wgsl"
 );
@@ -507,19 +618,46 @@ pub fn any_tensor(rows: &[PencilRow]) -> bool {
     })
 }
 
-/// One variant's settings, ten vec4s (see `PencilRow` in the shader).
+/// One variant's settings, thirteen vec4s (see `PencilRow` in the shader):
+/// ten of settings, then the world-to-local rows of a `grid = "local"`
+/// variant (#544; the identity otherwise).
 #[repr(C)]
 #[derive(Copy, Clone, Pod, Zeroable, Debug, PartialEq)]
 pub struct PencilRow {
-    pub v: [[f32; 4]; 10],
+    pub v: [[f32; 4]; 13],
 }
 
-/// The paper and stroke images, kept with the style (#390).
+impl PencilRow {
+    /// Hatch on the surfaces in the space `rows` take a world point into
+    /// (#544): the world-to-local rows of [`LocalFrame::inverse_rows`].
+    /// Only a world-grid row takes it, so a local grid is a world one plus
+    /// the frame.
+    ///
+    /// [`LocalFrame::inverse_rows`]: crate::style_mask::LocalFrame::inverse_rows
+    pub fn set_local(&mut self, rows: [[f32; 4]; 3]) {
+        let flags = self.v[6][2] as u32;
+        if flags & WORLD_GRID as u32 == 0 {
+            return;
+        }
+        if flags & LOCAL_GRID as u32 == 0 {
+            self.v[6][2] += LOCAL_GRID;
+        }
+        self.v[10..13].copy_from_slice(&rows);
+    }
+}
+
+/// The rows a row's local frame holds while it has none: the identity.
+const NO_LOCAL: [[f32; 4]; 3] = [
+    [1.0, 0.0, 0.0, 0.0],
+    [0.0, 1.0, 0.0, 0.0],
+    [0.0, 0.0, 1.0, 0.0],
+];
+
+/// The paper and stroke images, kept with the style (#390), a stack of
+/// each a frame (#547).
 struct Images {
-    paper: ImageSlot,
-    stroke: ImageSlot,
-    /// Whether the two-images-in-one-frame warning has been given.
-    warned: bool,
+    paper: ImageStack,
+    stroke: ImageStack,
 }
 
 #[repr(C)]
@@ -535,9 +673,11 @@ struct PencilUniforms {
     forward: [f32; 3],
     _pad1: f32,
     info: [u32; 4],
-    img: [f32; 4],
-    rows: [PencilRow; MAX_VARIANTS],
-    slots: [[u32; 4]; MAX_IDS / 4],
+    /// The shared edges' thresholds (#743): `edge_depth`, `edge_normal`
+    edge: [f32; 4],
+    /// Each layer of the paper and stroke stacks (#547): its measures and size
+    papers: [LayerInfo; MAX_LAYERS],
+    strokes: [LayerInfo; MAX_LAYERS],
 }
 
 /// A row's flag: leave its pixels as they are.
@@ -547,9 +687,15 @@ const PASS_THROUGH: f32 = 1.0;
 /// surfaces, `grid = "world"` (#389).
 const WORLD_GRID: f32 = 2.0;
 
+/// A row's flag (with [`WORLD_GRID`]): the world strokes are laid in the
+/// styled root's own space, `grid = "local"` (#544), through the row's
+/// last three vec4s.
+const LOCAL_GRID: f32 = 4.0;
+
 /// The slot of a mask id another registered style owns: its pixels are
 /// that style's (an ASCII prop in a pencil frame), so pencil leaves them.
-pub const FOREIGN: u32 = 255;
+/// No row's index: the table grows past 255 rows (#740).
+pub const FOREIGN: u32 = u32::MAX;
 
 /// The camera's forward axis from its inverse view-projection: from the
 /// centre of the near plane to the centre of the far one.
@@ -585,7 +731,9 @@ pub fn tone_mode(name: &str) -> f32 {
 /// post time, so a still drawing (boil 0) never changes and a boiling one
 /// changes in steps, the same steps at the same `--style-time`. The steps
 /// are [`motion_hold::tick`](crate::motion_hold::tick)'s, so a pose held at
-/// `rate = boil` moves in the same frames the lines redraw (#405).
+/// `rate = boil` moves in the same frames the lines redraw (#405), and that
+/// is the stepped clock with no glide ([`flint_core::step_clock`], #747), the
+/// one a living prop holds and glides on.
 pub fn effective_seed(seed: f32, boil: f32, time: f32) -> f32 {
     let base = seed.max(0.0).floor();
     match crate::motion_hold::tick(time, boil) {
@@ -643,8 +791,9 @@ pub fn row(
             [
                 origin[0],
                 origin[1],
+                // A local grid is a world one until its frame is set
                 flags
-                    + if option("grid") == "world" {
+                    + if matches!(option("grid").as_str(), "world" | "local") {
                         WORLD_GRID
                     } else {
                         0.0
@@ -665,29 +814,11 @@ pub fn row(
                 param("seed").max(0.0).floor(),
             ],
             [param("clutter").clamp(0.0, 1.0), 0.0, 0.0, 0.0],
+            NO_LOCAL[0],
+            NO_LOCAL[1],
+            NO_LOCAL[2],
         ],
     }
-}
-
-/// The one image a frame draws with in `lane` (2 paper, 3 stroke) of the
-/// rows' last vec4, from each row's name for it: the scene table's (row 0)
-/// when it names one, else the first row's that does. A row naming
-/// another loses its flag and draws procedurally. Returns the name and
-/// whether any row was refused so.
-pub fn choose_image(names: &[String], rows: &mut [PencilRow], lane: usize) -> (String, bool) {
-    let chosen = names
-        .iter()
-        .find(|n| names_image(n))
-        .cloned()
-        .unwrap_or_default();
-    let mut refused = false;
-    for (name, row) in names.iter().zip(rows.iter_mut()) {
-        if row.v[7][lane] > 0.5 && *name != chosen {
-            row.v[7][lane] = 0.0;
-            refused = true;
-        }
-    }
-    (chosen, refused)
 }
 
 /// How far, in pixels, a styled pixel's draw reads the prep texture
@@ -698,6 +829,22 @@ pub fn choose_image(names: &[String], rows: &mut [PencilRow], lane: usize) -> (S
 /// disc it measures (three times `clutter_radius` in `pencil.wgsl`: six
 /// contour widths, at least nine pixels); and four pixels for the bilinear
 /// taps' footprint and the flow's half-resolution texels.
+/// Where the prep pass draws (#385): per entity, their rect grown by how
+/// far a styled pixel reads the prep; `None` for the whole frame.
+fn prep_rect(
+    frame: &StyleFrame<'_>,
+    rows: &[PencilRow],
+    pixels_per_point: f32,
+) -> Option<kit::PixelRect> {
+    frame.styled_rect(0).map(|r| {
+        r.padded(
+            prep_reach(rows, pixels_per_point),
+            frame.width,
+            frame.height,
+        )
+    })
+}
+
 fn prep_reach(rows: &[PencilRow], pixels_per_point: f32) -> u32 {
     let pixels = rows
         .iter()
@@ -719,14 +866,14 @@ fn prep_reach(rows: &[PencilRow], pixels_per_point: f32) -> u32 {
 }
 
 struct Pencil {
-    prep_pipeline: wgpu::RenderPipeline,
+    prep_pipeline: std::sync::Arc<wgpu::RenderPipeline>,
     /// The tensor flow blur along x, from the prep target (#392)
-    flow_across: wgpu::RenderPipeline,
+    flow_across: std::sync::Arc<wgpu::RenderPipeline>,
     /// And along y, from the across pass's result
-    flow_down: wgpu::RenderPipeline,
-    draw_pipeline: wgpu::RenderPipeline,
+    flow_down: std::sync::Arc<wgpu::RenderPipeline>,
+    draw_pipeline: std::sync::Arc<wgpu::RenderPipeline>,
     /// The drawing pass while some row draws on (#879, [`DRAW_ON_SHADER`])
-    draw_on_pipeline: wgpu::RenderPipeline,
+    draw_on_pipeline: std::sync::Arc<wgpu::RenderPipeline>,
     uniforms: wgpu::Buffer,
     uniform_bgl: wgpu::BindGroupLayout,
     input_bgl: wgpu::BindGroupLayout,
@@ -736,10 +883,12 @@ struct Pencil {
     no_mask_view: wgpu::TextureView,
     _no_albedo: wgpu::Texture,
     no_albedo_view: wgpu::TextureView,
+    _no_edges: wgpu::Texture,
+    no_edges_view: wgpu::TextureView,
     /// The input through, outside the styled entities' rect (#385).
     blit: kit::Blit,
-    /// Whether the too-many-variants warning has been given.
-    warned: Mutex<bool>,
+    /// The variant table (#740): grows with the frame.
+    table: Mutex<VariantTable>,
     images: Mutex<Images>,
 }
 
@@ -749,16 +898,24 @@ impl Pencil {
         &self,
         frame: &StyleFrame<'_>,
         with_mask: bool,
-        paper: &StyleImage,
-        stroke: &StyleImage,
+        paper: &StackedImages,
+        stroke: &StackedImages,
     ) -> Arc<wgpu::BindGroup> {
         let mask = frame.mask.filter(|_| with_mask);
-        // Keyed by both images' uploads, so a new paper gets a new group,
-        // and by the albedo's size, which a render-scale step changes
-        let key = (mask.is_some() as u64 | paper.generation << 1 | stroke.generation << 32)
-            ^ frame.albedo_key().wrapping_mul(0x9E37_79B9_7F4A_7C15);
-        frame.depth_bind("Pencil Geometry BG", key, || {
-            frame.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        // Kept over the images, the albedo and the edges themselves (#960):
+        // a new paper or stroke upload is a new view, and its group takes
+        // the old one's place. With and without the mask side by side
+        let view = crate::bind_cache::Bound::View;
+        let over = [
+            view(mask.unwrap_or(&self.no_mask_view)),
+            view(&paper.view),
+            view(&stroke.view),
+            frame.albedo_or(&self.no_albedo_view),
+            frame.edges_or(&self.no_edges_view),
+        ];
+        let variant = mask.is_some() as u64;
+        frame.depth_bind_over("Pencil Geometry BG", variant, &over, || {
+            frame.device.create_bind_group_counted(&wgpu::BindGroupDescriptor {
                 label: Some("Pencil Geometry BG"),
                 layout: &self.geometry_bgl,
                 entries: &[
@@ -789,19 +946,25 @@ impl Pencil {
                                 .map_or(&self.no_albedo_view, |a| &a.view),
                         ),
                     },
+                    wgpu::BindGroupEntry {
+                        binding: 5,
+                        resource: wgpu::BindingResource::TextureView(
+                            frame
+                                .edges
+                                .as_ref()
+                                .map_or(&self.no_edges_view, |e| &e.view),
+                        ),
+                    },
                 ],
             })
         })
     }
 
     /// Row 0 (the whole frame's) and a row for each per-entity variant,
-    /// with the row of every mask id.
-    /// Each row's image names (paper, stroke) come back beside it.
-    #[allow(clippy::type_complexity)]
-    fn variant_table(
-        &self,
-        frame: &StyleFrame<'_>,
-    ) -> (Vec<PencilRow>, [u32; MAX_IDS], Vec<[String; 2]>) {
+    /// with the row of every mask id (#740: every variant gets one).
+    /// Each row's image names (paper, stroke) and mask id come back
+    /// beside it.
+    fn variant_table(&self, frame: &StyleFrame<'_>) -> Table {
         let whole = row(
             &|n| frame.param(n),
             &|n| frame.option(n).to_string(),
@@ -812,87 +975,131 @@ impl Pencil {
         let mut rows = vec![whole];
         let image_names = |o: &dyn Fn(&str) -> String| [o("paper_image"), o("stroke_image")];
         let mut names = vec![image_names(&|n| frame.option(n).to_string())];
-        let mut slots = [0u32; MAX_IDS];
+        let mut ids = vec![0u16];
+        let mut slots = vec![0u32; frame.style_ids.len() + 1];
         // Ids another running style draws are that style's pixels (#384:
         // the framework puts the input back there too; the slot keeps
         // pencil's contours and hatching from reading them as its own)
         for id in frame.foreign_ids() {
-            if (id as usize) < MAX_IDS {
-                slots[id as usize] = FOREIGN;
-            }
+            slots[id as usize] = FOREIGN;
         }
         for (id, v) in frame.variants() {
-            if rows.len() == MAX_VARIANTS || id as usize >= MAX_IDS {
-                let mut warned = self.warned.lock().unwrap_or_else(|e| e.into_inner());
-                if !*warned {
-                    tracing::warn!(
-                        "pencil: more per-entity variants than the {} (or ids past {MAX_IDS}) \
-                         one frame holds; the rest are drawn like the whole frame",
-                        MAX_VARIANTS - 1
-                    );
-                    *warned = true;
-                }
-                continue;
-            }
             let origin = v
                 .anchor
                 .and_then(|a| frame.project(a))
                 .map_or([0.0, 0.0], |at| [at[0].round(), at[1].round()]);
             let flags = if v.off { PASS_THROUGH } else { 0.0 };
             slots[id as usize] = rows.len() as u32;
+            ids.push(id);
             names.push(image_names(&|n| frame.variant_option(v, n).to_string()));
-            rows.push(row(
+            let mut r = row(
                 &|n| frame.variant_param(v, n),
                 &|n| frame.variant_option(v, n).to_string(),
                 frame.time,
                 origin,
                 flags,
-            ));
+            );
+            // Strokes on the root's own surfaces (#544); a prop scaled to
+            // nothing has no frame and keeps the world's
+            if let Some(local) = v.local.and_then(|f| f.inverse_rows()) {
+                r.set_local(local);
+            }
+            rows.push(r);
         }
-        (rows, slots, names)
+        Table {
+            rows,
+            slots,
+            names,
+            ids,
+        }
     }
 
-    /// The frame's paper and stroke images, clearing the flag of any row
-    /// that names another (see [`choose_image`]) or whose image didn't load.
-    fn images(
-        &self,
-        frame: &StyleFrame<'_>,
-        rows: &mut [PencilRow],
-        names: &[[String; 2]],
-    ) -> (Arc<StyleImage>, Arc<StyleImage>) {
-        let papers: Vec<String> = names.iter().map(|n| n[0].clone()).collect();
-        let strokes: Vec<String> = names.iter().map(|n| n[1].clone()).collect();
-        let (paper_name, refused_paper) = choose_image(&papers, rows, 2);
-        let (stroke_name, refused_stroke) = choose_image(&strokes, rows, 3);
-        let search = frame.assets;
+    /// The frame's paper and stroke stacks (#547), each row given the
+    /// layer it reads (lanes 2 and 3 of its eighth vec4: the layer plus
+    /// one, 0 for the procedural paper or dashes): a layer each image the
+    /// rows name, up to [`MAX_LAYERS`]; past it, or for an image that
+    /// doesn't load, the row draws procedurally.
+    fn images(&self, frame: &StyleFrame<'_>, table: &mut Table) -> (Stacked, Stacked) {
+        let papers: Vec<String> = table.names.iter().map(|n| n[0].clone()).collect();
+        let strokes: Vec<String> = table.names.iter().map(|n| n[1].clone()).collect();
         let poll = frame.frame.is_multiple_of(15);
         let mut images = self.images.lock().unwrap_or_else(|e| e.into_inner());
-        if (refused_paper || refused_stroke) && !images.warned {
-            tracing::warn!(
-                "pencil: one paper and one stroke image a frame (\"{paper_name}\", \
-                 \"{stroke_name}\"); entities naming others draw procedurally"
-            );
-            images.warned = true;
-        }
         let paper = images
             .paper
-            .get(frame.device, frame.queue, search, &paper_name, poll);
+            .get(frame.device, frame.queue, frame.assets, &papers, poll);
         let stroke = images
             .stroke
-            .get(frame.device, frame.queue, search, &stroke_name, poll);
-        for row in rows.iter_mut() {
-            if !paper.found {
-                row.v[7][2] = 0.0;
+            .get(frame.device, frame.queue, frame.assets, &strokes, poll);
+        for (lane, stack, kind) in [(2, &paper, "paper images"), (3, &stroke, "stroke images")] {
+            for (row, layer) in table.rows.iter_mut().zip(&stack.layer) {
+                row.v[7][lane] = *layer as f32;
             }
-            if !stroke.found {
-                row.v[7][3] = 0.0;
+            // The first entity past the cap is said (#740)
+            if let Some(row) = stack.over_cap {
+                let entity = frame.style_ids.entity(table.ids[row]).unwrap_or("?");
+                report_drop("pencil", kind, MAX_LAYERS, entity, "drawn procedurally");
             }
         }
         (paper, stroke)
     }
 }
 
+/// One frame's variant table, built by [`Pencil::variant_table`].
+struct Table {
+    rows: Vec<PencilRow>,
+    /// Each mask id's row, [`FOREIGN`] for another style's.
+    slots: Vec<u32>,
+    /// Each row's (paper, stroke) image names.
+    names: Vec<[String; 2]>,
+    /// Each row's mask id (row 0's is 0).
+    ids: Vec<u16>,
+}
+
+impl Pencil {
+    /// Group 0: the uniform and this frame's variant table, written first.
+    fn uniform_bind(
+        &self,
+        frame: &StyleFrame<'_>,
+        rows: &[PencilRow],
+        slots: &[u32],
+    ) -> Arc<wgpu::BindGroup> {
+        let mut table = self.table.lock().unwrap_or_else(|e| e.into_inner());
+        table.upload(frame.device, frame.queue, rows, slots);
+        let [rows, slots] = table.entries(1);
+        frame.bind("Pencil Uniform BG", table.generation(), || {
+            frame.device.create_bind_group_counted(&wgpu::BindGroupDescriptor {
+                label: Some("Pencil Uniform BG"),
+                layout: &self.uniform_bgl,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: self.uniforms.as_entire_binding(),
+                    },
+                    rows,
+                    slots,
+                ],
+            })
+        })
+    }
+}
+
 impl StylePass for Pencil {
+    /// Per entity (#743), the prep reads the shared edges only where it
+    /// draws: [`prep_rect`], in depth pixels.
+    fn edges_rect(&self, frame: &StyleFrame<'_>) -> Option<kit::PixelRect> {
+        let rows = self.variant_table(frame).rows;
+        let ppp = if frame.pixels_per_point.is_finite() && frame.pixels_per_point > 0.0 {
+            frame.pixels_per_point
+        } else {
+            1.0
+        };
+        let size = [frame.width, frame.height];
+        prep_rect(frame, &rows, ppp).map(|r| {
+            r.rescaled(size, frame.depth_size)
+                .padded(2, frame.depth_size[0], frame.depth_size[1])
+        })
+    }
+
     fn encode(
         &self,
         frame: &StyleFrame<'_>,
@@ -900,10 +1107,12 @@ impl StylePass for Pencil {
         input: &StyleInput<'_>,
         output: &wgpu::TextureView,
     ) {
-        let (mut rows, slots, names) = self.variant_table(frame);
-        let (paper, stroke) = self.images(frame, &mut rows, &names);
+        let mut table = self.variant_table(frame);
+        let (paper, stroke) = self.images(frame, &mut table);
+        let (paper, stroke) = (paper.images, stroke.images);
+        let Table { rows, slots, .. } = table;
         let with_mask = (rows.len() > 1 || slots.contains(&FOREIGN)) && frame.mask.is_some();
-        let mut uniforms = PencilUniforms {
+        let uniforms = PencilUniforms {
             inv_view_proj: frame.camera.inv_view_proj,
             camera_pos: frame.camera.position,
             pixels_per_point: if frame.pixels_per_point.is_finite() && frame.pixels_per_point > 0.0
@@ -923,19 +1132,19 @@ impl StylePass for Pencil {
                 with_mask as u32,
                 0,
             ],
-            img: paper.stats.paper_and(stroke.stats),
-            rows: [PencilRow::zeroed(); MAX_VARIANTS],
-            slots: [[0; 4]; MAX_IDS / 4],
+            edge: [
+                frame.config.edge_depth.max(super::edges::MIN_THRESHOLD),
+                frame.config.edge_normal.max(super::edges::MIN_THRESHOLD),
+                0.0,
+                0.0,
+            ],
+            papers: paper.layers,
+            strokes: stroke.layers,
         };
-        uniforms.rows[..rows.len()].copy_from_slice(&rows);
-        for (i, slot) in slots.iter().enumerate() {
-            uniforms.slots[i / 4][i % 4] = *slot;
-        }
         frame
             .queue
-            .write_buffer(&self.uniforms, 0, bytemuck::bytes_of(&uniforms));
-
-        let uniform = frame.uniform("Pencil Uniform BG", &self.uniform_bgl, &self.uniforms);
+            .write_buffer_counted(&self.uniforms, 0, bytemuck::bytes_of(&uniforms));
+        let uniform = self.uniform_bind(frame, &rows, &slots);
         let input_bind = frame.sampled_input("Pencil Input BG", &self.input_bgl, input);
         let geometry = self.geometry_bind(frame, with_mask, &paper, &stroke);
         let prep = frame.target("pencil.prep", PREP_FORMAT);
@@ -945,13 +1154,7 @@ impl StylePass for Pencil {
         // how far a styled pixel reads the prep
         let size = [frame.width, frame.height];
         let draw_rect = frame.styled_rect(0);
-        let prep_rect = draw_rect.map(|r| {
-            r.padded(
-                prep_reach(&rows, uniforms.pixels_per_point),
-                size[0],
-                size[1],
-            )
-        });
+        let prep_rect = prep_rect(frame, &rows, uniforms.pixels_per_point);
         kit::fullscreen_pass_in(
             encoder,
             "Pencil Prep",
@@ -995,7 +1198,7 @@ impl StylePass for Pencil {
         });
         let flow_view = flow.as_ref().map_or(&prep.view, |f| &f.view);
         let prep_bind = frame.bind("Pencil Prep BG", flow.is_some() as u64, || {
-            frame.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            frame.device.create_bind_group_counted(&wgpu::BindGroupDescriptor {
                 label: Some("Pencil Prep BG"),
                 layout: &self.prep_bgl,
                 entries: &[
@@ -1076,11 +1279,13 @@ mod tests {
     }
 
     #[test]
-    fn a_row_is_ten_vec4s() {
-        assert_eq!(std::mem::size_of::<PencilRow>(), 160);
+    fn a_row_is_thirteen_vec4s() {
+        // Ten of settings, three of a local grid's frame (#544)
+        assert_eq!(std::mem::size_of::<PencilRow>(), 208);
         assert_eq!(
             std::mem::size_of::<PencilUniforms>(),
-            64 + 16 + 16 + 16 + 16 + 16 + MAX_VARIANTS * 160 + MAX_IDS * 4
+            // ... #743's edge thresholds, then the stacks' layers (#547)
+            64 + 16 + 16 + 16 + 16 + 16 + 2 * 4 * 32
         );
     }
 
@@ -1114,30 +1319,30 @@ mod tests {
         let none = StyleIds::default();
         let mut config = PostProcessConfig::default();
         config.styles.set_enabled("pencil", true);
-        assert!(!crate::stylize::any_uses_albedo(&config, &none), "picture is the default");
+        assert!(!crate::stylize::StyleRegistry::new().any_uses_albedo(&config, &none), "picture is the default");
         config.styles.set_option("pencil", "tone", "light");
-        assert!(crate::stylize::any_uses_albedo(&config, &none));
+        assert!(crate::stylize::StyleRegistry::new().any_uses_albedo(&config, &none));
         // A preset for entities draws nothing by itself
         config.styles.set_option("pencil", "scope", "entities");
-        assert!(!crate::stylize::any_uses_albedo(&config, &none));
+        assert!(!crate::stylize::StyleRegistry::new().any_uses_albedo(&config, &none));
 
         // An entity's variant: its own tone, else the preset's
         let mut ids = StyleIds::default();
         ids.set(vec![("pencil".to_string(), StyleVariant::plain("pencil"))]);
-        assert!(crate::stylize::any_uses_albedo(&config, &ids), "inherits light");
+        assert!(crate::stylize::StyleRegistry::new().any_uses_albedo(&config, &ids), "inherits light");
         let mut own = StyleVariant::plain("pencil");
         own.options.insert("tone".into(), "picture".into());
         ids.set(vec![("pencil{tone=picture}".to_string(), own)]);
-        assert!(!crate::stylize::any_uses_albedo(&config, &ids));
+        assert!(!crate::stylize::StyleRegistry::new().any_uses_albedo(&config, &ids));
         let mut off = StyleVariant::plain("pencil");
         off.off = true;
         ids.set(vec![("pencil{off}".to_string(), off)]);
-        assert!(!crate::stylize::any_uses_albedo(&config, &ids), "an opt-out");
+        assert!(!crate::stylize::StyleRegistry::new().any_uses_albedo(&config, &ids), "an opt-out");
         // Post-processing off draws no style at all
         let mut ids = StyleIds::default();
         ids.set(vec![("pencil".to_string(), StyleVariant::plain("pencil"))]);
         config.enabled = false;
-        assert!(!crate::stylize::any_uses_albedo(&config, &ids));
+        assert!(!crate::stylize::StyleRegistry::new().any_uses_albedo(&config, &ids));
     }
 
     /// `transition = "draw"` (#879): the row carries it in `i.z` and the
@@ -1210,8 +1415,8 @@ mod tests {
             ("pencil".into(), inherits),
             ("pencil{transition=fade}".into(), fades),
         ]);
-        let registry = crate::stylize::registry();
-        let table = super::super::fade::owner_table(&config, &ids, registry);
+        let registry = crate::stylize::StyleRegistry::new();
+        let table = super::super::fade::owner_table(&config, &ids, &registry);
         let me = registry.iter().position(|d| d.name == "pencil").unwrap() as u32 + 1;
         assert_eq!(table[ids.id("pencil").unwrap() as usize], 0, "drawn by pencil");
         assert_eq!(
@@ -1232,6 +1437,19 @@ mod tests {
         assert_eq!(effective_seed(7.0, 4.0, 1.0), 11.0);
         assert_eq!(effective_seed(7.0, 4.0, f32::NAN), 7.0);
         assert_eq!(effective_seed(-3.0, 0.0, 0.0), 0.0);
+    }
+
+    #[test]
+    fn the_boil_steps_on_the_living_props_clock() {
+        // The seed's step is the stepped clock with no glide (#747): the beat
+        // `warp` gives a living prop counting 1/boil seconds a beat.
+        let mut t = 0.0f32;
+        for _ in 0..600 {
+            t += 1.0 / 60.0;
+            let beats = f64::from(t * 12.0 + flint_core::step_clock::TICK_EARLY);
+            let (beat, _) = flint_core::step_clock::warp(beats, 0.0);
+            assert_eq!(effective_seed(3.0, 12.0, t), 3.0 + beat as f32, "t {t}");
+        }
     }
 
     /// The `pencil_style` schema and the descriptor agree: every field is a
@@ -1274,14 +1492,14 @@ mod tests {
                 reached.extend(channels);
             }
         }
-        for p in STYLE.params {
+        for p in &STYLE.params {
             assert!(
                 reached.iter().any(|r| r == p.name),
                 "{} not in the schema",
                 p.name
             );
         }
-        for o in STYLE.options {
+        for o in &STYLE.options {
             // scope is the scene table's, not an entity's
             if o.name != "scope" {
                 assert!(
@@ -1349,6 +1567,45 @@ mod tests {
         assert!(GRIDS.contains(&"world"));
     }
 
+    /// `grid = "local"` (#544) is a world grid until its frame is set,
+    /// then carries the frame's rows and its flag; any other row keeps the
+    /// identity and refuses a frame.
+    #[test]
+    fn a_local_grid_is_a_world_grid_with_its_roots_frame() {
+        let p = |n: &str| STYLE.params.iter().find(|q| q.name == n).unwrap().default;
+        let grid = |g: &'static str| {
+            move |n: &str| {
+                if n == "grid" {
+                    g.to_string()
+                } else {
+                    String::new()
+                }
+            }
+        };
+        let frame = [
+            [0.0, 0.0, -1.0, 2.0],
+            [0.0, 1.0, 0.0, -3.0],
+            [1.0, 0.0, 0.0, 0.5],
+        ];
+        let mut local = row(&p, &grid("local"), 0.0, [0.0, 0.0], 0.0);
+        assert_eq!(local.v[6][2], WORLD_GRID, "no frame yet: the world's");
+        assert_eq!(&local.v[10..13], &NO_LOCAL, "the identity");
+        local.set_local(frame);
+        assert_eq!(local.v[6][2], WORLD_GRID + LOCAL_GRID);
+        assert_eq!(&local.v[10..13], &frame);
+        local.set_local(frame);
+        assert_eq!(local.v[6][2], WORLD_GRID + LOCAL_GRID, "set twice, one flag");
+
+        let mut screen = row(&p, &grid("screen"), 0.0, [0.0, 0.0], 0.0);
+        screen.set_local(frame);
+        assert_eq!(screen.v[6][2], 0.0, "a screen grid takes no frame");
+        assert_eq!(&screen.v[10..13], &NO_LOCAL);
+        let mut off = row(&p, &grid("local"), 0.0, [0.0, 0.0], PASS_THROUGH);
+        off.set_local(frame);
+        assert_eq!(off.v[6][2], PASS_THROUGH + WORLD_GRID + LOCAL_GRID);
+        assert!(GRIDS.contains(&"local"));
+    }
+
     #[test]
     fn directions_parse_and_fall_back_to_surface() {
         assert_eq!(direction_mode("surface"), 0.0);
@@ -1403,33 +1660,15 @@ mod tests {
     }
 
     #[test]
-    fn one_image_a_frame_the_scene_tables_first() {
+    fn a_rows_image_flags_say_whether_it_names_one() {
+        // Provisional, until the stacks give each row its layer (#547)
         let config = crate::postprocess::PostProcessConfig::default();
         let p = |n: &str| STYLE.param(&config, n);
-        let named = |paper: &'static str| {
-            let config = crate::postprocess::PostProcessConfig::default();
-            move |n: &str| match n {
-                "paper_image" => paper.to_string(),
-                o => STYLE.option(&config, o).to_string(),
-            }
+        let named = |n: &str| match n {
+            "paper_image" => "cold_press".to_string(),
+            o => STYLE.option(&config, o).to_string(),
         };
-        let mut rows = vec![
-            row(&p, &named("none"), 0.0, [0.0; 2], 0.0),
-            row(&p, &named("cold_press"), 0.0, [0.0; 2], 0.0),
-            row(&p, &named("hot_press"), 0.0, [0.0; 2], 0.0),
-        ];
-        let names: Vec<String> = ["none", "cold_press", "hot_press"].map(String::from).into();
-        let (chosen, refused) = choose_image(&names, &mut rows, 2);
-        assert_eq!(
-            chosen, "cold_press",
-            "the scene names none: the first entity's"
-        );
-        assert!(refused);
-        assert_eq!(
-            rows.iter().map(|r| r.v[7][2]).collect::<Vec<_>>(),
-            vec![0.0, 1.0, 0.0],
-            "the other paper draws procedurally"
-        );
+        assert_eq!(row(&p, &named, 0.0, [0.0; 2], 0.0).v[7][2..], [1.0, 0.0]);
         assert!(names_image("cold_press") && !names_image("none") && !names_image(""));
     }
 }

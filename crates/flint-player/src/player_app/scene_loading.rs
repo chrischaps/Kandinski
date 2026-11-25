@@ -5,15 +5,13 @@ use flint_animation::node_clip::NodeClip;
 use flint_animation::skeletal_clip::SkeletalClip;
 use flint_animation::skeleton::Skeleton;
 use flint_animation::AnimationSystem;
-use flint_asset::{AssetCatalog, ContentStore};
+use flint_asset::HeldAssets;
 use flint_audio::decode::Need;
 use flint_audio::AudioSystem;
 use flint_core::components as comp;
 use flint_core::project::{AssetKind, Project};
-use flint_core::toml_util::{toml_f32, toml_f64, toml_vec3};
 use flint_core::vfs;
 use flint_core::EntityId;
-use flint_core::Vec3 as FlintVec3;
 use flint_ecs::FlintWorld;
 use flint_physics::PhysicsSystem;
 use flint_render::model_loader::{self, ModelLoadConfig};
@@ -27,24 +25,27 @@ use std::path::{Path, PathBuf};
 /// `flint_player::post_process_config_from_def` path (flint-cli uses it).
 pub use flint_render::post_process_config_from_def;
 
-/// Register the user-authored styles (`styles/*.shader.toml`, ADR 0112)
-/// a scene at `scene_path` can see, before its `[post_process]` is read:
-/// a table naming a style the registry doesn't know is dropped with a
-/// warning. Styles already registered are kept, so a scene change only
-/// adds (#275).
-pub fn load_user_styles(scene_path: &str) {
+/// The built-in styles with the user-authored ones (`styles/*.shader.toml`,
+/// ADR 0112) a scene at `scene_path` can see (#742): the registry to read
+/// its `[post_process]` against, where a table naming a style it doesn't
+/// hold is dropped with a warning. What didn't load is warned about.
+pub fn load_user_styles(scene_path: &str) -> flint_render::stylize::StyleRegistry {
     load_user_styles_in(&flint_core::project::AssetScope::for_scene(Path::new(
         scene_path,
-    )));
+    )))
 }
 
 /// [`load_user_styles`] for a host that holds the scene's project: every
 /// `styles/*.shader.toml` the project's one asset search lists from
 /// `scope`, the nearest of a name winning (ADR 0114, #426).
-pub fn load_user_styles_in(scope: &flint_core::project::AssetScope) {
-    for message in flint_render::stylize::custom::load_for(scope) {
+pub fn load_user_styles_in(
+    scope: &flint_core::project::AssetScope,
+) -> flint_render::stylize::StyleRegistry {
+    let (styles, messages) = flint_render::stylize::StyleRegistry::new().for_scene(scope);
+    for message in messages {
         tracing::warn!("{message}");
     }
+    styles
 }
 
 /// A scene's `[post_process]` as the player draws it: the look the scene
@@ -77,9 +78,8 @@ pub fn scene_post_process_in(
     }
 }
 
-/// Load terrain from world entities. Free function to avoid borrow conflicts.
-/// Info about loaded grass, returned from terrain loading for debug panel creation.
-/// The fields are only read by the `debug-hud` grass panel construction.
+/// The grass a scene loaded, for its debug panel. The fields are only read
+/// by the `debug-hud` grass panel construction.
 #[cfg_attr(not(feature = "debug-hud"), allow(dead_code))]
 pub(super) struct LoadedGrassInfo {
     pub config: flint_terrain::GrassConfig,
@@ -88,209 +88,26 @@ pub(super) struct LoadedGrassInfo {
     pub component: &'static str,
 }
 
-pub(super) fn load_terrain_from_world_inner(
-    world: &FlintWorld,
-    scene_path: &str,
-    device: &wgpu::Device,
-    queue: &wgpu::Queue,
-    scene_renderer: &mut SceneRenderer,
+/// The static collider of a terrain `SceneRenderer::bind_scene` loaded: a
+/// heightfield of its chunks' vertex grid where its transform puts it
+/// (#1219), the same surface as the chunks' triangles with no seams.
+pub(super) fn register_terrain_collider(
     physics: &mut PhysicsSystem,
-    terrain_out: &mut Option<(flint_terrain::Terrain, flint_terrain::TerrainConfig)>,
-    grass_info_out: &mut Option<LoadedGrassInfo>,
+    loaded: &flint_render::LoadedTerrain,
 ) {
-    use flint_core::Transform;
-    use flint_terrain::{Heightmap, Terrain, TerrainConfig};
+    physics.register_static_heightfield(loaded.entity, &terrain_heightfield(loaded), 0.8, 0.1);
+}
 
-    let scene_dir = Path::new(scene_path)
-        .parent()
-        .unwrap_or_else(|| Path::new("."));
-    let project = &Project::for_scene(Path::new(scene_path));
-
-    for entity in world.all_entities() {
-        let terrain_comp = match world.get_component(entity.id, comp::TERRAIN) {
-            Some(c) => c,
-            None => continue,
-        };
-
-        let heightmap_rel = match terrain_comp.get("heightmap").and_then(|v| v.as_str()) {
-            Some(s) if !s.is_empty() => s.to_string(),
-            _ => {
-                tracing::warn!("Terrain entity '{}': missing heightmap path", entity.name);
-                continue;
-            }
-        };
-
-        // A path found by the project's one search (`AssetKind::Files`)
-        let hm_path = project.file_or_beside("terrain heightmap", &heightmap_rel, scene_dir);
-
-        let heightmap = match Heightmap::from_png(&hm_path) {
-            Ok(hm) => hm,
-            Err(e) => {
-                tracing::warn!("Failed to load heightmap: {}", e);
-                continue;
-            }
-        };
-
-        let get_f32 = |key: &str, default: f32| -> f32 {
-            terrain_comp.get(key).and_then(toml_f32).unwrap_or(default)
-        };
-
-        let get_i32 = |key: &str, default: i32| -> i32 {
-            terrain_comp
-                .get(key)
-                .and_then(|v| v.as_integer())
-                .map(|i| i as i32)
-                .unwrap_or(default)
-        };
-
-        let get_str = |key: &str| -> String {
-            terrain_comp
-                .get(key)
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string()
-        };
-
-        let config = TerrainConfig {
-            heightmap_path: heightmap_rel,
-            width: get_f32("width", 256.0),
-            depth: get_f32("depth", 256.0),
-            height_scale: get_f32("height_scale", 50.0),
-            chunk_resolution: get_i32("chunk_resolution", 64) as u32,
-            texture_tile: get_f32("texture_tile", 16.0),
-            splat_map_path: get_str("splat_map"),
-            layer_textures: [
-                get_str("layer0_texture"),
-                get_str("layer1_texture"),
-                get_str("layer2_texture"),
-                get_str("layer3_texture"),
-            ],
-            metallic: get_f32("metallic", 0.0),
-            roughness: get_f32("roughness", 0.85),
-            grass: None,
-        };
-
-        let terrain = Terrain::generate(&heightmap, &config);
-
-        // Get entity transform
-        let transform = world
-            .get_component(entity.id, comp::TRANSFORM)
-            .and_then(|t| {
-                let pos = t.get("position").and_then(toml_vec3).unwrap_or([0.0; 3]);
-                Some(Transform {
-                    position: FlintVec3 {
-                        x: pos[0],
-                        y: pos[1],
-                        z: pos[2],
-                    },
-                    ..Default::default()
-                })
-            })
-            .unwrap_or_default();
-
-        // Upload to GPU
-        scene_renderer.load_terrain(
-            device,
-            queue,
-            &terrain.chunks,
-            &transform,
-            config.texture_tile,
-            config.metallic,
-            config.roughness,
-            &config.splat_map_path,
-            &config.layer_textures,
-            scene_dir,
-        );
-        // A style_mask on the terrain entity masks its chunks (#310)
-        scene_renderer.set_terrain_entity(Some(entity.id));
-
-        // Register physics collider
-        let (verts, tris) = terrain.trimesh_data();
-        let offset = [
-            transform.position.x,
-            transform.position.y,
-            transform.position.z,
-        ];
-        let offset_verts: Vec<[f32; 3]> = verts
-            .iter()
-            .map(|v| [v[0] + offset[0], v[1] + offset[1], v[2] + offset[2]])
-            .collect();
-        physics.register_static_trimesh(entity.id, offset_verts, tris, 0.8, 0.1);
-
-        // Load grass if enabled
-        let grass_config = flint_terrain::GrassConfig::from_component(terrain_comp, false);
-
-        if grass_config.enabled {
-            // Get raw heightmap data and splat map data for GPU upload
-            let hm_data = heightmap.clone_heights();
-            let hm_w = heightmap.width;
-            let hm_d = heightmap.depth;
-
-            // Load splat map pixels for grass compute shader
-            let splat_path =
-                project.file_or_beside("terrain splat map", &config.splat_map_path, scene_dir);
-
-            if let Ok(splat_img) = flint_render::open_image(&splat_path) {
-                let splat_rgba = splat_img.to_rgba8();
-                let (sw, sh) = splat_rgba.dimensions();
-
-                scene_renderer.load_grass(
-                    device,
-                    queue,
-                    &grass_config,
-                    &hm_data,
-                    hm_w,
-                    hm_d,
-                    splat_rgba.as_raw(),
-                    sw,
-                    sh,
-                    offset,
-                    config.width,
-                    config.depth,
-                    config.height_scale,
-                );
-
-                tracing::info!(
-                    "Grass enabled: density={}, max_dist={}",
-                    grass_config.density,
-                    grass_config.max_distance
-                );
-
-                *grass_info_out = Some(LoadedGrassInfo {
-                    config: grass_config.clone(),
-                    terrain_entity_name: entity.name.clone(),
-                    component: comp::TERRAIN,
-                });
-            } else {
-                tracing::warn!("Grass enabled but splat map not found at {:?}", splat_path);
-            }
-        }
-
-        tracing::info!(
-            "Loaded terrain '{}': {}x{} heightmap, {} chunks, {}x{} world units",
-            entity.name,
-            heightmap.width,
-            heightmap.depth,
-            terrain.chunks.len(),
-            config.width,
-            config.depth,
-        );
-
-        *terrain_out = Some((terrain, config));
-        break; // Only one terrain entity for now
-    }
-
-    // Grass on a scene-authored mesh ground (ADR 0089). One grass field per
-    // scene: a grass_ground replaces a terrain's grass.
-    if let Some(info) = load_grass_ground(world, project, scene_dir, device, queue, scene_renderer)
-    {
-        if grass_info_out.is_some() {
-            tracing::warn!(
-                "grass_ground '{}' replaces the terrain's grass",
-                info.terrain_entity_name
-            );
-        }
-        *grass_info_out = Some(info);
+/// A loaded terrain's heights as physics takes them.
+fn terrain_heightfield(loaded: &flint_render::LoadedTerrain) -> flint_physics::StaticHeightfield {
+    let grid = loaded.terrain.height_grid();
+    flint_physics::StaticHeightfield {
+        columns: grid.columns,
+        rows: grid.rows,
+        heights: grid.heights,
+        width: grid.width,
+        depth: grid.depth,
+        origin: loaded.offset,
     }
 }
 
@@ -309,38 +126,27 @@ pub fn load_scene_grass_ground(
         .is_some()
 }
 
-/// The player's grass ground: `flint_render::load_grass_ground_in`, with
-/// what the grass debug panel needs.
-fn load_grass_ground(
-    world: &FlintWorld,
-    project: &Project,
-    scene_dir: &Path,
-    device: &wgpu::Device,
-    queue: &wgpu::Queue,
-    scene_renderer: &mut SceneRenderer,
-) -> Option<LoadedGrassInfo> {
-    let loaded = flint_render::load_grass_ground_in(
-        world,
-        project,
-        scene_dir,
-        device,
-        queue,
-        scene_renderer,
-    )?;
-    Some(LoadedGrassInfo {
-        config: loaded.config,
-        terrain_entity_name: loaded.entity_name,
-        component: comp::GRASS_GROUND,
-    })
-}
-
-/// Build a ModelLoadConfig with catalog-resolved path overrides.
+/// Build a ModelLoadConfig with catalog-resolved path overrides: `held` is
+/// the project's catalog and store (`AssetSources::of`, #1065), the same
+/// `flint validate` and `flint check` ask.
 pub(super) fn build_model_load_config(
     project: &Project,
     scene_path: &str,
     world: &FlintWorld,
-    catalog: Option<&AssetCatalog>,
-    store: Option<&ContentStore>,
+    held: Option<&HeldAssets>,
+) -> ModelLoadConfig {
+    let ids: Vec<EntityId> = world.all_entities().iter().map(|e| e.id).collect();
+    build_model_load_config_of(project, scene_path, world, &ids, held)
+}
+
+/// [`build_model_load_config`] with the catalog asked only for the names
+/// the entities `ids` use: a chunk's, or a script's spawns (#1107).
+pub(super) fn build_model_load_config_of(
+    project: &Project,
+    scene_path: &str,
+    world: &FlintWorld,
+    ids: &[EntityId],
+    held: Option<&HeldAssets>,
 ) -> ModelLoadConfig {
     let mut config = ModelLoadConfig::in_project(project.clone(), scene_path);
     // The player asks procgen for every name before its file (#32), and the
@@ -349,33 +155,19 @@ pub(super) fn build_model_load_config(
         .asked_first
         .push("a procgen spec of the same name (specs/<name>.procgen.toml)");
 
-    let (Some(cat), Some(st)) = (catalog, store) else {
+    let Some(held) = held else {
         return config;
     };
     config.asked_first.insert(0, "the asset catalog");
 
-    for entity in world.all_entities() {
-        if let Some(comps) = world.get_components(entity.id) {
-            // Resolve model assets
-            if let Some(model) = comps.get(comp::MODEL) {
-                if let Some(name) = model.get("asset").and_then(|v| v.as_str()) {
-                    if !config.overrides.contains_key(name) {
-                        if let Some(path) = resolve_catalog(cat, st, name) {
-                            config.overrides.insert(name.to_string(), path);
-                        }
-                    }
-                }
-            }
-            // Resolve textures
-            for comp_name in &[comp::MATERIAL, comp::SPRITE] {
-                if let Some(comp) = comps.get(*comp_name) {
-                    if let Some(tex) = comp.get("texture").and_then(|v| v.as_str()) {
-                        if !config.overrides.contains_key(tex) {
-                            if let Some(path) = resolve_catalog(cat, st, tex) {
-                                config.overrides.insert(tex.to_string(), path);
-                            }
-                        }
-                    }
+    for &id in ids {
+        let model = world.view(id, comp::MODEL).opt_str("asset");
+        let textures =
+            [comp::MATERIAL, comp::SPRITE].map(|table| world.view(id, table).opt_str("texture"));
+        for name in std::iter::once(model).chain(textures).flatten() {
+            if !config.overrides.contains_key(name) {
+                if let Some(path) = held.path_of(name) {
+                    config.overrides.insert(name.to_string(), path);
                 }
             }
         }
@@ -384,23 +176,19 @@ pub(super) fn build_model_load_config(
     config
 }
 
-/// Look up an asset name in the catalog and content store.
-pub(super) fn resolve_catalog(
-    catalog: &AssetCatalog,
-    store: &ContentStore,
-    name: &str,
-) -> Option<PathBuf> {
-    let meta = catalog.get(name)?;
-    let hash = flint_core::ContentHash::from_prefixed_hex(&meta.hash)?;
-    store.get(&hash)
-}
-
 /// Register skeletal data from loaded models into the animation system.
 pub(super) fn register_skeletal_data(
     load_result: &model_loader::ModelLoadResult,
     animation: &mut AnimationSystem,
 ) {
-    register_skeletal_data_saying(load_result, animation, &mut |line| println!("{line}"));
+    register_skeletal_data_saying(load_result, animation, &mut loaded("skeletal_clip"));
+}
+
+/// The player's `say` for the `_saying` loaders: each line a `load` event
+/// of `kind`, which the load's summary counts and `RUST_LOG=load=debug`
+/// shows (#716). `flint render` hands its own `say`, for its report.
+pub(super) fn loaded(kind: &'static str) -> impl FnMut(String) {
+    move |line| tracing::debug!(target: "load", kind, "{}", line.trim_start())
 }
 
 /// [`register_skeletal_data`], each clip it registers told to `say` rather
@@ -468,7 +256,7 @@ pub(super) fn register_node_animation_data(
     load_result: &model_loader::ModelLoadResult,
     animation: &mut AnimationSystem,
 ) {
-    register_node_animation_data_saying(load_result, animation, &mut |line| println!("{line}"));
+    register_node_animation_data_saying(load_result, animation, &mut loaded("node_clip"));
 }
 
 /// [`register_node_animation_data`], telling `say` what it registers.
@@ -514,6 +302,17 @@ pub(super) fn load_audio_from_world(
     preload_all: bool,
     queue: bool,
 ) {
+    // A sound a script plays by a name nothing here caches is looked for
+    // by the same search on its first play (#975), which is the search
+    // `flint check` holds a script's sound to. Set again when a late bundle
+    // lands, which forgets the names it found nothing for.
+    audio
+        .engine
+        .set_sound_search(Some(flint_core::project::AssetScope::new(
+            project.clone(),
+            scene_dir_of(scene_path),
+        )));
+
     let mut load = |name: &str, path: &Path, need: Need| {
         if audio.engine.has_sound(name) {
             return;
@@ -525,31 +324,24 @@ pub(super) fn load_audio_from_world(
         };
         match result {
             Err(e) => tracing::warn!("Failed to load audio '{}': {:?}", name, e),
-            Ok(()) if !queue => println!("Loaded audio: {}", name),
+            Ok(()) if !queue => {
+                tracing::debug!(target: "load", kind = "sound", "Loaded audio: {}", name)
+            }
             Ok(()) => {}
         }
     };
     let scene_dir = scene_dir_of(scene_path);
-
     // Load audio files referenced by audio_source components: a `file` is a
     // path from the scene's directory or from any directory up to the
     // project root (`audio/hit.ogg`), by the project's one search.
     for entity in world.all_entities() {
-        let Some(source) = world
-            .get_components(entity.id)
-            .and_then(|components| components.get(comp::AUDIO_SOURCE).cloned())
-        else {
-            continue;
-        };
-        let Some(file_name) = source.get("file").and_then(|v| v.as_str()) else {
+        // Through the typed view (ADR 0115), as flint-audio reads it
+        let source = world.view(entity.id, comp::AUDIO_SOURCE);
+        let Some(file_name) = source.opt_str("file") else {
             continue;
         };
         // Heard the moment it loads: an autoplay source above silence.
-        let audible = source
-            .get("autoplay")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(true)
-            && source.get("volume").and_then(toml_f64).unwrap_or(1.0) > 0.0;
+        let audible = source.bool("autoplay", true) && source.f64("volume", 1.0) > 0.0;
         let need = if audible { Need::Audible } else { Need::Later };
 
         match project.resolve(AssetKind::Audio, file_name, scene_dir) {
@@ -628,9 +420,7 @@ pub(super) fn load_animations_from_world(
     scene_path: &str,
     animation: &mut AnimationSystem,
 ) {
-    load_animations_saying(project, scene_path, animation, &mut |line| {
-        println!("{line}")
-    });
+    load_animations_saying(project, scene_path, animation, &mut loaded("animation"));
 }
 
 /// [`load_animations_from_world`], telling `say` what it loads.
@@ -665,9 +455,7 @@ pub(super) fn load_sequences_from_world(
     scene_path: &str,
     animation: &mut AnimationSystem,
 ) {
-    load_sequences_saying(project, scene_path, animation, &mut |line| {
-        println!("{line}")
-    });
+    load_sequences_saying(project, scene_path, animation, &mut loaded("sequence"));
 }
 
 /// [`load_sequences_from_world`], telling `say` what it loads.
@@ -705,9 +493,7 @@ pub(super) fn load_sprite_animations_from_world(
     scene_path: &str,
     animation: &mut AnimationSystem,
 ) {
-    load_sprite_animations_saying(project, scene_path, animation, &mut |line| {
-        println!("{line}")
-    });
+    load_sprite_animations_saying(project, scene_path, animation, &mut loaded("sprite_clip"));
 }
 
 /// [`load_sprite_animations_from_world`], telling `say` what it loads.

@@ -11,15 +11,17 @@
 //! `contour_enabled`, `contour_width`... keys fold into that table when it
 //! loads (`flint_scene::fold_legacy_style_keys`).
 //!
-//! Lines come from breaks in depth (the second difference of 1 / distance,
-//! so flat ground draws none) and in luminance. In a scene with a `[wooze]`
+//! Lines come from breaks in depth (the shared edges' steps since #743,
+//! [`super::edges`], which leave out a plane seen edge-on, so flat ground
+//! draws none) and in luminance. In a scene with a `[wooze]`
 //! field, `boil` re-decides on each drawing of the field where a line runs,
 //! how wide it is and how hard the pen pressed; at 0 none of that runs.
 
+use crate::gpu_counts::{CountedDevice, CountedQueue};
 use super::kit;
 use super::{
-    StyleDescriptor, StyleDevice, StyleFrame, StyleHint, StyleInput, StyleParam, StylePass,
-    StyleStage,
+    StyleDescriptor, StyleDevice, StyleFrame, StyleInput, StyleNeed, StyleParam,
+    StylePass, StyleStage,
 };
 use crate::postprocess::{PostProcessConfig, HDR_FORMAT};
 use bytemuck::{Pod, Zeroable};
@@ -31,49 +33,30 @@ pub(super) static STYLE: StyleDescriptor = StyleDescriptor::new(
     create,
 )
 .params(&[
-    StyleParam::new("width", 1.25, 0.25..=5.0),
-    StyleParam::new("threshold", 0.08, 0.01..=0.5),
-    StyleParam::new("strength", 0.9, 0.0..=1.0),
-    StyleParam::new("luma", 0.5, 0.0..=2.0),
-    StyleParam::new("color_r", 0.015, 0.0..=1.0),
+    StyleParam::new("width", 1.25, 0.25..=5.0)
+        .label("Width (px)")
+        .help("Half a line's width, in pixels at 1080p; scaled with the frame"),
+    StyleParam::new("threshold", 0.08, 0.01..=0.5)
+        .label("Threshold")
+        .help("How strong an edge must be before it inks; lower draws more"),
+    StyleParam::new("strength", 0.9, 0.0..=1.0).label("Strength").help("How dark the ink goes"),
+    StyleParam::new("luma", 0.5, 0.0..=2.0)
+        .label("Luma")
+        .help("How much edges in luminance count against edges in depth; 0 is silhouettes only"),
+    StyleParam::new("color_r", 0.015, 0.0..=1.0)
+        .label("Ink")
+        .help("The ink's colour, as the HDR scene holds it (linear)"),
     StyleParam::new("color_g", 0.012, 0.0..=1.0),
     StyleParam::new("color_b", 0.02, 0.0..=1.0),
-    StyleParam::new("fade", 30.0, 0.0..=200.0),
-    StyleParam::new("boil", 0.0, 0.0..=2.0),
+    StyleParam::new("fade", 30.0, 0.0..=200.0)
+        .label("Fade (m)")
+        .help("Metres at which a line has faded by half, so distance doesn't go solid; 0 never fades"),
+    StyleParam::new("boil", 0.0, 0.0..=2.0)
+        .label("Boil")
+        .help("How far each drawing of the wooze field moves the lines; needs a [wooze] table"),
 ])
-.hints(&[
-    StyleHint::new(
-        "width",
-        "Width (px)",
-        "Half a line's width, in pixels at 1080p; scaled with the frame",
-    ),
-    StyleHint::new(
-        "threshold",
-        "Threshold",
-        "How strong an edge must be before it inks; lower draws more",
-    ),
-    StyleHint::new("strength", "Strength", "How dark the ink goes"),
-    StyleHint::new(
-        "luma",
-        "Luma",
-        "How much edges in luminance count against edges in depth; 0 is silhouettes only",
-    ),
-    StyleHint::new(
-        "color",
-        "Ink",
-        "The ink's colour, as the HDR scene holds it (linear)",
-    ),
-    StyleHint::new(
-        "fade",
-        "Fade (m)",
-        "Metres at which a line has faded by half, so distance doesn't go solid; 0 never fades",
-    ),
-    StyleHint::new(
-        "boil",
-        "Boil",
-        "How far each drawing of the wooze field moves the lines; needs a [wooze] table",
-    ),
-]);
+// Its silhouettes (#743): the depth steps, no creases
+.needs(&[StyleNeed::EdgeSteps]);
 
 fn create(d: &StyleDevice) -> Box<dyn StylePass> {
     Box::new(Contour::new(d))
@@ -94,7 +77,9 @@ pub(crate) struct ContourUniforms {
     pub boil: f32,
     pub seed: u32,
     pub fade: f32,
-    pub _pad: [u32; 2],
+    /// The shared edges' `edge_depth`, to read their steps back (#743).
+    pub edge_depth: f32,
+    pub _pad: u32,
 }
 
 impl ContourUniforms {
@@ -117,20 +102,25 @@ impl ContourUniforms {
             boil: param("boil").max(0.0) * config.boil.amount,
             seed: config.boil.seed,
             fade: param("fade").max(0.0),
-            _pad: [0; 2],
+            edge_depth: config.edge_depth.max(super::edges::MIN_THRESHOLD),
+            _pad: 0,
         }
     }
 }
 
 struct Contour {
-    pipeline: wgpu::RenderPipeline,
+    pipeline: std::sync::Arc<wgpu::RenderPipeline>,
     uniform_bgl: wgpu::BindGroupLayout,
     scene_bgl: wgpu::BindGroupLayout,
     depth_bgl: wgpu::BindGroupLayout,
     uniforms: wgpu::Buffer,
-    /// Depth is read by the nearest texel. One kept bind group holds it,
+    /// Depth and the shared edges are read by the nearest texel (the
+    /// edges through it since #1257). One kept bind group holds it,
     /// bound once a frame, so the DX12 sampler heap is safe.
     depth_sampler: wgpu::Sampler,
+    /// Bound if the shared edge pass couldn't be built: one texel of no edge.
+    _no_edges: wgpu::Texture,
+    no_edges_view: wgpu::TextureView,
 }
 
 impl Contour {
@@ -157,12 +147,14 @@ impl Contour {
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::NonFiltering),
                     count: None,
                 },
+                // The shared edges (#743), or the blank stand-in
+                super::pencil::image_entry(2),
             ],
         });
         let pipeline = kit::fullscreen_pipeline(
             device,
             "Contour Pipeline",
-            &kit::shader(device, "Contour Shader", kit::wgsl!("contour.wgsl")),
+            &kit::shader(device, "Contour Shader", kit::wgsl!("prelude_core.wgsl", "noise.wgsl", "edges_read.wgsl", "contour.wgsl")),
             &[&uniform_bgl, &scene_bgl, &depth_bgl],
             HDR_FORMAT,
         );
@@ -174,7 +166,24 @@ impl Contour {
             address_mode_v: wgpu::AddressMode::ClampToEdge,
             ..Default::default()
         });
+        let no_edges = device.create_texture_counted(&wgpu::TextureDescriptor {
+            label: Some("Contour No Edges"),
+            size: wgpu::Extent3d {
+                width: 1,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: super::edges::EDGE_FORMAT,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let no_edges_view = no_edges.create_view(&Default::default());
         Self {
+            _no_edges: no_edges,
+            no_edges_view,
             uniforms: kit::uniform_buffer::<ContourUniforms>(device, "Contour Uniform Buffer"),
             pipeline,
             uniform_bgl,
@@ -202,9 +211,11 @@ impl StylePass for Contour {
         );
         frame
             .queue
-            .write_buffer(&self.uniforms, 0, bytemuck::cast_slice(&[uniforms]));
-        let depth = frame.depth_bind("Contour Depth BG", 0, || {
-            frame.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            .write_buffer_counted(&self.uniforms, 0, bytemuck::cast_slice(&[uniforms]));
+        // Kept over the edges themselves (#960)
+        let over = [frame.edges_or(&self.no_edges_view)];
+        let depth = frame.depth_bind_over("Contour Depth BG", 0, &over, || {
+            frame.device.create_bind_group_counted(&wgpu::BindGroupDescriptor {
                 label: Some("Contour Depth BG"),
                 layout: &self.depth_bgl,
                 entries: &[
@@ -215,6 +226,15 @@ impl StylePass for Contour {
                     wgpu::BindGroupEntry {
                         binding: 1,
                         resource: wgpu::BindingResource::Sampler(&self.depth_sampler),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::TextureView(
+                            frame
+                                .edges
+                                .as_ref()
+                                .map_or(&self.no_edges_view, |e| &e.view),
+                        ),
                     },
                 ],
             })
@@ -247,9 +267,9 @@ mod tests {
     #[test]
     fn uniforms_scale_with_the_frame_and_the_field() {
         let mut config = PostProcessConfig::default();
-        crate::post_style::set_post_style_param(&mut config, "contour", "width", 2.0.into())
+        crate::post_style::set_post_style_param(&mut config, &crate::stylize::StyleRegistry::new(), "contour", "width", 2.0.into())
             .unwrap();
-        crate::post_style::set_post_style_param(&mut config, "contour", "boil", 0.5.into())
+        crate::post_style::set_post_style_param(&mut config, &crate::stylize::StyleRegistry::new(), "contour", "boil", 0.5.into())
             .unwrap();
         config.boil.amount = 1.5;
         config.boil.seed = 9;

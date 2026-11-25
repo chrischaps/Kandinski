@@ -20,10 +20,15 @@
 //! Then each layer stack a manifest names loads whole, and every archetype
 //! names only components that stack declares (the registry skips an unknown
 //! one in silence, so an archetype with a misspelt component just has one
-//! component fewer).
+//! component fewer). A `required_component` constraint of the stack names an
+//! archetype the stack declares, which lists that component: when #681 made
+//! the examples' room "transform-only" while `rooms_have_bounds` still asked
+//! every room for `bounds`, the three showcase levels failed `flint check`
+//! and nothing in `cargo test` said why (#974).
 //!
 //! The repository's own tree must have no problem, and a tree with the #266
 //! mistake in it must have exactly that one, naming the file.
+#![allow(clippy::disallowed_methods)] // a test: reads its files off the disk, not through the vfs
 
 use flint_constraint::ConstraintRegistry;
 use flint_schema::SchemaRegistry;
@@ -33,19 +38,105 @@ fn repo() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
 }
 
-/// The schema layers of the repository, each with the stack it is loaded
-/// in: the one its `flint.toml` names (`flint.toml` for the first two,
-/// `showcase_game/flint.toml` for the third). A directory of schema files
-/// that is in none of them fails [`problems`] as unread.
-const STACKS: &[&[&str]] = &[
-    &["schemas"],
-    &["schemas", "schemas/examples"],
-    &["schemas", "schemas/examples", "showcase_game/schemas"],
-];
+/// The schema layers of the repository, read from its manifests.
+struct Layers {
+    /// Each stack a layer is loaded in, as paths from the repository: the
+    /// engine's set alone (what a game's `engine/schemas` is), the stack the
+    /// root `flint.toml` names, and the one each game kept in the checkout
+    /// names (a top-level directory with a `flint.toml`, found by it so the
+    /// engine names no game, #760). A directory of schema files that is in
+    /// none of them fails [`problems`] as unread.
+    stacks: Vec<Vec<String>>,
+    /// The roots walked for `.toml` files, the layers no other layer holds:
+    /// every file under them must be a schema file of a stack's layer.
+    roots: Vec<String>,
+}
 
-/// The roots walked for `.toml` files: every file under them must be a
-/// schema file of one of the [`STACKS`]' layers.
-const ROOTS: &[&str] = &["schemas", "showcase_game/schemas"];
+impl Layers {
+    fn of_repo() -> Layers {
+        let root = repo();
+        let manifest_stack = |dir: &str| -> Option<Vec<String>> {
+            let text = std::fs::read_to_string(root.join(dir).join("flint.toml")).ok()?;
+            let doc: toml::Table = text
+                .parse()
+                .unwrap_or_else(|e| panic!("{dir}/flint.toml: {e}"));
+            let layers = doc.get("project")?.get("schemas")?.as_array()?;
+            Some(
+                layers
+                    .iter()
+                    .map(|l| normalize(&format!("{dir}/{}", l.as_str().unwrap())))
+                    .collect(),
+            )
+        };
+        let mut stacks = vec![vec!["schemas".to_string()]];
+        stacks.extend(manifest_stack("."));
+        let mut games: Vec<String> = std::fs::read_dir(&root)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.path().join("flint.toml").is_file())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        games.sort();
+        assert!(!games.is_empty(), "no game kept in the checkout");
+        stacks.extend(games.iter().filter_map(|g| manifest_stack(g)));
+        // An engine schema directory brings its packages' after it, as the
+        // resolver loads them (#1332)
+        for stack in &mut stacks {
+            *stack = stack
+                .iter()
+                .flat_map(|layer| {
+                    let engine = Path::new(layer).parent().unwrap_or(Path::new(""));
+                    let packages = flint_core::project::package_schema_dirs(&root.join(layer))
+                        .into_iter()
+                        .map(move |(name, _)| {
+                            let dir = engine.join("packages").join(name).join("schemas");
+                            normalize(&dir.to_string_lossy().replace('\\', "/"))
+                        });
+                    std::iter::once(layer.clone()).chain(packages)
+                })
+                .collect();
+        }
+
+        let mut layers: Vec<String> = stacks.iter().flatten().cloned().collect();
+        layers.sort();
+        layers.dedup();
+        let roots = layers
+            .iter()
+            .filter(|l| !layers.iter().any(|o| l.starts_with(&format!("{o}/"))))
+            .cloned()
+            .collect();
+        Layers { stacks, roots }
+    }
+
+    fn roots(&self) -> Vec<&str> {
+        self.roots.iter().map(String::as_str).collect()
+    }
+
+    fn problems(&self, root: &Path) -> Vec<String> {
+        let stacks: Vec<Vec<&str>> = self
+            .stacks
+            .iter()
+            .map(|s| s.iter().map(String::as_str).collect())
+            .collect();
+        let stacks: Vec<&[&str]> = stacks.iter().map(Vec::as_slice).collect();
+        problems(root, &self.roots(), &stacks)
+    }
+}
+
+/// `a/./b/../c` as `a/c`, for a layer a game names from its own folder.
+fn normalize(path: &str) -> String {
+    let mut parts: Vec<&str> = Vec::new();
+    for part in path.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            p => parts.push(p),
+        }
+    }
+    parts.join("/")
+}
 
 /// The directories of a schema layer, and which loader reads each.
 #[derive(Clone, Copy, Debug)]
@@ -235,6 +326,39 @@ fn problems(root: &Path, roots: &[&str], stacks: &[&[&str]]) -> Vec<String> {
                 }
             }
         }
+        // A constraint that asks an archetype for a component its schema
+        // doesn't list: the two say different things about what one is.
+        for layer in &dirs {
+            let Ok(constraints) = ConstraintRegistry::load_from_directory(layer) else {
+                continue; // said above, or by the file on its own
+            };
+            for constraint in constraints.all() {
+                let flint_constraint::ConstraintKind::RequiredComponent {
+                    archetype,
+                    component,
+                } = &constraint.kind
+                else {
+                    continue;
+                };
+                let lists = registry
+                    .get_archetype(archetype)
+                    .map(|a| a.has_component(component));
+                let problem = match lists {
+                    None => {
+                        format!("names archetype '{archetype}', which the stack doesn't declare")
+                    }
+                    Some(false) => format!(
+                        "asks every '{archetype}' for '{component}', which the archetype's \
+                         components don't list"
+                    ),
+                    Some(true) => continue,
+                };
+                found.push(format!(
+                    "{named}: constraint '{}' {problem}",
+                    constraint.name
+                ));
+            }
+        }
     }
     found.sort();
     found.dedup();
@@ -243,7 +367,7 @@ fn problems(root: &Path, roots: &[&str], stacks: &[&[&str]]) -> Vec<String> {
 
 #[test]
 fn every_schema_file_in_the_repository_loads() {
-    let found = problems(&repo(), ROOTS, STACKS);
+    let found = Layers::of_repo().problems(&repo());
     assert!(
         found.is_empty(),
         "{} problem(s) in the repository's schema files:\n  {}",
@@ -269,8 +393,8 @@ fn scratch_copy(name: &str) -> PathBuf {
     }
     let root = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("schema_files_{name}"));
     let _ = std::fs::remove_dir_all(&root);
-    for dir in ROOTS {
-        copy(&repo().join(dir), &root.join(dir));
+    for dir in Layers::of_repo().roots {
+        copy(&repo().join(&dir), &root.join(&dir));
     }
     root
 }
@@ -295,7 +419,7 @@ fn an_unescaped_quote_in_a_component_file_fails_and_names_the_file() {
     let broken = description.replacen("= \"", "= \"the \"style\" ", 1);
     std::fs::write(&file, text.replacen(&description, &broken, 1)).unwrap();
 
-    let found = problems(&root, ROOTS, STACKS);
+    let found = Layers::of_repo().problems(&root);
     println!("{}", found.join("\n"));
     assert_eq!(found.len(), 1, "one mistake, one problem: {found:#?}");
     assert!(
@@ -347,7 +471,7 @@ fn a_broken_file_of_each_kind_is_found_with_the_others() {
         "\"transfrom\"",
     );
 
-    let found = problems(&root, ROOTS, STACKS);
+    let found = Layers::of_repo().problems(&root);
     println!("{}", found.join("\n"));
     let has = |needle: &str| found.iter().any(|l| l.contains(needle));
     assert!(
@@ -368,6 +492,37 @@ fn a_broken_file_of_each_kind_is_found_with_the_others() {
     );
     assert!(
         has("schemas: archetype 'character' names component 'transfrom'"),
+        "{found:#?}"
+    );
+}
+
+/// #974: the examples' room as #681 left it, "transform-only", while
+/// `rooms_have_bounds` asks every room for `bounds`. Found once in each
+/// stack that loads the examples' layer: the root's, and the showcase's.
+#[test]
+fn a_constraint_asking_an_archetype_for_a_component_it_lacks_is_found() {
+    let root = scratch_copy("room_without_bounds");
+    replace_in(
+        &root.join("schemas/examples/archetypes/room.toml"),
+        "components = [\"transform\", \"bounds\"]",
+        "components = [\"transform\"]",
+    );
+
+    let found = Layers::of_repo().problems(&root);
+    println!("{}", found.join("\n"));
+    let said = ": constraint 'rooms_have_bounds' asks every 'room' for 'bounds', which the \
+                archetype's components don't list";
+    assert_eq!(
+        found.len(),
+        2,
+        "one mistake, one problem a stack: {found:#?}"
+    );
+    assert!(found.iter().all(|l| l.ends_with(said)), "{found:#?}");
+    // The engine's set is `schemas` and the packages' it brings (#1332)
+    assert!(
+        found[0].starts_with(
+            "schemas + packages/living/schemas + packages/music/schemas + schemas/examples"
+        ),
         "{found:#?}"
     );
 }

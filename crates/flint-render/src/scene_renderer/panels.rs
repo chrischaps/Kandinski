@@ -17,6 +17,7 @@
 
 use super::SceneRenderer;
 use crate::camera::Camera;
+use crate::gpu_counts::CountedDevice;
 use crate::panels::{panel_camera, PanelCompositor, PanelLayout, PanelRect};
 use crate::postprocess::{PostProcessConfig, PostProcessResources};
 use std::collections::HashMap;
@@ -26,18 +27,12 @@ use std::collections::HashMap;
 #[derive(Default)]
 pub(crate) struct ViewSlot {
     postprocess_resources: Option<PostProcessResources>,
-    msaa_color: Option<(wgpu::Texture, wgpu::TextureView, u32, u32)>,
-    msaa_depth: Option<(wgpu::Texture, wgpu::TextureView)>,
-    msaa_depth_id: u64,
-    ocean_grab_color: Option<(wgpu::Texture, wgpu::TextureView)>,
-    ocean_grab_depth: Option<(wgpu::Texture, wgpu::TextureView)>,
-    ocean_grab_size: (u32, u32),
-    ocean_grab_bind_group: Option<wgpu::BindGroup>,
+    msaa: super::msaa::MsaaView,
+    ocean_grab: super::water::OceanGrab,
     scaled_depth: Option<std::sync::Arc<crate::render_scale::ScaledDepth>>,
     depth_upscale: Option<crate::render_scale::DepthUpscale>,
     surface_size: (u32, u32),
-    style_mask_pass: Option<crate::style_mask::StyleMaskPass>,
-    style_albedo_pass: Option<crate::style_albedo::StyleAlbedoPass>,
+    style_passes: super::style_mask::StylePasses,
     selection_outline: Option<crate::selection_outline::SelectionOutline>,
 }
 
@@ -47,11 +42,11 @@ struct PanelView {
     format: wgpu::TextureFormat,
     msaa: u32,
     scale: f32,
-    _color: wgpu::Texture,
+    /// Its picture and depth, which a captured frame reads (#1085).
+    color: wgpu::Texture,
     color_view: wgpu::TextureView,
-    _depth: wgpu::Texture,
+    depth: wgpu::Texture,
     depth_view: wgpu::TextureView,
-    depth_id: u64,
     picture_bind: wgpu::BindGroup,
     slot: ViewSlot,
 }
@@ -102,7 +97,7 @@ impl SceneRenderer {
                     if !spec.has_own_look() {
                         return None;
                     }
-                    match resolve_panel_post(base.as_ref(), spec, &scope) {
+                    match resolve_panel_post(base.as_ref(), spec, &scope, &self.styles) {
                         Ok(config) => Some(config),
                         Err(e) => {
                             tracing::warn!(
@@ -209,7 +204,7 @@ impl SceneRenderer {
         };
         let frame_size = self.surface_size;
         let format = self.surface_format;
-        let msaa = self.sample_count;
+        let msaa = self.pipelines.samples();
         let rects = layout.rects(frame_size.0, frame_size.1, self.pixels_per_point);
         let compositor = match self.panel_state.compositor.take() {
             Some(c) if c.format() == format => c,
@@ -220,6 +215,10 @@ impl SceneRenderer {
         let posts = std::mem::take(&mut self.panel_state.posts);
         let last = layout.panels.len() - 1;
         let mut submissions = 0;
+        // A described page names the camera its panels' are made from (#1176)
+        if let Some(log) = &mut self.frame_log {
+            log.page_camera = Some(crate::frame_replay::CameraState::of(camera));
+        }
         for (i, (spec, rect)) in layout.panels.iter().zip(&rects).enumerate() {
             let size = rect.size();
             let fits = views.get(&spec.name).is_some_and(|v| {
@@ -254,7 +253,18 @@ impl SceneRenderer {
             });
             let frame_config = own.map(|c| std::mem::replace(&mut self.postprocess_config, c));
             self.swap_view(&mut view.slot);
-            let depth = crate::bind_cache::DepthTarget::new(&view.depth_view, view.depth_id);
+            let depth = crate::bind_cache::DepthTarget::new(&view.depth_view);
+            // A described frame names each panel's view (#1084)
+            if let Some(log) = &mut self.frame_log {
+                log.panels.push(spec.name.clone());
+            }
+            // and a captured one reads the panel's picture as its surface
+            if let Some(taps) = &mut self.frame_taps {
+                taps.view = crate::frame_taps::CaptureTargets {
+                    surface: Some(view.color.clone()),
+                    depth: Some(view.depth.clone()),
+                };
+            }
             if i == last {
                 self.encode_to(device, queue, encoder, depth, &cam, &view.color_view);
             } else {
@@ -290,6 +300,25 @@ impl SceneRenderer {
             .map(|(spec, rect)| (*rect, &views[&spec.name].picture_bind))
             .collect();
         compositor.encode(queue, encoder, target_view, frame_size, &layout, &pictures);
+        if let Some(log) = &mut self.frame_log {
+            log.on_page = true;
+            let pass = log.ran("Panels", false);
+            pass.writes(&["surface"]);
+            pass.pass.also = layout.panels.iter().map(|p| p.name.clone()).collect();
+        }
+        // The page, read from the host's own output (#1085)
+        if let Some(mut taps) = self.frame_taps.take() {
+            taps.view = taps.host().clone();
+            let mut scopes = crate::frame_capture::FrameScopes {
+                timer: None,
+                log: self.frame_log.take(),
+                taps: Some(taps),
+                knobs: None,
+            };
+            self.tap_pass(device, &mut scopes, encoder, "Panels");
+            self.frame_log = scopes.log;
+            self.frame_taps = scopes.taps;
+        }
         self.panel_state.compositor = Some(compositor);
         self.panel_state.views = views;
         self.panel_state.posts = posts;
@@ -311,25 +340,31 @@ impl SceneRenderer {
             height: size.1,
             depth_or_array_layers: 1,
         };
-        let color = device.create_texture(&wgpu::TextureDescriptor {
+        let color = device.create_texture_counted(&wgpu::TextureDescriptor {
             label: Some("Panel Picture"),
             size: extent,
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::TEXTURE_BINDING
+                // Copied out by a frame capture (#1085)
+                | wgpu::TextureUsages::COPY_SRC,
             view_formats: &[],
         });
         let color_view = color.create_view(&wgpu::TextureViewDescriptor::default());
-        let depth = device.create_texture(&wgpu::TextureDescriptor {
+        let depth = device.create_texture_counted(&wgpu::TextureDescriptor {
             label: Some("Panel Depth"),
             size: extent,
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format: wgpu::TextureFormat::Depth32Float,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::TEXTURE_BINDING
+                // Copied out by a frame capture (#1085)
+                | wgpu::TextureUsages::COPY_SRC,
             view_formats: &[],
         });
         let depth_view = depth.create_view(&wgpu::TextureViewDescriptor::default());
@@ -341,13 +376,12 @@ impl SceneRenderer {
         PanelView {
             size,
             format,
-            msaa: self.sample_count,
+            msaa: self.pipelines.samples(),
             scale: self.render_scale,
-            _color: color,
+            color,
             color_view,
-            _depth: depth,
+            depth,
             depth_view,
-            depth_id: crate::bind_cache::new_depth_id(),
             picture_bind,
             slot,
         }
@@ -360,21 +394,12 @@ impl SceneRenderer {
             &mut self.postprocess_resources,
             &mut slot.postprocess_resources,
         );
-        swap(&mut self.msaa_color, &mut slot.msaa_color);
-        swap(&mut self.msaa_depth, &mut slot.msaa_depth);
-        swap(&mut self.msaa_depth_id, &mut slot.msaa_depth_id);
-        swap(&mut self.ocean_grab_color, &mut slot.ocean_grab_color);
-        swap(&mut self.ocean_grab_depth, &mut slot.ocean_grab_depth);
-        swap(&mut self.ocean_grab_size, &mut slot.ocean_grab_size);
-        swap(
-            &mut self.ocean_grab_bind_group,
-            &mut slot.ocean_grab_bind_group,
-        );
+        self.msaa.swap_view(&mut slot.msaa);
+        self.water.swap_grab(&mut slot.ocean_grab);
         swap(&mut self.scaled_depth, &mut slot.scaled_depth);
         swap(&mut self.depth_upscale, &mut slot.depth_upscale);
         swap(&mut self.surface_size, &mut slot.surface_size);
-        swap(&mut self.style_mask_pass, &mut slot.style_mask_pass);
-        swap(&mut self.style_albedo_pass, &mut slot.style_albedo_pass);
+        self.style_mask.swap_passes(&mut slot.style_passes);
         swap(&mut self.selection_outline, &mut slot.selection_outline);
     }
 }
@@ -386,6 +411,7 @@ fn resolve_panel_post(
     base: Option<&flint_scene::PostProcessDef>,
     spec: &crate::panels::PanelSpec,
     scope: &flint_core::project::AssetScope,
+    styles: &crate::stylize::StyleRegistry,
 ) -> Result<PostProcessConfig, String> {
     let mut def = match base {
         Some(def) => crate::look::resolve_in(def, def.look.as_deref(), scope)?,
@@ -398,5 +424,7 @@ fn resolve_panel_post(
     if let Some(keys) = &spec.post_process {
         def = crate::look::overlay(Some(&def), keys)?;
     }
-    Ok(crate::postprocess::post_process_config_from_def(&def))
+    Ok(crate::postprocess::post_process_config_from_def(
+        &def, styles,
+    ))
 }

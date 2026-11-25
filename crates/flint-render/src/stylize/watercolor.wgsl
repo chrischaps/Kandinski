@@ -31,7 +31,7 @@ struct Row {
     flags: u32,
     paper: vec3<f32>,
     layers: f32,
-    // 1: paint on the paper image (#390)
+    // The paper image's layer plus one (#390, #547); 0 = procedural
     image: f32,
     _p0: f32,
     _p1: f32,
@@ -46,21 +46,23 @@ struct PaintUniforms {
     passthrough: u32,
     near: f32,
     far: f32,
-    // The paper image's mean and spread of luma (#390)
-    paper_stats: vec4<f32>,
-    rows: array<Row, 16>,
-    slots: array<vec4<u32>, 64>,
+    // Each layer of the paper stack (#547): measures and size
+    papers: array<StyleImageLayer, 4>,
 };
 
 @group(0) @binding(0) var<uniform> params: PaintUniforms;
+// The variant table (#740, the framework's): a row a variant, and the row
+// of each mask id, as long as the frame needs
+@group(0) @binding(1) var<storage, read> paint_rows: array<Row>;
+@group(0) @binding(2) var<storage, read> flint_slots: array<u32>;
 @group(1) @binding(0) var input_texture: texture_2d<f32>;
 @group(1) @binding(1) var input_sampler: sampler;
 @group(2) @binding(0) var wash_texture: texture_2d<f32>;
 @group(2) @binding(1) var wash_sampler: sampler;
-@group(3) @binding(0) var mask_texture: texture_2d<u32>;
+@group(3) @binding(0) var flint_mask_texture: texture_2d<u32>;
 @group(3) @binding(1) var depth_texture: texture_depth_2d;
-// The paper image (#390), a blank texel while none is named
-@group(3) @binding(2) var paper_texture: texture_2d<f32>;
+// The paper stack (#390, #547), a blank texel while none is named
+@group(3) @binding(2) var paper_texture: texture_2d_array<f32>;
 
 const PASS_THROUGH: u32 = 1u;
 
@@ -78,42 +80,12 @@ fn vs_main(@builtin(vertex_index) vi: u32) -> VertexOutput {
     return out;
 }
 
-fn to_display(c: vec3<f32>) -> vec3<f32> {
-    let lo = c * 12.92;
-    let hi = 1.055 * pow(c, vec3<f32>(1.0 / 2.4)) - 0.055;
-    return select(hi, lo, c <= vec3<f32>(0.0031308));
-}
+// --- noise: stylize/noise.wgsl's value noise (#1256), under the paint's seed ---
 
-fn to_linear(c: vec3<f32>) -> vec3<f32> {
-    let lo = c / 12.92;
-    let hi = pow((c + 0.055) / 1.055, vec3<f32>(2.4));
-    return select(hi, lo, c <= vec3<f32>(0.04045));
-}
-
-fn luma(c: vec3<f32>) -> f32 {
-    return dot(c, vec3<f32>(0.2126, 0.7152, 0.0722));
-}
-
-// --- noise: integer-hashed value noise, the same on every run and GPU ---
-
-fn hash(p: vec2<i32>) -> f32 {
-    var h = (bitcast<u32>(p.x) * 1597334677u) ^ (bitcast<u32>(p.y) * 3812015801u);
-    h = (h ^ (h >> 16u)) * 2246822519u;
-    h = (h ^ (h >> 13u)) * 3266489917u;
-    h = h ^ (h >> 16u);
-    return f32(h) * (1.0 / 4294967295.0);
-}
+const PAINT_SEED: u32 = 0u;
 
 fn vnoise(p: vec2<f32>) -> f32 {
-    let i = floor(p);
-    let f = p - i;
-    let u = f * f * (3.0 - 2.0 * f);
-    let c = vec2<i32>(i);
-    let a = hash(c);
-    let b = hash(c + vec2<i32>(1, 0));
-    let d = hash(c + vec2<i32>(0, 1));
-    let e = hash(c + vec2<i32>(1, 1));
-    return mix(mix(a, b, u.x), mix(d, e, u.x), u.y);
+    return flint_vnoise(p, PAINT_SEED);
 }
 
 // Two octaves, -1..1 on each axis: where a read wanders to
@@ -144,17 +116,10 @@ fn turbulence(pt: vec2<f32>) -> f32 {
 
 // --- the mask and the depth, read by UV (both at scene resolution) ---
 
-fn mask_at(uv: vec2<f32>) -> u32 {
-    let dims = vec2<i32>(textureDimensions(mask_texture));
-    let c = clamp(vec2<i32>(uv * vec2<f32>(dims)), vec2<i32>(0), dims - 1);
-    return textureLoad(mask_texture, c, 0).r;
-}
-
+// The mask is read through mask_read.wgsl, the slots through mask_slot.wgsl
+// (#1256); a slot past the rows is the scene's
 fn slot_of(id: u32) -> u32 {
-    if (id >= 256u) {
-        return 0u;
-    }
-    let slot = params.slots[id / 4u][id % 4u];
+    let slot = flint_slot(id);
     return select(0u, slot, slot < params.row_count);
 }
 
@@ -166,14 +131,23 @@ fn view_depth(uv: vec2<f32>) -> f32 {
 }
 
 fn painted(slot: u32) -> bool {
-    let off = (params.rows[slot].flags & PASS_THROUGH) != 0u;
+    let off = (paint_rows[slot].flags & PASS_THROUGH) != 0u;
     return !off && !(slot == 0u && params.passthrough == 1u);
 }
 
 fn sample_display(t: texture_2d<f32>, s: sampler, uv: vec2<f32>) -> vec4<f32> {
     let c = textureSampleLevel(t, s, uv, 0.0);
     let rgb = clamp(c.rgb, vec3<f32>(0.0), vec3<f32>(1.0));
-    return vec4<f32>(select(rgb, to_display(rgb), params.srgb == 1u), c.a);
+    return vec4<f32>(select(rgb, flint_to_display(rgb), params.srgb == 1u), c.a);
+}
+
+// An unpainted pixel, as fs_main returns one whose wobbled read finds no
+// painted entity either (#538): the per-entity paint pass is scissored to
+// its entities, and this entry point draws the frame around them, so the
+// pixels there are fs_main's own bytes
+@fragment
+fn fs_passthrough(in: VertexOutput) -> @location(0) vec4<f32> {
+    return textureSampleLevel(input_texture, input_sampler, in.uv, 0.0);
 }
 
 @fragment
@@ -184,17 +158,17 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 
     // Where this pixel's paint comes from: the mask read at a wobbled
     // position, so a painted silhouette wanders over its surroundings
-    let home = slot_of(mask_at(in.uv));
-    let r0 = params.rows[home];
+    let home = slot_of(flint_mask_id(in.uv));
+    let r0 = paint_rows[home];
     let reach = wobble_field(pt / r0.wobble_scale) * r0.wobble * to_uv;
-    let slot = slot_of(mask_at(in.uv + reach));
+    let slot = slot_of(flint_mask_id(in.uv + reach));
     if (!painted(slot)) {
         // Unpainted. If the pixel itself is a painted entity's, its paint
         // wandered off: show what's beside it, as the wash would
         let at = select(in.uv, in.uv + reach, painted(home));
         return textureSampleLevel(input_texture, input_sampler, at, 0.0);
     }
-    let r = params.rows[slot];
+    let r = paint_rows[slot];
     let wuv = in.uv + wobble_field(pt / r.wobble_scale) * r.wobble * to_uv;
 
     let src = sample_display(input_texture, input_sampler, wuv);
@@ -210,17 +184,17 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         // Steps are even in the square root of the tone, so the darks get
         // as many glazes as the lights instead of one hard jump, and no
         // step moves a colour by more than a glaze's worth
-        let lw = max(luma(wash), 1e-3);
+        let lw = max(flint_luma(wash), 1e-3);
         let sw = sqrt(lw);
         let q = sw * r.layers;
         let ss = (floor(q) + smoothstep(0.2, 0.8, fract(q))) / r.layers;
         let ratio = clamp(ss * ss / lw, 0.8, 1.2);
         base = clamp(base * ratio, vec3<f32>(0.0), vec3<f32>(1.0));
         let o = 1.5 * to_uv;
-        let qx = luma(sample_display(wash_texture, wash_sampler, wuv + vec2<f32>(o.x, 0.0)).rgb)
-            - luma(sample_display(wash_texture, wash_sampler, wuv - vec2<f32>(o.x, 0.0)).rgb);
-        let qy = luma(sample_display(wash_texture, wash_sampler, wuv + vec2<f32>(0.0, o.y)).rgb)
-            - luma(sample_display(wash_texture, wash_sampler, wuv - vec2<f32>(0.0, o.y)).rgb);
+        let qx = flint_luma(sample_display(wash_texture, wash_sampler, wuv + vec2<f32>(o.x, 0.0)).rgb)
+            - flint_luma(sample_display(wash_texture, wash_sampler, wuv - vec2<f32>(o.x, 0.0)).rgb);
+        let qy = flint_luma(sample_display(wash_texture, wash_sampler, wuv + vec2<f32>(0.0, o.y)).rgb)
+            - flint_luma(sample_display(wash_texture, wash_sampler, wuv - vec2<f32>(0.0, o.y)).rgb);
         // q per point (d sqrt(l) = dl / 2 sqrt(l)), so the distance to the
         // step is in points
         let slope = length(vec2<f32>(qx, qy)) * r.layers / (6.0 * sw);
@@ -248,11 +222,13 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     var tint = vec3<f32>(1.0);
     if (r.image > 0.5) {
         let lod = log2(max(1.0 / (r.grain_scale * ppp), 1e-3));
-        let c = img_read(paper_texture, pt / r.grain_scale, lod, true, vec2<f32>(0.0), vec2<f32>(0.0));
-        h = img_paper_height(c, params.paper_stats.x, params.paper_stats.y);
+        let layer = img_layer(r.image);
+        let info = params.papers[layer];
+        let c = img_read(paper_texture, layer, info, pt / r.grain_scale, lod, true, vec2<f32>(0.0), vec2<f32>(0.0));
+        h = img_paper_height(c, info.stats.x, info.stats.y);
         tint = img_paper_tint(c);
     }
-    let load = 1.0 - luma(base);
+    let load = 1.0 - flint_luma(base);
     var d = r.pigment;
     // Pooling deepens a dark colour fastest under C^d, so it fades with the
     // load: a pale wash gets a crisp rim, a near-black one no inky outline
@@ -270,5 +246,5 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     // The paper: its colour, and its relief catching light
     let relief = 1.0 - r.grain * (0.5 - h) * 0.3;
     let out = clamp(pigment * r.paper * tint * relief, vec3<f32>(0.0), vec3<f32>(1.0));
-    return vec4<f32>(select(out, to_linear(out), params.srgb == 1u), src.a);
+    return vec4<f32>(select(out, flint_to_linear(out), params.srgb == 1u), src.a);
 }

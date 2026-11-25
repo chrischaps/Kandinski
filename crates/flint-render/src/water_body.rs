@@ -15,9 +15,8 @@
 //! for a game's own mesh. Both draw after the sea, depth-tested, so a lake
 //! above sea level hides the sea under it.
 
+use crate::gpu_counts::CountedDevice;
 use bytemuck::{Pod, Zeroable};
-use flint_core::toml_util::{toml_color, toml_f32};
-use wgpu::util::DeviceExt;
 
 /// A water mesh vertex: where the surface rests, which way is up for it,
 /// and where the water there is going.
@@ -259,13 +258,14 @@ impl Default for WaterBodyLook {
 }
 
 impl WaterBodyLook {
-    /// Read the look fields of a `water_body` component.
-    pub fn from_component(value: &toml::Value) -> Self {
+    /// Read the look fields of a `water_body` component, through the typed
+    /// view (ADR 0115): a wrong type reads as the default and is reported once.
+    pub fn from_component(view: &flint_ecs::ComponentView<'_>) -> Self {
         let d = Self::default();
-        let f = |name: &str, dv: f32| value.get(name).and_then(toml_f32).unwrap_or(dv);
+        let f = |name: &str, dv: f32| view.f32(name, dv);
         Self {
-            deep_color: value.get("deep_color").and_then(toml_color),
-            shallow_color: value.get("shallow_color").and_then(toml_color),
+            deep_color: view.opt_color("deep_color"),
+            shallow_color: view.opt_color("shallow_color"),
             wave_scale: f("wave_scale", d.wave_scale).clamp(0.0, 2.0),
             flow_foam: f("flow_foam", d.flow_foam).clamp(0.0, 2.0),
             flow_period: f("flow_period", d.flow_period).clamp(0.25, 30.0),
@@ -333,23 +333,23 @@ impl GpuWaterBody {
         mesh: &WaterBodyMesh,
         look: WaterBodyLook,
     ) -> Self {
-        let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        let vertex_buffer = device.create_buffer_init_counted(&wgpu::util::BufferInitDescriptor {
             label: Some(&format!("Water Body {label} Vertices")),
             contents: bytemuck::cast_slice(&mesh.vertices),
             usage: wgpu::BufferUsages::VERTEX,
         });
-        let index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        let index_buffer = device.create_buffer_init_counted(&wgpu::util::BufferInitDescriptor {
             label: Some(&format!("Water Body {label} Indices")),
             contents: bytemuck::cast_slice(&mesh.indices),
             usage: wgpu::BufferUsages::INDEX,
         });
-        let uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        let uniform_buffer = device.create_buffer_counted(&wgpu::BufferDescriptor {
             label: Some(&format!("Water Body {label} Uniforms")),
             size: std::mem::size_of::<WaterBodyUniformsGpu>() as u64,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        let bind_group = device.create_bind_group_counted(&wgpu::BindGroupDescriptor {
             layout,
             entries: &[
                 wgpu::BindGroupEntry {
@@ -382,11 +382,16 @@ impl GpuWaterBody {
 /// Build the mesh a `water_body` component describes: `shape = "lake"` with
 /// an `outline` of [x, z] points and a `level`, or `shape = "river"` with a
 /// `path` of [x, y, z] points, a `width`, a `speed` and a `fall_speedup`.
-pub fn mesh_from_component(value: &toml::Value) -> Result<WaterBodyMesh, String> {
-    let f = |name: &str, dv: f32| value.get(name).and_then(toml_f32).unwrap_or(dv);
+///
+/// Read through the typed view (ADR 0115, #1068): `level`, `width`, `speed`
+/// and `fall_speedup` of the wrong type keep their defaults and are
+/// reported once, as is a `shape` that is no string (a lake). An unknown
+/// shape or a bad point list is still the `Err` the caller warns with.
+pub fn mesh_from_component(view: &flint_ecs::ComponentView<'_>) -> Result<WaterBodyMesh, String> {
+    let f = |name: &str, dv: f32| view.f32(name, dv);
     let points = |name: &str, n: usize| -> Result<Vec<Vec<f32>>, String> {
-        let arr = value
-            .get(name)
+        let arr = view
+            .raw(name)
             .and_then(|v| v.as_array())
             .ok_or_else(|| format!("water_body needs a `{name}` array"))?;
         arr.iter()
@@ -398,11 +403,7 @@ pub fn mesh_from_component(value: &toml::Value) -> Result<WaterBodyMesh, String>
             })
             .collect()
     };
-    match value
-        .get("shape")
-        .and_then(|v| v.as_str())
-        .unwrap_or("lake")
-    {
+    match view.str("shape", "lake") {
         "lake" => {
             let outline: Vec<[f32; 2]> =
                 points("outline", 2)?.iter().map(|p| [p[0], p[1]]).collect();
@@ -659,13 +660,34 @@ mod tests {
             "shape = 'lake'\nlevel = 3.0\noutline = [[0, 0], [4, 0], [4, 4], [0, 4]]",
         )
         .unwrap();
-        let m = mesh_from_component(&lake).unwrap();
+        let reports = flint_ecs::ReadReports::new();
+        let view = |v| flint_ecs::ComponentView::of("pool", "water_body", Some(v), &reports);
+        let m = mesh_from_component(&view(&lake)).unwrap();
         assert!((tri_area(&m) - 16.0).abs() < 1e-4);
         let river: toml::Value =
             toml::from_str("shape = 'river'\nwidth = 2\npath = [[0, 1, 0], [10, 1, 0]]").unwrap();
-        assert!(mesh_from_component(&river).unwrap().vertices.len() > 10);
+        assert!(mesh_from_component(&view(&river)).unwrap().vertices.len() > 10);
         let bad: toml::Value = toml::from_str("shape = 'pond'").unwrap();
-        assert!(mesh_from_component(&bad).is_err());
+        assert!(mesh_from_component(&view(&bad)).is_err());
+        assert!(reports.is_empty());
+    }
+
+    #[test]
+    fn a_wrong_typed_body_field_keeps_its_default_and_is_reported_once() {
+        let river: toml::Value = toml::from_str(
+            "shape = 'river'\nwidth = 'wide'\nspeed = 2\npath = [[0, 1, 0], [10, 1, 0]]",
+        )
+        .unwrap();
+        let reports = flint_ecs::ReadReports::new();
+        let view = flint_ecs::ComponentView::of("stream", "water_body", Some(&river), &reports);
+        let first = mesh_from_component(&view).unwrap();
+        let again = mesh_from_component(&view).unwrap();
+        assert_eq!(first.vertices.len(), again.vertices.len());
+        let said: Vec<String> = reports.snapshot().iter().map(|d| d.to_string()).collect();
+        assert_eq!(
+            said,
+            ["error[bad-type] entity 'stream' water_body.width: expected a number, got string \"wide\""]
+        );
     }
 
     #[test]
@@ -693,12 +715,15 @@ mod tests {
 shore_foam = 0.25",
         )
         .unwrap();
-        let look = WaterBodyLook::from_component(&stream);
+        let reports = flint_ecs::ReadReports::new();
+        let view = |v| flint_ecs::ComponentView::of("stream", "water_body", Some(v), &reports);
+        let look = WaterBodyLook::from_component(&view(&stream));
         assert_eq!(look.shore_foam, 0.25);
         // Still or flowing, the band is the body's.
         assert_eq!(look.to_gpu(&sea, false).params[3], 0.25);
         assert_eq!(look.to_gpu(&sea, true).params[3], 0.25);
         let none: toml::Value = toml::from_str("shore_foam = -1").unwrap();
-        assert_eq!(WaterBodyLook::from_component(&none).shore_foam, 0.0);
+        assert_eq!(WaterBodyLook::from_component(&view(&none)).shore_foam, 0.0);
+        assert!(reports.is_empty());
     }
 }

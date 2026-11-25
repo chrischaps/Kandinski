@@ -5,7 +5,7 @@
 //!
 //! ```bash
 //! flint check                         # the project in the working directory
-//! flint check examples/               # every scene under a folder
+//! flint check flint-examples/        # every scene under a folder
 //! flint check scenes/dock.scene.toml  # one scene and the files it names
 //! flint check . --json                # one JSON document on stdout
 //! ```
@@ -16,6 +16,7 @@
 
 use crate::check::{self, Checks, Subject};
 use anyhow::{bail, Result};
+use flint_core::diagnostic::codes;
 use std::path::PathBuf;
 
 #[derive(clap::Args)]
@@ -23,10 +24,6 @@ pub struct CheckArgs {
     /// A project folder (every scene under it is checked) or one scene file
     #[arg(default_value = ".")]
     pub path: PathBuf,
-
-    /// Print one JSON document on stdout instead of text
-    #[arg(long)]
-    pub json: bool,
 
     /// Schema directories, later ones overriding earlier (repeatable).
     /// Without it: the project's flint.toml `schemas`, else schemas/ in the
@@ -44,6 +41,15 @@ pub struct CheckArgs {
     pub script: check::scripts::ScriptApiArgs,
 }
 
+/// `path` from the working directory, with `/`, as the report spells files.
+fn from_here(path: &std::path::Path) -> PathBuf {
+    let rel = std::env::current_dir()
+        .ok()
+        .and_then(|cwd| path.strip_prefix(cwd).ok().map(PathBuf::from))
+        .unwrap_or_else(|| path.to_path_buf());
+    PathBuf::from(flint_core::project::shown(&rel))
+}
+
 /// The report for `args`, without printing it or exiting.
 pub fn report(args: &CheckArgs) -> Result<check::Report> {
     let path = &args.path;
@@ -59,18 +65,26 @@ pub fn report(args: &CheckArgs) -> Result<check::Report> {
     };
     subject.strict = args.strict;
     subject.script_api = Some(args.script.api()?);
-    Ok(check::run(&subject, Checks::ALL))
+    let mut report = check::run(&subject, Checks::ALL);
+    // A package the project lists that this flint was built without
+    // (#1335): what checks here won't run
+    let at = if path.is_dir() {
+        path.join(flint_core::project::MANIFEST_FILE)
+    } else {
+        path.clone()
+    };
+    if let Some(unbuilt) = super::package::unbuilt_at(&at, &args.schemas) {
+        report.diagnostics.insert(
+            0,
+            flint_core::Diagnostic::error(codes::UNBUILT_PACKAGE, unbuilt.what())
+                .file(from_here(&unbuilt.manifest))
+                .hint(unbuilt.hint()),
+        );
+    }
+    Ok(report)
 }
 
 pub fn run(args: CheckArgs) -> Result<()> {
     let report = report(&args)?;
-    if args.json {
-        println!("{}", serde_json::to_string_pretty(&check::json(&report))?);
-    } else {
-        print!("{}", check::text(&report));
-    }
-    if report.has_errors() {
-        std::process::exit(1);
-    }
-    Ok(())
+    crate::output::emit(&report)
 }

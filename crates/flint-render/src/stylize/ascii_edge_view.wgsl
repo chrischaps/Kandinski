@@ -1,10 +1,13 @@
 // ASCII edge view (#349): what the edge passes found and what each glyph
 // cell made of it. `flint render --debug-mode edges` (and F4's "Style
 // Edges") draw this in place of the glyphs, over the scene in dim grey:
-//   - each edge pixel (ascii_edges.wgsl) in its source's colour: cyan a
-//     depth step, amber a crease, magenta a styled entity's outline;
-//   - each glyph cell's decision (ascii_edge_cells.wgsl, then the glyph
-//     pass's thinning in ascii_edge_thin.wgsl): a green line in the
+//   - each edge pixel (ascii_edge_source.wgsl: the shared edges and the
+//     mask's outlines, #743) in its source's colour: cyan a depth step,
+//     amber a crease, magenta a styled entity's outline;
+//   - each glyph cell's decision (ascii_edge_cells.wgsl, then the
+//     thinning and corners of ascii_edge_thin.wgsl and
+//     ascii_edge_corners.wgsl, #910, the texel the glyph pass reads): a
+//     green line in the
 //     glyph's direction where it draws one, a dim dashed one where it
 //     yields the line to a neighbour, a red wash where the cell holds more
 //     than `edge_max` (texture, keeps its tone glyph), nothing where it
@@ -16,6 +19,8 @@
 // The colours are ascii.rs's EDGE_VIEW_LEGEND; keep them together.
 
 struct EdgeViewUniforms {
+    // The edge pixels' inputs (ascii_edge_source.wgsl)
+    src: EdgeSource,
     cell: vec2<f32>,
     origin: vec2<f32>,
     size: vec2<f32>,
@@ -33,10 +38,15 @@ struct EdgeViewUniforms {
 };
 
 @group(0) @binding(0) var<uniform> u: EdgeViewUniforms;
-@group(1) @binding(0) var input_texture: texture_2d<f32>;
-@group(1) @binding(1) var input_sampler: sampler;
-@group(2) @binding(0) var edges: texture_2d<f32>;
+// Group 0's edge table and group 1's edges, mask and depth are
+// ascii_edge_source.wgsl's
+@group(2) @binding(0) var input_texture: texture_2d<f32>;
+@group(2) @binding(1) var input_sampler: sampler;
 @group(3) @binding(0) var edge_cells: texture_2d<f32>;
+// The edge slot pass's packed decision per cell (#910)
+@group(3) @binding(1) var edge_slots: texture_2d<u32>;
+// The mask's outlines (#743, ascii_edge_outline.wgsl), 0 while it didn't run
+@group(3) @binding(2) var outlines: texture_2d<f32>;
 
 // The edge cells are offset by one, so the part cell at the top left is
 // texel 0, 0 (ascii_common.wgsl's CELL_OFFSET)
@@ -52,7 +62,7 @@ const TEXTURE_COLOR: vec3<f32> = vec3<f32>(1.0, 0.25, 0.2);
 const CORNER_COLOR: vec3<f32> = vec3<f32>(1.0, 0.9, 0.3);
 
 // A corner glyph slot's arms (#348), right 1, left 2, down 4, up 8: the
-// inverse of ascii_edge_thin.wgsl's ARM_GLYPHS, slots 4..12
+// inverse of ascii_edge_corners.wgsl's ARM_GLYPHS, slots 4..12
 const SLOT_ARMS = array<u32, 9>(5u, 6u, 9u, 10u, 13u, 14u, 7u, 11u, 15u);
 
 struct VertexOutput {
@@ -67,18 +77,6 @@ fn vs_main(@builtin(vertex_index) vi: u32) -> VertexOutput {
     out.position = vec4<f32>(uv * 2.0 - 1.0, 0.0, 1.0);
     out.uv = vec2<f32>(uv.x, 1.0 - uv.y);
     return out;
-}
-
-fn to_display(c: vec3<f32>) -> vec3<f32> {
-    let lo = c * 12.92;
-    let hi = 1.055 * pow(c, vec3<f32>(1.0 / 2.4)) - 0.055;
-    return select(hi, lo, c <= vec3<f32>(0.0031308));
-}
-
-fn to_linear(c: vec3<f32>) -> vec3<f32> {
-    let lo = c / 12.92;
-    let hi = pow((c + 0.055) / 1.055, vec3<f32>(2.4));
-    return select(hi, lo, c <= vec3<f32>(0.04045));
 }
 
 // 3x5 digits, bit (row * 3 + column) set where the digit inks
@@ -124,8 +122,8 @@ fn glyph_direction(slot: u32) -> vec2<f32> {
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let src = textureSample(input_texture, input_sampler, in.uv);
     let rgb = clamp(src.rgb, vec3<f32>(0.0), vec3<f32>(1.0));
-    let shown = select(rgb, to_display(rgb), u.srgb > 0.5);
-    let luma = dot(shown, vec3<f32>(0.2126, 0.7152, 0.0722));
+    let shown = select(rgb, flint_to_display(rgb), u.srgb > 0.5);
+    let luma = flint_luma(shown);
     var out = vec3<f32>(luma * u.dim);
 
     let p = in.position.xy;
@@ -140,8 +138,10 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let e = edge_cell_at(c);
     let len = e.y;
     let has_line = e.x > 0.5;
-    let drawn = has_line && thinned_slot(c) != NO_EDGE;
-    let shape = cornered_slot(c, u.corners);
+    let cmax = vec2<i32>(textureDimensions(edge_slots)) - vec2<i32>(1);
+    let slots = textureLoad(edge_slots, clamp(c, vec2<i32>(0), cmax), 0).x;
+    let drawn = has_line && slot_for(slots, 0u) != NO_EDGE;
+    let shape = slot_for(slots, u.corners);
     // A corner in a gap (#637) draws no line of its own, so it isn't `drawn`
     let corner = shape >= 4u && shape != NO_EDGE;
     var decision = SHORT_COLOR;
@@ -161,7 +161,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         vec2<i32>(p * u.edge_size / u.size),
         vec2<i32>(u.edge_size) - vec2<i32>(1),
     );
-    let kind = textureLoad(edges, q, 0).w;
+    let kind = edge_pixel(q, textureLoad(outlines, q, 0)).w;
     if kind > 2.5 {
         out = OUTLINE_COLOR;
     } else if kind > 1.5 {
@@ -215,6 +215,6 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         }
     }
 
-    let encoded = select(out, to_linear(out), u.srgb > 0.5);
+    let encoded = select(out, flint_to_linear(out), u.srgb > 0.5);
     return vec4<f32>(encoded, src.a);
 }

@@ -17,21 +17,26 @@ Without visibility culling, every object renders every frame regardless of wheth
 - Mesh LOD switching by camera distance
 - Optional texture streaming for large worlds
 
-> Partly delivered. The renderer extracts a camera frustum every frame
-> (`flint-render/src/frustum.rs`) and culls terrain chunks by AABB against it;
-> grass has its own distance fade. Entity meshes are still drawn
-> unconditionally, so per-object culling and LOD remain open.
+> Mostly delivered. Every opaque and transparent mesh draw whose world box
+> misses the camera frustum is skipped, each shadow cascade skips the draws
+> outside its own frustum, and terrain chunks are culled the same way. A
+> multi-LOD model draws one level at a time by distance (authored
+> `flint_lod` bands, or a `LOD_0`, `LOD_1`, ... chain banded at import,
+> #193), an entity's `lod` component sets a draw distance, and two runtime
+> scales serve quality settings (see [Rendering](concepts/rendering.md)).
+> Still open: a BVH (the cull walks every draw), terrain chunk LOD, and
+> texture streaming.
 
 ## Navigation Mesh & Pathfinding
 
 **Priority: High**
 
-Every game with NPCs needs this. Currently enemies can only do simple raycast-based movement — entire genres are blocked without proper pathfinding.
+Every game with NPCs needs this. Tracked in [#969](https://github.com/chrischaps/Flint/issues/969), whose baseline has landed ([ADR 0130](https://github.com/chrischaps/Flint/blob/main/docs/adr/0130-navigation-is-a-lazy-grid-of-floors.md)): a grid of floors baked from the fixed colliders as searches reach it, A\* over it, and `find_path` / `move_along_path` for scripts ([Physics and Runtime: Navigation](concepts/physics-and-runtime.md#navigation)). Still to come:
 
-- Nav mesh generation from scene geometry
-- A\* pathfinding with dynamic obstacle avoidance
-- Script API: `find_path(from, to)`, `move_along_path()`
-- Optional crowd simulation (RVO) for dense NPC scenes
+- Dynamic obstacles: doors, lifts and other agents are not on the grid, so a path goes through a closed door
+- Avoidance between agents, and crowd simulation (RVO) for dense NPC scenes
+- Links between floors a step can't join (jumps, ladders, teleports)
+- A nav mesh built from the same column data, if a game's open ground outgrows a grid
 
 ## Coroutines & Async Scripting
 
@@ -57,7 +62,7 @@ The renderer currently uses binary alpha only — pixels are either fully opaque
 
 > Partly delivered. The [ocean](concepts/ocean.md) pipeline already does a grab
 > pass with screen-space refraction, per-channel absorption and turbidity, and
-> [render mode 5](concepts/post-processing.md#render-modes) handles being
+> the [`underwater` style](concepts/post-processing.md#the-reality-styles) handles being
 > underwater. What remains here is the *general* case: sorted alpha blending
 > and an `opacity` material field for glass, shields and smoke.
 

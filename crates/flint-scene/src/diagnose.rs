@@ -24,17 +24,23 @@
 
 use crate::format::{EntityDef, SceneFile};
 use crate::prefab;
+use flint_asset::held::CATALOG_DIR;
+use flint_asset::HeldAssets;
 use flint_core::diagnostic::{self, codes, Diagnostic};
 use flint_core::project::{self, AssetKind, Project};
 use flint_core::vfs;
 use flint_schema::{references, validate_component, validate_table, ReferenceKind, SchemaRegistry};
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// The component that declares an asset to be made (`flint asset resolve`
 /// reads it): its `name` is an asset the scene may name before any file is
 /// there.
 const ASSET_DEF: &str = "asset_def";
+
+/// The kinds the player asks the asset catalog for before the files: a
+/// model's `asset`, a material's or sprite's `texture` (#804).
+const CATALOGUED: &[AssetKind] = &[AssetKind::Models, AssetKind::Textures];
 
 /// Every problem in the scene at `scene_file`, prefab instances expanded as
 /// the loader expands them (their entities are named `<prefix>_<name>`).
@@ -42,10 +48,24 @@ const ASSET_DEF: &str = "asset_def";
 /// archetype declared in any of them is known. `project` finds the prefabs
 /// and the assets, and its `[project] strict = true` makes an unknown field
 /// an error, as [`diagnostic::promote_strict`] does for
-/// `flint validate --strict`.
+/// `flint validate --strict`. What its `[project.diagnostics] allow` names
+/// is left out ([`diagnose_all`] keeps it, for a host that counts it).
 ///
 /// Entities are reported in name order, so two runs print the same list.
 pub fn diagnose(
+    scene_file: &Path,
+    registry: &SchemaRegistry,
+    project: &Project,
+) -> Vec<Diagnostic> {
+    let mut found = diagnose_all(scene_file, registry, project);
+    diagnostic::drop_allowed(&mut found, &project.allow);
+    found
+}
+
+/// [`diagnose`] with nothing left out for the project's allow list: what
+/// `flint validate` and `flint check` run, applying the list (and counting
+/// what it took) once every check of theirs has spoken.
+pub fn diagnose_all(
     scene_file: &Path,
     registry: &SchemaRegistry,
     project: &Project,
@@ -56,9 +76,15 @@ pub fn diagnose(
             return vec![Diagnostic::error(codes::FILE_UNREADABLE, e.to_string()).file(scene_file)]
         }
     };
-    let mut scene: SceneFile = match SceneFile::parse(&content) {
-        Ok(scene) => scene,
-        Err(e) => return vec![parse_diagnostic(scene_file, &e)],
+    // A typed table that doesn't fit its type refuses the parse; the rest
+    // of the scene is still checked, and so is the table, by its schema
+    // (#1061)
+    let (mut scene, refused) = match SceneFile::parse(&content) {
+        Ok(scene) => (scene, Vec::new()),
+        Err(e) => match SceneFile::parse_refusing(&content) {
+            Some(parsed) => parsed,
+            None => return vec![parse_diagnostic(scene_file, &e)],
+        },
     };
     let mut found = Vec::new();
     if let Err(e) = prefab::expand_prefabs_in(&mut scene, scene_file, project) {
@@ -75,10 +101,45 @@ pub fn diagnose(
     if !expanded {
         found.retain(|d| d.code != codes::UNKNOWN_ENTITY);
     }
+    for (table, said) in refused {
+        refuse_table(&mut found, scene_file, table, &said);
+    }
     if project.strict {
         diagnostic::promote_strict(&mut found);
     }
+    crate::place_table_diagnostics(&content, &mut found);
     found
+}
+
+/// What the hint of a table that refuses the load ends with.
+pub const REFUSES_THE_LOAD: &str = "the scene does not load until the table fits";
+
+/// A typed table that doesn't fit its type (#1061): the scene pass has held
+/// it to its `[table.<name>]` schema, and its errors there (`bad-type`
+/// naming the field) are why the load is refused, so they say so in their
+/// hint; serde's message stands, as `toml-parse` on the table, only when the
+/// pass found no error in it. One mistake is one diagnostic, by its field,
+/// as #807 made it for `[living]`.
+fn refuse_table(found: &mut Vec<Diagnostic>, file: &Path, table: &str, said: &str) {
+    let mut named = false;
+    for d in found
+        .iter_mut()
+        .filter(|d| d.is_error() && d.entity.is_none() && d.table.as_deref() == Some(table))
+    {
+        named = true;
+        d.hint = Some(match d.hint.take() {
+            Some(hint) => format!("{hint}; {REFUSES_THE_LOAD}"),
+            None => REFUSES_THE_LOAD.to_string(),
+        });
+    }
+    if !named {
+        found.push(
+            Diagnostic::error(codes::TOML_PARSE, said)
+                .file(file)
+                .table(table)
+                .hint(REFUSES_THE_LOAD),
+        );
+    }
 }
 
 /// A file that is not TOML, or not a scene, as a diagnostic naming it.
@@ -105,14 +166,130 @@ pub fn diagnose_scene_in(
         scene,
         project,
         scene_dir,
-        to_be_made: scene
-            .entities
-            .values()
-            .filter_map(|entity| entity.components.get(ASSET_DEF)?.get("name")?.as_str())
-            .collect(),
+        to_be_made: declared_assets(scene),
         assets: HashMap::new(),
+        held: None,
     };
     diagnose_entities(scene, Some(file), registry, Some(&mut lookup))
+}
+
+/// The `name` of every `asset_def` in `scene`: assets it declares, which
+/// `flint asset resolve` makes, so a reference to one is not missing before
+/// its file is there. `flint check` passes them by this too (#804).
+pub fn declared_assets(scene: &SceneFile) -> HashSet<&str> {
+    scene
+        .entities
+        .values()
+        .filter_map(|entity| entity.components.get(ASSET_DEF)?.get("name")?.as_str())
+        .collect()
+}
+
+/// Where a scene's asset reference leads ([`asset_references`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Located {
+    /// The file the engine loads for it.
+    File(PathBuf),
+    /// No file, but the project's asset catalog holds a model or texture
+    /// of that name, which the player loads from there.
+    Catalog,
+    /// Nothing yet, but an `asset_def` of the scene declares it: an asset
+    /// `flint asset resolve` is to make.
+    Declared,
+    /// Nothing: every path tried, as `flint check`'s hint says them.
+    Missing { tried: String },
+}
+
+/// One `asset` field's value, written in a scene.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AssetReference {
+    /// The entity it is written on (a prefab's as `<prefix>_<name>`), or
+    /// `None` for a scene-level table.
+    pub entity: Option<String>,
+    /// The component it is a field of, or the scene table (`environment`).
+    pub table: String,
+    /// The field's dotted path inside it: `texture`, `layers[1].mask`.
+    pub field: String,
+    /// The name written.
+    pub name: String,
+    /// The kinds the field's schema says it may name.
+    pub kinds: Vec<AssetKind>,
+    pub located: Located,
+}
+
+/// Every asset a scene names (#968): each value of a field the loaded
+/// schemas type `asset`, through arrays and tables with fields, in every
+/// component of every entity (prefab instances expanded, as the loader
+/// expands them) and in every scene-level table, each looked up as
+/// [`diagnose`] looks it up. The list comes from `registry`, so a new
+/// `asset` field is in it with no change here; a component or table no
+/// schema declares, an empty name and an asset turned off by its `unless`
+/// sibling are not. Entities in name order, then the tables in name order.
+///
+/// Only what the scene writes is read: an archetype's defaults are not.
+/// What `flint asset resolve` reports.
+pub fn asset_references(
+    scene_file: &Path,
+    registry: &SchemaRegistry,
+    project: &Project,
+) -> flint_core::Result<Vec<AssetReference>> {
+    let content = vfs::read_to_string(scene_file)?;
+    let mut scene = SceneFile::parse(&content).map_err(|e| {
+        flint_core::FlintError::ParseError(format!("{}: {e}", scene_file.display()))
+    })?;
+    prefab::expand_prefabs_in(&mut scene, scene_file, project)?;
+    let scene_dir = scene_file
+        .parent()
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let mut lookup = Lookup {
+        scene: &scene,
+        project,
+        scene_dir,
+        to_be_made: declared_assets(&scene),
+        assets: HashMap::new(),
+        held: None,
+    };
+
+    let tables = scene.scene_tables();
+    let mut written: Vec<(
+        Option<&str>,
+        &str,
+        &flint_schema::ComponentSchema,
+        &toml::Value,
+    )> = Vec::new();
+    for (name, entity) in &scene.entities {
+        let mut components: Vec<(&String, &toml::Value)> = entity.components.iter().collect();
+        components.sort_unstable_by_key(|(component, _)| *component);
+        for (component, data) in components {
+            if let Some(schema) = registry.get_component(component) {
+                written.push((Some(name), component, schema, data));
+            }
+        }
+    }
+    for (name, data) in &tables {
+        if let Some(schema) = registry.get_table(name) {
+            written.push((None, name, schema, data));
+        }
+    }
+
+    let mut found = Vec::new();
+    for (entity, table, schema, data) in written {
+        for reference in references(schema, data) {
+            let ReferenceKind::Asset(kinds) = reference.kind else {
+                continue;
+            };
+            let located = lookup.locate(&kinds, &reference.name);
+            found.push(AssetReference {
+                entity: entity.map(str::to_string),
+                table: table.to_string(),
+                field: reference.field,
+                name: reference.name,
+                kinds,
+                located,
+            });
+        }
+    }
+    Ok(found)
 }
 
 /// [`diagnose_scene_in`] without the references: the entities' archetypes
@@ -163,12 +340,130 @@ fn diagnose_entities(
             );
         }
     }
+    // A loop of parents needs the whole scene to see, and no schema
+    if lookup.is_some() {
+        found.extend(parent_cycles(scene));
+        // So does which entity is the player
+        found.extend(second_players(scene, registry));
+    }
     if let Some(file) = file {
         for d in &mut found {
             d.file = Some(file.to_path_buf());
         }
     }
     found
+}
+
+/// Every loop the scene's `parent`s close (#680), once each: `parent =
+/// "lamp"` on `lamp`, or `cart` under `wheel` under `cart`. The loader
+/// refuses the first link that closes one (`FlintWorld::set_parent`), which
+/// link that is depends on the order the entities load in, so the
+/// diagnostic is put on the loop's first entity by name and its chain
+/// starts there: the same words every run.
+fn parent_cycles(scene: &SceneFile) -> Vec<Diagnostic> {
+    let mut names: Vec<&str> = scene.entities.keys().map(String::as_str).collect();
+    names.sort_unstable();
+    let parent_of = |name: &str| {
+        scene
+            .entities
+            .get(name)
+            .and_then(|e| e.parent.as_deref())
+            .filter(|p| scene.entities.contains_key(*p))
+    };
+    let mut done: HashSet<&str> = HashSet::new();
+    let mut found = Vec::new();
+    for &start in &names {
+        // Up from `start` until a name walked before: in this walk, a loop;
+        // in an earlier one, nothing new
+        let mut path: Vec<&str> = Vec::new();
+        let mut at = Some(start);
+        while let Some(name) = at {
+            if done.contains(name) {
+                break;
+            }
+            if let Some(i) = path.iter().position(|n| *n == name) {
+                let ring = &path[i..];
+                let first = (0..ring.len()).min_by_key(|&k| ring[k]).unwrap_or(0);
+                let mut chain: Vec<&str> = ring[first..]
+                    .iter()
+                    .chain(&ring[..first])
+                    .copied()
+                    .collect();
+                let entity = chain[0];
+                let message = if chain.len() == 1 {
+                    format!("`{entity}` is its own parent, so the scene does not load")
+                } else {
+                    chain.push(entity);
+                    format!(
+                        "the parents loop: {}, each the child of the next, so the scene does \
+                         not load",
+                        chain.join(" -> ")
+                    )
+                };
+                found.push(
+                    Diagnostic::error(codes::PARENT_CYCLE, message)
+                        .entity(entity)
+                        .field("parent")
+                        .hint(if ring.len() == 1 {
+                            format!("remove `parent = \"{entity}\"` from `{entity}`")
+                        } else {
+                            "remove or change the `parent` of one of them".to_string()
+                        }),
+                );
+                break;
+            }
+            path.push(name);
+            at = parent_of(name);
+        }
+        done.extend(path);
+    }
+    found
+}
+
+/// `second-player` (#1212): the player is the first entity by name that
+/// carries a `character_controller`, written or from its archetype
+/// (`flint_physics::PhysicsSystem::initialize` walks the world's names in
+/// order and takes the first), and the controller of every other entity is
+/// never read: it doesn't walk, turn or jump. One warning on each of those,
+/// naming the player. A warning: the scene plays, with one player.
+fn second_players(scene: &SceneFile, registry: &SchemaRegistry) -> Vec<Diagnostic> {
+    use flint_core::components::CHARACTER_CONTROLLER;
+    let mut carrying: Vec<&str> = scene
+        .entities
+        .iter()
+        .filter(|(_, entity)| {
+            entity.components.contains_key(CHARACTER_CONTROLLER)
+                || entity
+                    .archetype
+                    .as_deref()
+                    .and_then(|a| registry.get_archetype(a))
+                    .is_some_and(|a| a.components.iter().any(|c| c == CHARACTER_CONTROLLER))
+        })
+        .map(|(name, _)| name.as_str())
+        .collect();
+    carrying.sort_unstable();
+    let Some((player, others)) = carrying.split_first() else {
+        return Vec::new();
+    };
+    others
+        .iter()
+        .map(|&other| {
+            Diagnostic::warning(
+                codes::SECOND_PLAYER,
+                format!(
+                    "`{player}` is the player (the first entity by name with a \
+                     `character_controller`), so this one's controller is never read"
+                ),
+            )
+            .entity(other)
+            .component(CHARACTER_CONTROLLER)
+            .hint(format!(
+                "keep one `character_controller` in the scene; to make `{other}` the player, \
+                 take it off `{player}`. A character a script walks needs none: \
+                 `move_character(id, dx, dy, dz)` moves any collider"
+            ))
+        })
+        .collect()
 }
 
 /// What to do about a table named after a kind of light: nothing reads it,
@@ -227,6 +522,9 @@ fn diagnose_tables(
             continue;
         };
         found.extend(validate_table(schema, data));
+        if name == "post_process" {
+            found.extend(post_range_warnings(data));
+        }
         let Some(lookup) = lookup.as_deref_mut() else {
             continue;
         };
@@ -236,6 +534,34 @@ fn diagnose_tables(
             }
         }
     }
+}
+
+/// `post-range` (#741): each built-in effect key of a `[post_process]` whose
+/// value lies outside what its effect is tuned for
+/// ([`flint_schema::post_effects`]). A warning, as a style value past its
+/// range is (#355): the value still draws.
+fn post_range_warnings(data: &toml::Value) -> Vec<Diagnostic> {
+    let Some(table) = data.as_table() else {
+        return Vec::new();
+    };
+    let mut found = Vec::new();
+    for (key, value) in table {
+        let Some(param) = flint_schema::post_effects::param(key) else {
+            continue;
+        };
+        if let Some(message) = param.range_error(value) {
+            found.push(
+                Diagnostic::warning(codes::POST_RANGE, message)
+                    .table("post_process")
+                    .field(key.clone())
+                    .hint(format!(
+                        "{}: {}; `flint render --list-effects` lists every key and its range",
+                        param.label, param.help
+                    )),
+            );
+        }
+    }
+    found
 }
 
 /// What a reference is looked up in: the scene's entities, and the project's
@@ -248,7 +574,11 @@ struct Lookup<'a> {
     /// The `name` of every `asset_def` in the scene: assets it declares
     /// and `flint asset resolve` makes, so no file need be there yet.
     to_be_made: HashSet<&'a str>,
-    assets: HashMap<(Vec<AssetKind>, String), Option<String>>,
+    /// Each (kinds, name) searched for: the file found, or every path tried.
+    assets: HashMap<(Vec<AssetKind>, String), Result<PathBuf, String>>,
+    /// The project's asset catalog and store, read the first time a model
+    /// or texture is not found as a file (`None` inside: there is none).
+    held: Option<Option<HeldAssets>>,
 }
 
 impl Lookup<'_> {
@@ -302,34 +632,88 @@ impl Lookup<'_> {
                         codes::MISSING_ASSET,
                         format!("{} '{}' not found", asset_noun(kinds), reference.name),
                     )
-                    .hint(tried),
+                    .hint(with_builtins(
+                        &reference.name,
+                        &reference.builtins,
+                        tried,
+                    )),
                 )
             }
         }
     }
 
-    /// `None` when a file of one of `kinds` is found for `name`, or an
-    /// `asset_def` of the scene declares it; otherwise every path tried, as
-    /// the hint.
+    /// `None` when a file of one of `kinds` is found for `name`, an
+    /// `asset_def` of the scene declares it, or (for a model or a texture,
+    /// as the player asks) the project's asset catalog holds it; otherwise
+    /// every path tried, as the hint.
     fn missing_asset(&mut self, kinds: &[AssetKind], name: &str) -> Option<String> {
-        if self.to_be_made.contains(name) {
-            return None;
+        match self.locate(kinds, name) {
+            Located::Missing { tried } => Some(tried),
+            _ => None,
         }
+    }
+
+    /// Where `name` is found for a field of `kinds`, asked as the loader
+    /// asks: a file the project's search finds for one of the kinds (a
+    /// particle effect or a sequence by the name its file states), then,
+    /// for a model or a texture, the project's asset catalog, then an
+    /// `asset_def` of the scene that declares it.
+    fn locate(&mut self, kinds: &[AssetKind], name: &str) -> Located {
         let (project, scene_dir) = (self.project, self.scene_dir);
-        self.assets
+        let searched = self
+            .assets
             .entry((kinds.to_vec(), name.to_string()))
             .or_insert_with(|| {
                 let mut tried = Vec::new();
                 for kind in kinds {
-                    let resolution = project.explain(*kind, name, scene_dir);
-                    if resolution.found.is_some() {
-                        return None;
+                    let resolution = project.explain_registered(*kind, name, scene_dir);
+                    if let Some(found) = resolution.found {
+                        return Ok(found);
                     }
                     tried.extend(resolution.tried.iter().map(|path| project::shown(path)));
                 }
-                Some(format!("tried {}", tried.join(", ")))
+                Err(format!("tried {}", tried.join(", ")))
             })
-            .clone()
+            .clone();
+        let tried = match searched {
+            Ok(path) => return Located::File(path),
+            Err(tried) => tried,
+        };
+        let catalogued = kinds.iter().any(|kind| CATALOGUED.contains(kind));
+        if catalogued && self.catalog().is_some_and(|held| held.holds(name)) {
+            return Located::Catalog;
+        }
+        if self.to_be_made.contains(name) {
+            return Located::Declared;
+        }
+        Located::Missing {
+            tried: if catalogued {
+                format!("{tried}; the asset catalog ({CATALOG_DIR}/) holds no such name either")
+            } else {
+                tried
+            },
+        }
+    }
+
+    /// The project's catalog and store, read once.
+    fn catalog(&mut self) -> Option<&HeldAssets> {
+        let project = self.project;
+        self.held
+            .get_or_insert_with(|| HeldAssets::of(project))
+            .as_ref()
+    }
+}
+
+/// A miss's hint for a field that also takes names with no file (#1063):
+/// the nearest of them, then all of them, then the paths tried.
+fn with_builtins(name: &str, builtins: &[String], tried: String) -> String {
+    if builtins.is_empty() {
+        return tried;
+    }
+    let listed = format!("built in: {}; {tried}", builtins.join(", "));
+    match diagnostic::did_you_mean(name, builtins.iter().map(String::as_str)) {
+        Some(nearest) => format!("{nearest} {listed}"),
+        None => listed,
     }
 }
 
@@ -338,6 +722,76 @@ impl Lookup<'_> {
 fn asset_noun(kinds: &[AssetKind]) -> String {
     let nouns: Vec<&str> = kinds.iter().map(|kind| kind.info().noun).collect();
     nouns.join(" or ")
+}
+
+/// `needs-component` (#804): a `collider` on an entity with no `rigidbody`,
+/// written or given by its archetype. Physics hands a collider to Rapier only
+/// as part of its entity's body, so this one collides with nothing; the
+/// player says the same once it runs (`flint_physics`'
+/// `report_lone_colliders`, #685), and this says it before. A terrain or a
+/// spline mesh makes its own static trimesh, so it is not this. A warning,
+/// as the player's is: a script may add the body later.
+fn lone_collider(
+    entity: &EntityDef,
+    archetype: Option<&flint_schema::ArchetypeSchema>,
+) -> Option<Diagnostic> {
+    use flint_core::components as comp;
+    let has = |component: &str| {
+        entity.components.contains_key(component)
+            || archetype.is_some_and(|a| a.components.iter().any(|c| c == component))
+    };
+    let own_trimesh = has(comp::TERRAIN) || has("spline_mesh");
+    (has(comp::COLLIDER) && !has(comp::RIGIDBODY) && !own_trimesh).then(|| {
+        Diagnostic::warning(
+            codes::NEEDS_COMPONENT,
+            "a collider with no rigidbody collides with nothing",
+        )
+        .component(comp::COLLIDER)
+        .hint(
+            "add a `rigidbody` to the entity, `body_type = \"static\"` for scenery, or remove \
+             the collider",
+        )
+    })
+}
+
+/// `bad-enum-value` (#1220): a `collider.layer`, or an entry of
+/// `collider.mask`, that is neither `default` nor one of the project's
+/// `[project.physics] layers`, written or from the archetype. Physics says
+/// the same once the game runs (`flint_physics`' `groups_of`, #729), in the
+/// same words (`flint_core::collision_layers::unknown_layer`); this says it
+/// before. A value that is no string is the schema's `bad-type`, not this.
+fn unknown_layers(
+    entity: &EntityDef,
+    archetype: Option<&flint_schema::ArchetypeSchema>,
+    project: &Project,
+) -> Vec<Diagnostic> {
+    use flint_core::collision_layers::{layer_names, unknown_layer, LayerUse};
+    use flint_core::components as comp;
+    let field = |key: &str| {
+        entity
+            .components
+            .get(comp::COLLIDER)
+            .and_then(|collider| collider.get(key))
+            .or_else(|| archetype.and_then(|a| a.get_default(comp::COLLIDER, key)))
+    };
+    let names = layer_names(&project.physics_layers);
+    let known = |name: &str| names.contains(&name);
+    let mut found = Vec::new();
+    if let Some(layer) = field("layer").and_then(toml::Value::as_str) {
+        if !known(layer) {
+            found.push(unknown_layer(layer, &names, LayerUse::Layer).field("layer"));
+        }
+    }
+    let mask = field("mask").and_then(toml::Value::as_array);
+    for (i, entry) in mask.into_iter().flatten().enumerate() {
+        if let Some(layer) = entry.as_str().filter(|layer| !known(layer)) {
+            found.push(unknown_layer(layer, &names, LayerUse::Mask).field(format!("mask[{i}]")));
+        }
+    }
+    found
+        .into_iter()
+        .map(|d| d.component(comp::COLLIDER))
+        .collect()
 }
 
 fn diagnose_entity(
@@ -383,6 +837,16 @@ fn diagnose_entity(
                 .hint(lookup.unknown_entity_hint(parent)),
             );
         }
+    }
+
+    if let Some(d) = lone_collider(entity, archetype) {
+        found.push(d.entity(name));
+    }
+    // The layers are the project's, so a pass with no project (a chunk's)
+    // leaves them to the game
+    if let Some(lookup) = lookup.as_deref() {
+        let layers = unknown_layers(entity, archetype, lookup.project);
+        found.extend(layers.into_iter().map(|d| d.entity(name)));
     }
 
     let mut components: Vec<(&String, &toml::Value)> = entity.components.iter().collect();
@@ -647,9 +1111,9 @@ slots = 4
         assert_eq!(
             said,
             [
-                "scenes/a.scene.toml: warning[unknown-table] [enviroment]: no scene table named \
-                 `enviroment`, so nothing reads it (did you mean `environment`?)",
-                "scenes/a.scene.toml: warning[unknown-table] [inventory]: no scene table named \
+                "scenes/a.scene.toml: warning[unknown-table] 5:2 [enviroment]: no scene table \
+                 named `enviroment`, so nothing reads it (did you mean `environment`?)",
+                "scenes/a.scene.toml: warning[unknown-table] 8:2 [inventory]: no scene table named \
                  `inventory`, so nothing reads it (a table a game adds is declared in its \
                  schema layer, as `[table.inventory]` in scene/inventory.toml; `flint schema \
                  --list` names the ones loaded)",
@@ -693,21 +1157,79 @@ position = [0, 0, 0]
         assert_eq!(
             said,
             [
-                "warning[unknown-field] [environment] fog.colour: `environment.fog` has no \
+                // Each at its key (#1061): inside an inline table too, and a
+                // missing field at its table's header
+                "warning[unknown-field] 8:25 [environment] fog.colour: `environment.fog` has no \
                  field `colour`",
-                "error[out-of-range] [environment] fog.density: -1 is below the minimum 0",
-                "warning[unknown-field] [environment] shadws: `environment` has no field \
+                "error[out-of-range] 8:9 [environment] fog.density: -1 is below the minimum 0",
+                "warning[unknown-field] 6:1 [environment] shadws: `environment` has no field \
                  `shadws`",
-                "error[missing-asset] [environment] skybox: file 'skies/none.hdr' not found",
-                "error[missing-field] [weather] kind: required field `kind` is missing",
-                "error[bad-type] [weather] rain: expected f32, got string",
-                "error[bad-type] [weather] wind: a vec3 is 3 numbers, got 2",
-                "error[unknown-entity] [weather] watcher: no entity named `nobody`",
+                "error[missing-asset] 7:1 [environment] skybox: file 'skies/none.hdr' not found",
+                "error[missing-field] 10:2 [weather] kind: required field `kind` is missing",
+                "error[bad-type] 11:1 [weather] rain: expected f32, got string",
+                "error[bad-type] 12:1 [weather] wind: a vec3 is 3 numbers, got 2",
+                "error[unknown-entity] 13:1 [weather] watcher: no entity named `nobody`",
             ]
         );
         assert_eq!(found[2].hint.as_deref(), Some("did you mean `shadows`?"));
         assert!(found.iter().all(|d| d.component.is_none()
             && d.file.as_deref() == Some(Path::new("scenes/a.scene.toml"))));
+    }
+
+    /// #1061: a typed table that doesn't fit its type refuses the parse,
+    /// and the pass still runs. A table with a schema is named by field
+    /// (`bad-type`, with why the load is refused); one with none to name it
+    /// keeps serde's message, as `toml-parse` on the table, placed at its
+    /// header. The entities are checked as ever.
+    #[test]
+    fn a_wrong_type_in_a_typed_table_is_named_and_the_rest_checked() {
+        let found = found_in(
+            "[scene]\nname = \"s\"\n\n[environment]\nshadows = \"no\"\n\n\
+             [camera]\nfov = \"wide\"\n\n[entities.rock.lihgt]\n",
+        );
+        let said: Vec<String> = found.iter().map(|d| d.to_string()).collect();
+        assert_eq!(
+            said,
+            [
+                "error[bad-type] 5:1 [environment] shadows: expected bool, got string",
+                "error[unknown-component] entity 'rock' component 'lihgt': no component named \
+                 `lihgt`, so nothing checks it",
+                "error[toml-parse] 7:2 [camera]: invalid type: string \"wide\", expected f32",
+            ],
+            "{found:#?}"
+        );
+        assert_eq!(found[0].hint.as_deref(), Some(REFUSES_THE_LOAD));
+        assert_eq!(found[2].hint.as_deref(), Some(REFUSES_THE_LOAD));
+    }
+
+    /// #741: a built-in effect key past the range its effect is tuned for
+    /// warns, naming the key and the range, as a style value does; a key
+    /// inside it, and the table's own keys, say nothing. The effect keys
+    /// are declared by their descriptors, not the schema file.
+    #[test]
+    fn a_post_value_past_its_range_warns() {
+        let schema = "[table.post_process]\n[table.post_process.fields]\n\
+                      look = { type = \"string\" }\n";
+        let scene = "[scene]\nname = \"s\"\n[post_process]\nlook = \"none\"\n\
+                     exposure = 1.2\nbloom_intensity = 3\nfog_color = [0.5, 0.5, 2.0]\n";
+        let found = with_scene(
+            &[
+                ("schemas/scene/post_process.toml", schema),
+                ("scenes/a.scene.toml", scene),
+            ],
+            |registry, project| diagnose(Path::new("scenes/a.scene.toml"), registry, project),
+        );
+        let said: Vec<String> = found.iter().map(|d| d.to_string()).collect();
+        assert_eq!(
+            said,
+            [
+                "warning[post-range] 6:1 [post_process] bloom_intensity: bloom_intensity=3 is \
+                 outside its range 0..1",
+                "warning[post-range] 7:1 [post_process] fog_color: fog_color=[0.5, 0.5, 2.0] \
+                 is outside its range 0..1",
+            ]
+        );
+        assert!(found.iter().all(|d| !d.is_error()));
     }
 
     /// A table of the game's layer is known with that layer and unknown
@@ -985,12 +1507,41 @@ intensity = 1.0
     /// hint says what a light is.
     #[test]
     fn a_stale_light_table_says_what_a_light_is() {
-        let found =
-            found_in("[scene]\nname = \"s\"\n[entities.sun.directional_light]\nintensity = 2.0\n");
-        assert_eq!(found.len(), 1);
-        assert_eq!(found[0].code, codes::UNKNOWN_COMPONENT);
-        let hint = found[0].hint.as_deref().unwrap();
-        assert!(hint.contains("type = \"directional\""), "{hint}");
+        for kind in ["directional", "point", "spot"] {
+            let found = found_in(&format!(
+                "[scene]\nname = \"s\"\n[entities.sun.{kind}_light]\nintensity = 2.0\n"
+            ));
+            assert_eq!(found.len(), 1);
+            assert_eq!(found[0].code, codes::UNKNOWN_COMPONENT);
+            let hint = found[0].hint.as_deref().unwrap();
+            assert!(hint.contains("a `light` component"), "{hint}");
+            assert!(hint.contains(&format!("type = \"{kind}\"")), "{hint}");
+        }
+    }
+
+    /// `[project.diagnostics] allow` (#795): what it names is left out of
+    /// `diagnose` and of a load's list, kept by `diagnose_all`, and nothing
+    /// else is touched.
+    #[test]
+    fn the_manifest_allows_a_code_at_a_field() {
+        let scene = "[scene]\nname = \"s\"\n[entities.sun.light]\nintensty = 3.0\nwetness = 1.0\n";
+        let manifest = "[project.diagnostics]\nallow = [\"unknown-field:light.wetness\"]\n";
+        let files = [("scenes/a.scene.toml", scene), ("flint.toml", manifest)];
+        let (all, allowed, loaded) = with_scene(&files, |registry, project| {
+            let path = Path::new("scenes/a.scene.toml");
+            let loaded = crate::load_scene_diagnosed(path, registry).unwrap().2;
+            (
+                diagnose_all(path, registry, project),
+                diagnose(path, registry, project),
+                loaded,
+            )
+        });
+        let fields = |list: &[Diagnostic]| -> Vec<String> {
+            list.iter().filter_map(|d| d.field.clone()).collect()
+        };
+        assert_eq!(fields(&all), ["intensty", "wetness"]);
+        assert_eq!(fields(&allowed), ["intensty"]);
+        assert_eq!(fields(&loaded), ["intensty"]);
     }
 
     #[test]
@@ -1070,6 +1621,58 @@ target = "nope"
         );
         assert_eq!(found[2].hint.as_deref(), Some("did you mean `hand`?"));
         assert!(found.iter().all(Diagnostic::is_error));
+    }
+
+    /// #680: every loop of parents, once, on its first entity by name, with
+    /// the chain from there; a chain hanging off a loop is not one more.
+    #[test]
+    fn a_loop_of_parents_is_one_error_on_its_first_entity() {
+        let scene = r#"
+[scene]
+name = "s"
+
+[entities.lamp]
+parent = "lamp"
+
+[entities.wheel]
+parent = "cart"
+
+[entities.cart]
+parent = "hub"
+
+[entities.hub]
+parent = "wheel"
+
+[entities.spoke]
+parent = "hub"
+
+[entities.ground]
+
+[entities.tree]
+parent = "ground"
+"#;
+        let found = with_scene(
+            &[RIG, ("scenes/a.scene.toml", scene)],
+            |registry, project| diagnose(Path::new("scenes/a.scene.toml"), registry, project),
+        );
+        let said: Vec<String> = found.iter().map(|d| d.to_string()).collect();
+        assert_eq!(
+            said,
+            [
+                "error[parent-cycle] entity 'cart' field 'parent': the parents loop: \
+                 cart -> hub -> wheel -> cart, each the child of the next, so the scene \
+                 does not load",
+                "error[parent-cycle] entity 'lamp' field 'parent': `lamp` is its own parent, \
+                 so the scene does not load",
+            ]
+        );
+        assert_eq!(
+            found[1].hint.as_deref(),
+            Some("remove `parent = \"lamp\"` from `lamp`")
+        );
+        assert!(found
+            .iter()
+            .all(|d| d.file.as_deref() == Some(Path::new("scenes/a.scene.toml"))));
     }
 
     /// A prefab's references are written `${PREFIX}_<name>` and checked
@@ -1160,7 +1763,8 @@ mesh = "nope"
             found[0].hint.as_deref(),
             Some(
                 "tried scenes/models/nope.glb, scenes/models/nope.gltf, models/nope.glb, \
-                 models/nope.gltf, scenes/specs, scenes/models, specs, models"
+                 models/nope.gltf, scenes/specs, scenes/models, specs, models; the asset \
+                 catalog (assets/) holds no such name either"
             )
         );
         assert_eq!(
@@ -1195,6 +1799,362 @@ mesh = "nope"
         );
     }
 
+    /// The ticket's second box, first half (#804): a model registered only
+    /// in the asset catalog, with its content in the store, is there, as the
+    /// player finds it. A sidecar whose content is not stored is not, and a
+    /// sound is never asked of the catalog (the player asks it for models
+    /// and textures alone).
+    #[test]
+    fn a_catalog_only_asset_is_not_missing() {
+        const HASH: &str = "ab12000000000000000000000000000000000000000000000000000000000000";
+        let sidecar = |name: &str| {
+            format!("[asset]\nname = \"{name}\"\ntype = \"mesh\"\nhash = \"sha256:{HASH}\"\n")
+        };
+        let (table, chair, bell) = (
+            sidecar("oak_table"),
+            sidecar("oak_chair"),
+            sidecar("bell.ogg"),
+        );
+        let stored = format!(".flint/assets/ab/{HASH}.glb");
+        let scene = "[scene]\nname = \"s\"\n\
+                     [entities.a.rig]\nmesh = \"oak_table\"\n\
+                     [entities.b.rig]\nmesh = \"oak_chair\"\nsound = \"bell.ogg\"\n";
+        let found = with_scene(
+            &[
+                RIG,
+                ("flint.toml", "[project]\n"),
+                ("scenes/a.scene.toml", scene),
+                ("assets/oak_table.asset.toml", &table),
+                ("assets/oak_chair.asset.toml", &chair),
+                ("assets/bell.asset.toml", &bell),
+                (&stored, "glTF"),
+            ],
+            |registry, project| diagnose(Path::new("scenes/a.scene.toml"), registry, project),
+        );
+        let said: Vec<String> = found.iter().map(|d| d.to_string()).collect();
+        assert_eq!(
+            said,
+            ["error[missing-asset] entity 'b' rig.sound: sound 'bell.ogg' not found"],
+            "oak_table and oak_chair share the stored content, so both are there"
+        );
+
+        // With the store emptied, the catalog names them and holds nothing
+        let found = with_scene(
+            &[
+                RIG,
+                ("flint.toml", "[project]\n"),
+                (
+                    "scenes/a.scene.toml",
+                    "[scene]\nname = \"s\"\n[entities.a.rig]\nmesh = \"oak_table\"\n",
+                ),
+                ("assets/oak_table.asset.toml", &table),
+            ],
+            |registry, project| diagnose(Path::new("scenes/a.scene.toml"), registry, project),
+        );
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].code, codes::MISSING_ASSET);
+    }
+
+    /// The ticket's second box, second half (#804): a particle effect and an
+    /// animation sequence are named by the `name` in their file, not its
+    /// stem. One the file states passes, a stem whose file states another
+    /// name fails, and a misspelling fails with the paths read.
+    #[test]
+    fn effects_and_sequences_are_found_by_the_name_inside_their_file() {
+        let schemas: &[(&str, &str)] = &[
+            (
+                "schemas/components/particle_effect.toml",
+                "[component.particle_effect.fields]\n\
+                 effect = { type = \"asset\", kind = \"particles\", default = \"\" }\n",
+            ),
+            (
+                "schemas/components/animator.toml",
+                "[component.animator.fields]\n\
+                 sequence = { type = \"asset\", kind = \"sequences\", default = \"\" }\n",
+            ),
+        ];
+        let scene = r#"
+[scene]
+name = "s"
+
+[entities.hearth.particle_effect]
+effect = "campfire"
+
+[entities.stem.particle_effect]
+effect = "fx_fire"
+
+[entities.plain.particle_effect]
+effect = "smoke"
+
+[entities.typo.particle_effect]
+effect = "campfyre"
+
+[entities.idle.animator]
+sequence = "wave_hello"
+
+[entities.lost.animator]
+sequence = "wave_helo"
+
+[entities.unset.animator]
+sequence = ""
+"#;
+        let mut files: Vec<(&str, &str)> = schemas.to_vec();
+        files.extend([
+            ("flint.toml", "[project]\n"),
+            ("scenes/a.scene.toml", scene),
+            // Named inside: known as `campfire`, not `fx_fire`
+            ("particles/fx_fire.particles.toml", "name = \"campfire\"\n"),
+            // No name inside: its stem, as the loader takes it
+            ("particles/smoke.particles.toml", "[[emitters]]\n"),
+            (
+                "scenes/animations/greet.sequence.toml",
+                "name = \"wave_hello\"\n",
+            ),
+        ]);
+        let found = with_scene(&files, |registry, project| {
+            diagnose(Path::new("scenes/a.scene.toml"), registry, project)
+        });
+        let said: Vec<String> = found.iter().map(|d| d.to_string()).collect();
+        assert_eq!(
+            said,
+            [
+                "error[missing-asset] entity 'lost' animator.sequence: animation sequence \
+                 'wave_helo' not found",
+                "error[missing-asset] entity 'stem' particle_effect.effect: particle effect \
+                 'fx_fire' not found",
+                "error[missing-asset] entity 'typo' particle_effect.effect: particle effect \
+                 'campfyre' not found",
+            ]
+        );
+        assert_eq!(
+            found[2].hint.as_deref(),
+            Some("tried scenes/particles, particles")
+        );
+    }
+
+    /// The ticket's fourth box (#804): a collider with no rigidbody, written
+    /// or given by an archetype, is the warning the player gives once it
+    /// runs; a terrain makes its own trimesh and is not one.
+    #[test]
+    fn a_collider_with_no_rigidbody_is_reported_before_the_game_runs() {
+        let schemas: &[(&str, &str)] = &[
+            ("schemas/components/collider.toml", "[component.collider]\n"),
+            (
+                "schemas/components/rigidbody.toml",
+                "[component.rigidbody]\n",
+            ),
+            ("schemas/components/terrain.toml", "[component.terrain]\n"),
+            (
+                "schemas/archetypes/crate.toml",
+                "[archetype.crate]\ncomponents = [\"transform\", \"collider\"]\n",
+            ),
+        ];
+        let scene = r#"
+[scene]
+name = "s"
+
+[entities.wall.collider]
+[entities.wall.rigidbody]
+
+[entities.ghost.collider]
+
+[entities.box]
+archetype = "crate"
+
+[entities.ground.collider]
+[entities.ground.terrain]
+"#;
+        let mut files: Vec<(&str, &str)> = schemas.to_vec();
+        files.push(("scenes/a.scene.toml", scene));
+        let found = with_scene(&files, |registry, project| {
+            diagnose(Path::new("scenes/a.scene.toml"), registry, project)
+        });
+        let said: Vec<String> = found.iter().map(|d| d.to_string()).collect();
+        assert_eq!(
+            said,
+            [
+                "warning[needs-component] entity 'box' component 'collider': a collider with \
+                 no rigidbody collides with nothing",
+                "warning[needs-component] entity 'ghost' component 'collider': a collider \
+                 with no rigidbody collides with nothing",
+            ]
+        );
+        assert!(found[0]
+            .hint
+            .as_deref()
+            .unwrap()
+            .contains("body_type = \"static\""));
+    }
+
+    /// #1220's first box: a layer and a mask entry the project doesn't
+    /// declare are both told before the game runs, each naming the nearest
+    /// layer, in the words physics uses once it does (the core helper both
+    /// call); a declared one, `default`, and an archetype's are passed or
+    /// checked alike.
+    #[test]
+    fn an_undeclared_collider_layer_or_mask_names_the_nearest() {
+        let collider = "[component.collider]\n\n[component.collider.fields]\n\
+                        layer = { type = \"string\" }\n\
+                        mask = { type = \"array\", element = \"string\" }\n";
+        let scene = r#"
+[scene]
+name = "s"
+
+[entities.hero.collider]
+layer = "playr"
+mask = ["default", "pikcup"]
+
+[entities.coin.collider]
+layer = "pickup"
+mask = ["default", "player"]
+
+[entities.crate]
+archetype = "crate"
+"#;
+        let files: &[(&str, &str)] = &[
+            (
+                "flint.toml",
+                "[project.physics]\nlayers = [\"player\", \"pickup\"]\n",
+            ),
+            ("schemas/components/collider.toml", collider),
+            (
+                "schemas/archetypes/crate.toml",
+                "[archetype.crate]\ncomponents = [\"collider\"]\n\n\
+                 [archetype.crate.defaults.collider]\nlayer = \"wrld\"\n",
+            ),
+            ("scenes/a.scene.toml", scene),
+        ];
+        let found = with_scene(files, |registry, project| {
+            diagnose(Path::new("scenes/a.scene.toml"), registry, project)
+        });
+        let layers: Vec<&Diagnostic> = found
+            .iter()
+            .filter(|d| d.code == codes::BAD_ENUM_VALUE)
+            .collect();
+        let said: Vec<String> = layers.iter().map(|d| d.to_string()).collect();
+        assert_eq!(
+            said,
+            [
+                "error[bad-enum-value] entity 'crate' collider.layer: \"wrld\" is not a \
+                 collision layer",
+                "error[bad-enum-value] entity 'hero' collider.layer: \"playr\" is not a \
+                 collision layer",
+                "error[bad-enum-value] entity 'hero' collider.mask[1]: \"pikcup\" is not a \
+                 collision layer",
+            ],
+            "{found:#?}"
+        );
+        let hint = |i: usize| layers[i].hint.clone().unwrap();
+        assert!(
+            hint(0).contains("the layers are default, player, pickup"),
+            "{}",
+            hint(0)
+        );
+        assert_eq!(hint(1), "did you mean `player`?; it is read as `default`");
+        assert_eq!(hint(2), "did you mean `pickup`?; it is left out");
+        // The same diagnostic the physics view reports at run time
+        let names = flint_core::collision_layers::layer_names(&["player", "pickup"]);
+        let runtime = flint_core::collision_layers::unknown_layer(
+            "playr",
+            &names,
+            flint_core::collision_layers::LayerUse::Layer,
+        );
+        assert_eq!(
+            (layers[1].message.as_str(), &layers[1].hint),
+            (runtime.message.as_str(), &runtime.hint)
+        );
+    }
+
+    /// #1220's second box: a project with no `[project.physics]` has only
+    /// `default`, so a scene naming a layer is told to declare it.
+    #[test]
+    fn a_layer_in_a_project_with_none_is_told_to_declare_it() {
+        let found = found_in(
+            r#"
+[scene]
+name = "s"
+
+[entities.hero.collider]
+layer = "player"
+mask = ["default"]
+"#,
+        );
+        let layer: Vec<&Diagnostic> = found
+            .iter()
+            .filter(|d| d.code == codes::BAD_ENUM_VALUE)
+            .collect();
+        assert_eq!(layer.len(), 1, "{found:#?}");
+        assert_eq!(layer[0].field.as_deref(), Some("layer"));
+        assert_eq!(
+            layer[0].hint.as_deref(),
+            Some(
+                "this project declares no collision layers: add `[project.physics] layers = \
+                 [\"player\"]` to flint.toml; it is read as `default`"
+            )
+        );
+    }
+
+    /// #1212: two entities with a `character_controller` (one from its
+    /// archetype) are one player, the first by name, as physics picks it;
+    /// the other is told so, naming the player. One alone is no warning,
+    /// and neither is a chunk's pass, which has no whole scene to count.
+    #[test]
+    fn a_second_character_controller_names_the_player() {
+        let schemas: &[(&str, &str)] = &[
+            (
+                "schemas/components/character_controller.toml",
+                "[component.character_controller]\n",
+            ),
+            (
+                "schemas/archetypes/player.toml",
+                "[archetype.player]\ncomponents = [\"transform\", \"character_controller\"]\n",
+            ),
+        ];
+        let two = r#"
+[scene]
+name = "s"
+
+[entities.zed.character_controller]
+move_speed = 3.0
+
+[entities.hero]
+archetype = "player"
+
+[entities.lamp.transform]
+"#;
+        let one = "[scene]\nname = \"s\"\n[entities.hero]\narchetype = \"player\"\n";
+        let mut files: Vec<(&str, &str)> = schemas.to_vec();
+        files.push(("scenes/two.scene.toml", two));
+        files.push(("scenes/one.scene.toml", one));
+        let (found, alone, chunk) = with_scene(&files, |registry, project| {
+            let chunk = SceneFile::parse(two).unwrap();
+            (
+                diagnose(Path::new("scenes/two.scene.toml"), registry, project),
+                diagnose(Path::new("scenes/one.scene.toml"), registry, project),
+                diagnose_scene(&chunk, None, registry),
+            )
+        });
+        let said: Vec<String> = found.iter().map(|d| d.to_string()).collect();
+        assert_eq!(
+            said,
+            [
+                "warning[second-player] entity 'zed' component 'character_controller': `hero` \
+              is the player (the first entity by name with a `character_controller`), so \
+              this one's controller is never read"
+            ]
+        );
+        assert!(found[0]
+            .hint
+            .as_deref()
+            .unwrap()
+            .contains("take it off `hero`"));
+        assert!(alone.is_empty(), "{alone:?}");
+        assert!(
+            chunk.iter().all(|d| d.code != codes::SECOND_PLAYER),
+            "{chunk:?}"
+        );
+    }
+
     /// The loaders say the same things: a reference to nothing doesn't stop
     /// a load, and the list a host asks for holds it.
     #[test]
@@ -1223,5 +2183,47 @@ mesh = "nope"
         assert_eq!(found[0].code, codes::NO_SCHEMAS);
         assert_eq!(found[0].severity, Severity::Warning);
         assert_eq!(found[0].file, None);
+    }
+
+    /// #1320: a `<name>_style` that a user style the scene can see owns
+    /// (`styles/dusk.shader.toml`, with no schema file) is no
+    /// `unknown-component` when a host loads the scene. Its schema is made
+    /// when the style loads, after the scene, and binding judges it then.
+    /// One no style owns is still unknown, and `diagnose` (what
+    /// `flint check` runs, with the styles' schemas already registered) is
+    /// unchanged.
+    #[test]
+    fn a_user_styles_component_is_left_to_the_style_when_a_host_loads() {
+        let scene = r#"
+[scene]
+name = "Dusk"
+
+[entities.box.dusk_style]
+amount = 1.0
+
+[entities.crate.dawn_style]
+amount = 1.0
+"#;
+        let files = [
+            ("scenes/a.scene.toml", scene),
+            (
+                "scenes/styles/dusk.shader.toml",
+                "version = 1\nname = \"dusk\"\n",
+            ),
+        ];
+        let unknown = |found: &[Diagnostic]| -> Vec<String> {
+            found
+                .iter()
+                .filter(|d| d.code == codes::UNKNOWN_COMPONENT)
+                .map(|d| d.component.clone().unwrap_or_default())
+                .collect()
+        };
+        let (loaded, diagnosed) = with_scene(&files, |registry, project| {
+            let path = Path::new("scenes/a.scene.toml");
+            let (_, _, loaded) = crate::load_scene_diagnosed(path, registry).unwrap();
+            (loaded, diagnose(path, registry, project))
+        });
+        assert_eq!(unknown(&loaded), ["dawn_style"]);
+        assert_eq!(unknown(&diagnosed), ["dusk_style", "dawn_style"]);
     }
 }

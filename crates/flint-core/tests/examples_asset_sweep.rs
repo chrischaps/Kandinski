@@ -11,6 +11,7 @@
 //! scene that would load a different file than before.
 //!
 //! Run with `--nocapture` for the table.
+#![allow(clippy::disallowed_methods)] // a test: reads its files off the disk, not through the vfs
 
 use flint_core::project::{shown, AssetKind, OrderChange, Project};
 use std::collections::BTreeMap;
@@ -172,8 +173,8 @@ fn styled_by(scene: &toml::Table) -> Vec<(AssetKind, String)> {
     out
 }
 
-/// What a stylize golden's flags name, by scene: `--look`, `--ascii-font`,
-/// `--ascii-palette`, the `--style` words and the `--sweep` keys.
+/// What a stylize golden's flags name, by scene: `--look`, the `--style`
+/// words and the `--sweep` keys.
 fn named_by_goldens(repo: &Path) -> Vec<(PathBuf, AssetKind, String)> {
     let manifest = repo.join("crates/flint-cli/tests/golden/stylize.goldens.toml");
     let doc: toml::Table = std::fs::read_to_string(manifest).unwrap().parse().unwrap();
@@ -192,8 +193,6 @@ fn named_by_goldens(repo: &Path) -> Vec<(PathBuf, AssetKind, String)> {
             let (flag, value) = (pair[0], pair[1]);
             match flag {
                 "--look" => named.push((AssetKind::Looks, value.to_string())),
-                "--ascii-font" => named.extend(style_setting("font", value)),
-                "--ascii-palette" => named.extend(style_setting("palette", value)),
                 "--style" => {
                     let settings = value.split_once(':').map(|(_, s)| s).unwrap_or("");
                     for (key, value) in settings.split(',').filter_map(|s| s.split_once('=')) {
@@ -313,9 +312,9 @@ fn the_engines_own_scenes_load_the_files_they_loaded_before() {
     // where this test stands (it is the only test in this binary).
     std::env::set_current_dir(&repo).unwrap();
     let mut scenes = Vec::new();
-    // examples/ with its film sets, the frozen scenes the
-    // goldens and CLI tests load (#763), and the goldens' own fixture.
-    scenes_under(&repo.join("examples"), &mut scenes);
+    // The frozen scenes the goldens and CLI tests load (#763), and the
+    // goldens' own fixture. The examples are their own repository since
+    // #984, whose CI checks them.
     scenes_under(&repo.join("tests/fixtures"), &mut scenes);
     scenes_under(&repo.join("crates/flint-cli/tests/golden"), &mut scenes);
     scenes.sort();
@@ -325,7 +324,7 @@ fn the_engines_own_scenes_load_the_files_they_loaded_before() {
         "{} golden flags",
         golden_flags.len()
     );
-    assert!(scenes.len() > 50, "found only {} scenes", scenes.len());
+    assert!(scenes.len() > 25, "found only {} scenes", scenes.len());
 
     let mut tally: BTreeMap<&'static str, Tally> = BTreeMap::new();
     let mut changes: Vec<(PathBuf, OrderChange)> = Vec::new();
@@ -519,7 +518,7 @@ fn the_engines_own_scenes_load_the_files_they_loaded_before() {
     }
 
     println!(
-        "{} scenes under examples/, tests/fixtures/ and the goldens' fixture ({unread} not plain TOML tables)",
+        "{} scenes under tests/fixtures/ and the goldens' fixture ({unread} not plain TOML tables)",
         scenes.len()
     );
     println!(
@@ -550,18 +549,19 @@ fn the_engines_own_scenes_load_the_files_they_loaded_before() {
         changes.len()
     );
     // The sweep saw real assets of the kinds entities name, and of the
-    // style kinds scenes and goldens name.
+    // style kinds scenes and goldens name. Since the examples left (#984)
+    // no fixture plays a sound, names a palette file or draws a bitmap
+    // font, so those three kinds are held by their listings and by their
+    // own tests in `project/assets.rs`.
     for label in [
         "models",
         "textures",
-        "audio",
         "scripts",
         "specs",
         "prefabs",
         "looks",
-        "palettes",
+        "palettes (visible)",
         "glyph-sets",
-        "fonts",
         "papers",
         "strokes",
         "styles (visible)",

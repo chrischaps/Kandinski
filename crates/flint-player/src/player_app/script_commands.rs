@@ -6,7 +6,23 @@ use super::TransitionPhase;
 use flint_core::events::TRANSITION_COMPLETE;
 use flint_core::quality::QualitySettings;
 use flint_core::Vec3 as FlintVec3;
-use flint_script::{CameraOverrides, ScriptHost};
+use flint_script::{CameraOverrides, ScriptHost, SoundPlay, SoundRef};
+use std::time::Duration;
+
+/// A script's sound as the engine plays it, on the bus it names: any the
+/// game declares (#730); an unknown one is warned about once and plays on
+/// sfx.
+fn keyed(
+    engine: &mut flint_audio::engine::AudioEngine,
+    play: &SoundPlay,
+) -> flint_audio::engine::KeyedPlay {
+    flint_audio::engine::KeyedPlay {
+        volume: play.volume,
+        pitch: play.pitch,
+        looping: play.looping,
+        bus: engine.bus_or_sfx(&play.bus),
+    }
+}
 
 impl PlayerApp {
     /// A script's `quit_game()` (#659): the run ends as closing the window
@@ -26,7 +42,7 @@ impl PlayerApp {
         }
         #[cfg(not(target_arch = "wasm32"))]
         {
-            println!("[quit] a script asked to quit");
+            tracing::info!(target: "script", "a script asked to quit");
             self.outcome.exit_requested = true;
             if self.capture.exit_after.is_some() {
                 self.print_exit_report();
@@ -39,21 +55,9 @@ impl PlayerApp {
     /// until this is called from its Begin click; on the desktop the device
     /// opened at start and this does nothing new. Loops already in the
     /// scene start, and a subsystem that waited for a device (the scene's
-    /// music) starts at the next frame's first stage. Says whether there is
-    /// sound.
+    /// music) starts at the next frame's first stage, in the browser's
+    /// worklet like every other sound (#1216). Says whether there is sound.
     pub fn start_audio(&mut self) -> bool {
-        // A music session clocks its suite on kira's manager itself, which
-        // the browser's worklet mix (#136) keeps on the audio thread; such a
-        // scene mixes on the main thread, as before.
-        #[cfg(all(target_arch = "wasm32", feature = "music"))]
-        if !self.audio.engine.is_available() && crate::music::plays_music(&self.core.world) {
-            tracing::info!(
-                "[flint-audio] a music_session needs kira here: mixing on the main thread"
-            );
-            self.audio
-                .engine
-                .set_web_mixer(flint_audio::engine::WebMixer::MainThread);
-        }
         self.audio.start(&self.core.world)
     }
 }
@@ -66,15 +70,13 @@ impl ScriptHost for PlayerApp {
         "the player"
     }
 
-    fn play_sound(&mut self, name: String, volume: f64, pitch: f64) {
+    // A script's sounds are the engine's keyed ones (#699): the handle
+    // `play_sound` returned is the key `stop_sound` and `set_sound_volume`
+    // find it by, on kira here or in the browser's worklet alike.
+    fn play_sound(&mut self, handle: u64, name: String, play: SoundPlay) {
         if self.audio.engine.is_available() {
-            if let Err(e) = self.audio.engine.play_non_spatial(
-                &name,
-                volume,
-                pitch,
-                false,
-                flint_audio::Bus::Sfx,
-            ) {
+            let play = keyed(&mut self.audio.engine, &play);
+            if let Err(e) = self.audio.engine.play_keyed(handle, &name, play) {
                 tracing::warn!(target: "script", "play_sound error: {:?}", e);
             }
         }
@@ -82,29 +84,62 @@ impl ScriptHost for PlayerApp {
 
     fn play_sound_at(
         &mut self,
+        handle: u64,
         name: String,
         position: (f64, f64, f64),
-        volume: f64,
-        pitch: f64,
+        play: SoundPlay,
         distances: Option<(f32, f32)>,
         rolloff: Option<f32>,
     ) {
+        // As `play_sound`: with no device there's nothing to say (#714
+        // found it warning on every call in a silent run)
+        if !self.audio.engine.is_available() {
+            return;
+        }
         let pos = FlintVec3::new(position.0 as f32, position.1 as f32, position.2 as f32);
-        if let Err(e) = self.audio.engine.play_oneshot_at(
+        let play = keyed(&mut self.audio.engine, &play);
+        if let Err(e) = self.audio.engine.play_keyed_at(
+            handle,
             &name,
             pos,
-            volume,
-            pitch,
             distances.unwrap_or(flint_audio::engine::DEFAULT_DISTANCES),
             rolloff.unwrap_or(flint_audio::engine::DEFAULT_ROLLOFF),
-            flint_audio::Bus::Sfx,
+            play,
         ) {
             tracing::warn!(target: "script", "play_sound_at error: {:?}", e);
         }
     }
 
-    fn stop_sound(&mut self, _name: String) {
-        // One-shot sounds play to completion (same as AudioCommand::Stop)
+    fn stop_sound(&mut self, sound: SoundRef, fade: f64) {
+        let fade = Duration::from_secs_f64(fade.max(0.0));
+        match sound {
+            SoundRef::Handle(h) => {
+                self.audio.engine.stop_keyed(h, fade);
+            }
+            SoundRef::Name(name) => {
+                self.audio.engine.stop_keyed_named(&name, fade);
+            }
+        }
+    }
+
+    fn set_sound_volume(&mut self, handle: u64, volume: f64, fade: f64) {
+        let fade = Duration::from_secs_f64(fade.max(0.0));
+        self.audio.engine.set_keyed_volume(handle, volume, fade);
+    }
+
+    // Kept while silent too, so the mixer opens at it (the web's Begin). A
+    // name that is no bus is warned about once, by the engine.
+    fn set_bus_volume(&mut self, bus: String, volume: f64) {
+        let _ = self.audio.engine.set_bus_volume_named(&bus, volume);
+    }
+
+    // The player's own, apart from the game's and saved (#1217, user_audio.rs)
+    fn set_user_bus_volume(&mut self, bus: String, volume: f64) {
+        PlayerApp::set_user_bus_volume(self, &bus, volume);
+    }
+
+    fn set_bus_lowpass(&mut self, bus: String, hz: f64) {
+        let _ = self.audio.engine.set_bus_lowpass_named(&bus, hz);
     }
 
     fn fire_event(&mut self, name: String, data: toml::Value) {
@@ -120,13 +155,15 @@ impl ScriptHost for PlayerApp {
         match &self.transition_phase {
             TransitionPhase::Exiting { target_scene, .. } => {
                 let target = target_scene.clone();
+                // The script says its cover is drawn (#1125)
                 self.transition_phase = TransitionPhase::Loading {
                     target_scene: target,
+                    covered: true,
                 };
             }
             TransitionPhase::Entering { .. } => {
                 self.transition_phase = TransitionPhase::Idle;
-                println!("[transition] Transition complete");
+                tracing::info!(target: "script", "Transition complete");
             }
             _ => {}
         }
@@ -165,9 +202,15 @@ impl ScriptHost for PlayerApp {
         }
     }
 
-    fn set_look(&mut self, name: Option<String>) {
-        if let Err(e) = PlayerApp::set_look(self, name.as_deref()) {
+    fn set_look(&mut self, name: Option<String>, seconds: f64) {
+        if let Err(e) = PlayerApp::fade_to_look(self, name.as_deref(), seconds) {
             tracing::warn!("set_look: {e}");
+        }
+    }
+
+    fn prepare_look(&mut self, name: String) {
+        if let Err(e) = PlayerApp::prepare_look(self, &name) {
+            tracing::warn!("prepare_look: {e}");
         }
     }
 
@@ -177,7 +220,7 @@ impl ScriptHost for PlayerApp {
 
     fn load_scene(&mut self, path: String) {
         if self.transition_phase.is_idle() {
-            println!("[transition] Starting exit transition → {}", path);
+            tracing::info!(target: "script", "Starting exit transition → {}", path);
             self.transition_phase = TransitionPhase::Exiting {
                 target_scene: path,
                 elapsed: 0.0,
@@ -188,7 +231,7 @@ impl ScriptHost for PlayerApp {
     fn reload_scene(&mut self) {
         if self.transition_phase.is_idle() {
             let path = self.core.scene_path.clone();
-            println!("[transition] Reloading current scene");
+            tracing::info!(target: "script", "Reloading current scene");
             self.transition_phase = TransitionPhase::Exiting {
                 target_scene: path,
                 elapsed: 0.0,
