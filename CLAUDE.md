@@ -34,6 +34,9 @@ tools/        generators, shot.sh (one deterministic frame), sheet.py (contact s
               menu_flow.py (a scripted path through the menus, with frames and the save it leaves)
               touch_check.py (scripted fingers on phone- and tablet-shaped windows: handling numbers + a taps-only menu path)
               web_touch.mjs (the web export in Chrome over CDP with touch emulation: the same path, perf line, console)
+flint.toml    the project root: id (= input.toml's game_id), schemas, main scene, and [packages]:
+              the engine packages the game uses. Using a component or script function of a
+              package not listed is an `unlisted-package` error in flint check: list it, run build.bat
 save/         persist.toml: the save before Flint #726 (gitignored), read once and left in place;
               the game's save is %APPDATA%\kandinski\saves\default.toml now (input.toml's game_id)
 ```
@@ -41,7 +44,9 @@ save/         persist.toml: the save before Flint #726 (gitignored), read once a
 ## Build, run, check
 
 ```
-build.bat                         # cargo build --release in engine/
+build.bat                         # flint build --release: a player and flint with flint.toml's [packages] only
+                                  # (kernel + debug-hud; procgen = false). ~1 s when nothing changed
+engine/target/release/flint.exe check .   # must say "no problems"; flint.toml gives it the schemas
 play.bat / play_windowed.bat      # scenes\kandinski.scene.toml
 python tools/build_scene.py       # after changing pools or post-process
 python tools/gen_tiles.py ; python tools/gen_models.py ; python tools/gen_hero.py ; python tools/gen_audio.py
