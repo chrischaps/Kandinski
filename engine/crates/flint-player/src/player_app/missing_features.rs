@@ -13,10 +13,21 @@
 use std::collections::BTreeSet;
 use std::path::Path;
 
-use flint_core::components as comp;
 use flint_core::project::{AssetKind, Project};
 use flint_ecs::FlintWorld;
 use flint_terrain::GrassConfig;
+
+/// The components of the parts a build may leave out (#1330). Each one's
+/// crate owns its name (`flint_music::components`, `flint_living::components`,
+/// `flint_wooze::components`), and a build without the feature links none of
+/// them, so the names are written again here; `the_names_are_the_crates`
+/// holds them to the crates' in a build that has all three.
+mod comp {
+    pub(super) use flint_core::components::*;
+    pub(super) const MUSIC_SESSION: &str = "music_session";
+    pub(super) const LIVING_PROP: &str = "living_prop";
+    pub(super) const SHALLOW_WOOZE: &str = "shallow_wooze";
+}
 
 /// The line for a scene with a `music_session`, in a build without `music`.
 #[cfg_attr(feature = "music", allow(dead_code))]
@@ -52,10 +63,10 @@ pub(crate) fn living_uses(
     if tables.contains_key("wooze") {
         uses.push("[wooze]");
     }
-    if has(flint_wooze::components::SHALLOW_WOOZE) {
+    if has(comp::SHALLOW_WOOZE) {
         uses.push("shallow_wooze meshes");
     }
-    if grass.is_some_and(|c| c.enabled && c.wooze) {
+    if grass.and_then(GrassConfig::wooze_comb).is_some() {
         uses.push("woozy grass");
     }
     uses
@@ -90,19 +101,11 @@ pub(crate) fn names_a_spec_would_make(
 ) -> Vec<String> {
     let mut asked: BTreeSet<String> = BTreeSet::new();
     for entity in world.all_entities() {
-        let Some(comps) = world.get_components(entity.id) else {
-            continue;
-        };
-        let model = comps
-            .get(comp::MODEL)
-            .and_then(|m| m.get("asset"))
-            .and_then(|v| v.as_str());
-        let textures = [comp::MATERIAL, comp::SPRITE].into_iter().filter_map(|c| {
-            comps
-                .get(c)
-                .and_then(|t| t.get("texture"))
-                .and_then(|v| v.as_str())
-        });
+        // Through the typed view (ADR 0115): a wrong type is reported once
+        let model = world.view(entity.id, comp::MODEL).opt_str("asset");
+        let textures = [comp::MATERIAL, comp::SPRITE]
+            .into_iter()
+            .filter_map(|c| world.view(entity.id, c).opt_str("texture"));
         asked.extend(model.into_iter().chain(textures).map(String::from));
     }
     if asked.is_empty() {
@@ -163,6 +166,14 @@ mod tests {
             world.set_component(id, component, value).unwrap();
         }
         world
+    }
+
+    #[cfg(all(feature = "music", feature = "living"))]
+    #[test]
+    fn the_names_are_the_crates() {
+        assert_eq!(comp::MUSIC_SESSION, flint_music::components::MUSIC_SESSION);
+        assert_eq!(comp::LIVING_PROP, flint_living::components::LIVING_PROP);
+        assert_eq!(comp::SHALLOW_WOOZE, flint_wooze::components::SHALLOW_WOOZE);
     }
 
     #[test]

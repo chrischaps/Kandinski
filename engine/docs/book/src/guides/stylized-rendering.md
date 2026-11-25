@@ -6,7 +6,7 @@ Every image here was made with `flint render` from the commands beside it, at 12
 
 ## Three ways to style one frame
 
-The frame is `examples/ascii_entities.scene.toml`, a meadow clearing with a bench, a skinned YBot, a barrel, and a crate with a lantern on it. The camera is the same for each:
+The frame is [`flint-examples/ascii_entities.scene.toml`](https://github.com/chrischaps/flint-examples/blob/main/ascii_entities.scene.toml), a meadow clearing with a bench, a skinned YBot, a barrel, and a crate with a lantern on it. The camera is the same for each:
 
 ```bash
 CAM="--no-grid --target 0.7,0.7,4.2 --distance 5.2 --yaw 29 --pitch 10 --width 1280 --height 720"
@@ -15,7 +15,7 @@ CAM="--no-grid --target 0.7,0.7,4.2 --distance 5.2 --yaw 29 --pitch 10 --width 1
 | | |
 |---|---|
 | ![The clearing, smooth](../images/stylized-smooth.png) | ![The whole frame as glyphs](../images/stylized-whole-frame.png) |
-| **Smooth.** `--no-postprocess` (see #376) | **The whole frame.** `--ascii-scope screen` |
+| **Smooth.** `--no-postprocess` (see #376) | **The whole frame.** `--style ascii:scope=screen` |
 | ![Only the props as glyphs](../images/stylized-per-entity.png) | |
 | **Per entity.** The scene as authored: each prop's `ascii_style`, scope `entities` | |
 
@@ -40,7 +40,7 @@ The worry about per-entity glyphs was that they would not line up on one grid. T
 
 | ![Screen grid: the crate's # columns continue the ground's + columns, and an edge outline frames it](../images/stylized-grid-screen-zoom.png) | ![Object grid: the crate's columns start at their own offset, with no outline](../images/stylized-grid-object-zoom.png) |
 |---|---|
-| `--ascii-scope screen`: one grid | `--ascii-scope screen --ascii-grid object`: each prop on its own |
+| `--style ascii:scope=screen`: one grid | `--style ascii:scope=screen,grid=object`: each prop on its own |
 
 On the left, the crate's `#` columns sit exactly under the ground's `+` columns. On the right, the crate's grid is pinned to its projected origin. Its rows and columns start a few pixels off the field's, and wherever the two meet, cells are cut in half. The crate also loses its outline: [edge glyphs](../concepts/stylize-passes.md#edges) lie on the screen grid, so a variant on its own grid keeps only its tone glyphs. That seam is what the spike (#261) found, and it is why `grid = "object"` is opt-in per entity rather than the default.
 
@@ -55,7 +55,7 @@ For everything else, temporal stability (#277: per-cell history and hysteresis) 
 
 ## Edges give an object its shape
 
-Glyphs alone define an object only by tone, so a prop close to the ground's brightness blurs into it. Without edges, the crate on the right of `examples/stylize_props.scene.toml` is only a patch of brighter glyphs, and the barrel's top runs into the ground behind it. With geometry edges (depth steps, creases and mask changes, never colour), the crate becomes a drawn box with a lid:
+Glyphs alone define an object only by tone, so a prop close to the ground's brightness blurs into it. Without edges, the crate on the right of [`flint-examples/stylize_props.scene.toml`](https://github.com/chrischaps/flint-examples/blob/main/stylize_props.scene.toml) is only a patch of brighter glyphs, and the barrel's top runs into the ground behind it. With geometry edges (depth steps, creases and mask changes, never colour), the crate becomes a drawn box with a lid:
 
 | ![No edges: the crate on the right is a patch of brighter glyphs](../images/stylized-edges-off.png) | ![Edges: line glyphs outline the crate, the barrel and the figure](../images/stylized-edges-on.png) |
 |---|---|
@@ -70,7 +70,7 @@ A style runs at one of two stages (the reference's [Where styles run](../concept
 - **HDR**, in linear light at the scene's render scale, before fog, bloom and tonemapping. Painterly filters (Kuwahara) belong here: the fog fades them and the grade tints them like the rest of the scene.
 - **Display**, on the finished picture at output resolution. Glyphs, lines and hatching belong here.
 
-The difference shows under a render scale. Here is `examples/pbr_test.scene.toml` at `--render-scale 0.5`, zoomed 2x:
+The difference shows under a render scale. Here is [`flint-examples/pbr_test.scene.toml`](https://github.com/chrischaps/flint-examples/blob/main/pbr_test.scene.toml) at `--render-scale 0.5`, zoomed 2x:
 
 | ![Display stage: sharp 8 px glyphs on a crisp grid](../images/stylized-stage-display-scale05.png) | ![HDR stage: 16 px glyphs, blurred and bloomed](../images/stylized-stage-hdr-scale05.png) |
 |---|---|
@@ -92,13 +92,17 @@ At the HDR stage the glyphs are drawn at half resolution and upscaled: each 8 px
 
 Today the mask covers static glTF meshes, procedural boxes and skinned meshes. Terrain, grass, particles, sprites and water can only be styled by the whole frame (#290, #310). A frame holds up to 8 glyph sets, one per entity if you like (#335), and up to 4095 per-entity variants (#336).
 
+## A style in a story
+
+A whole-frame style can arrive partway through a scene rather than be there from the start: torn open at a point, wiped across, held to a panel. [A Live Scene Pulled into a Drawing](a-live-scene-pulled-into-a-drawing.md) is a 28-second film built that way (`demos/understudy/` in the [Flint demos](https://github.com/chrischaps/flint-demos) repository). A mannequin walks out of a live clearing through a torn page into the `rotoscope` look, is drawn on twos while it's there, and is wiped back to life. It opens on a page of [comic panels](../concepts/comic-panels.md) and ends on an inset drawn on stroke by stroke, with captions drawn by the HUD.
+
 ## Tuning a look
 
 Tune by sweeping, not by guessing. A sweep renders one frame per value side by side:
 
 ```bash
-flint render examples/ascii_entities.scene.toml --sweep ascii.cell=6,8,12 -o cells.png
-flint render examples/stylize_props.scene.toml --sweep look=ascii_noir,matrix,ink_wash,graphite -o looks.png
+flint render flint-examples/ascii_entities.scene.toml --sweep ascii.cell=6,8,12 -o cells.png
+flint render flint-examples/stylize_props.scene.toml --sweep look=ascii_noir,matrix,ink_wash,graphite -o looks.png
 ```
 
 Then confirm the winner with one render at the final size, since cells are in points. In the player or viewer, **F4 → Styles** tunes the same keys live. Its **Copy TOML** puts the block that reproduces the picture on the clipboard, and **Commit to scene** writes it into the scene file. See [Looks and sweeps](../concepts/stylize-passes.md#looks-and-sweeps) and the reference's advice on [cell size and ramps](../concepts/stylize-passes.md#choosing-cell-size-and-ramp).

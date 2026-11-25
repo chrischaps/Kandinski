@@ -1,9 +1,8 @@
 //! What a debug key says when it has nothing to act on (#367): F3 in a scene
 //! with no panels, F4 with no renderer, the music keys with no session. The
 //! person who pressed the key is looking at the window, so the note shows
-//! there for a moment, and the console gets the same line (`[debug] F3: ...`,
-//! printed like the `[transition]` and `[script]` lines). It used to go to
-//! `tracing::info!`, which the player's log filter never prints.
+//! there for a moment, and the log gets the same line (`[debug] F3: ...`,
+//! at info under target `player`, which the player's filter shows, #716).
 //!
 //! One note at a time: a second key's note replaces the first. Its clock is
 //! egui's, so under `--frame-step` it runs on game time and a capture shows
@@ -19,7 +18,7 @@ pub(crate) struct KeyNote {
 }
 
 struct Shown {
-    key: &'static str,
+    key: String,
     text: String,
     /// egui time it was first painted; `None` until then, so a note said
     /// between frames gets its whole time on screen.
@@ -29,10 +28,10 @@ struct Shown {
 #[cfg_attr(not(feature = "debug-hud"), allow(dead_code))]
 impl KeyNote {
     /// Show `text` for `key` and print it to the console.
-    pub(crate) fn say(&mut self, key: &'static str, text: &str) {
-        println!("[debug] {key}: {text}");
+    pub(crate) fn say(&mut self, key: &str, text: &str) {
+        tracing::info!(target: "player", "[debug] {key}: {text}");
         self.shown = Some(Shown {
-            key,
+            key: key.to_string(),
             text: text.to_string(),
             since: None,
         });
@@ -41,7 +40,9 @@ impl KeyNote {
     /// The note showing, as `(key, text)`.
     #[cfg(test)]
     pub(crate) fn showing(&self) -> Option<(&str, &str)> {
-        self.shown.as_ref().map(|s| (s.key, s.text.as_str()))
+        self.shown
+            .as_ref()
+            .map(|s| (s.key.as_str(), s.text.as_str()))
     }
 
     /// The note's strength at egui time `now` (1 held, falling to 0 over the
@@ -70,7 +71,7 @@ impl KeyNote {
         };
         // The HUD blends in display space: build every translucent colour
         // premultiplied, scaled by the note's strength (crates/flint-player
-        // CLAUDE.md, egui 0.30's premultiply gotcha).
+        // CLAUDE.md, the HUD blend).
         let fade = |r: u8, g: u8, b: u8, alpha: u8| {
             let k = a * alpha as f32 / 255.0;
             let p = |c: u8| (c as f32 * k).round() as u8;
@@ -83,23 +84,23 @@ impl KeyNote {
             .order(egui::Order::Foreground)
             .interactable(false)
             .show(ctx, |ui| {
-                egui::Frame::none()
+                egui::Frame::NONE
                     .fill(fade(14, 16, 22, 224))
                     .stroke(egui::Stroke::new(1.0_f32, fade(255, 255, 255, 40)))
-                    .rounding(egui::Rounding::same(8.0))
-                    .inner_margin(egui::Margin::symmetric(12.0, 8.0))
+                    .corner_radius(egui::CornerRadius::same(8))
+                    .inner_margin(egui::Margin::symmetric(12, 8))
                     .show(ui, |ui| {
                         ui.horizontal(|ui| {
                             ui.spacing_mut().item_spacing.x = 10.0;
                             // The key, as a keycap
-                            egui::Frame::none()
+                            egui::Frame::NONE
                                 .fill(fade(255, 196, 92, 36))
                                 .stroke(egui::Stroke::new(1.0_f32, fade(255, 196, 92, 150)))
-                                .rounding(egui::Rounding::same(4.0))
-                                .inner_margin(egui::Margin::symmetric(6.0, 2.0))
+                                .corner_radius(egui::CornerRadius::same(4))
+                                .inner_margin(egui::Margin::symmetric(6, 2))
                                 .show(ui, |ui| {
                                     ui.label(
-                                        egui::RichText::new(shown.key)
+                                        egui::RichText::new(&shown.key)
                                             .monospace()
                                             .size(12.0)
                                             .color(fade(255, 214, 140, 255)),
@@ -119,6 +120,7 @@ impl KeyNote {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use flint_debug_ui::run_headless_frame;
 
     /// One egui pass at time `t` with the note painted; whether it drew.
     fn frame_at(note: &mut KeyNote, ctx: &egui::Context, t: f64) -> bool {
@@ -130,7 +132,7 @@ mod tests {
             )),
             ..Default::default()
         };
-        let out = ctx.run(input, |ctx| note.paint(ctx, 24.0));
+        let out = run_headless_frame(ctx, input, |ui| note.paint(ui.ctx(), 24.0));
         !out.shapes.is_empty()
     }
 

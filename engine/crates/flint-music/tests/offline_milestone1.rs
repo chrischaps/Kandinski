@@ -8,6 +8,7 @@
 //! transition to its bus. All tolerances trace to kira's chunk-granular
 //! clock advancement (one internal buffer = CHUNK frames) plus the scripted
 //! ramp and the analysis window.
+#![allow(clippy::disallowed_methods)] // a test: reads its files off the disk, not through the vfs
 
 use flint_music::analysis::{
     find_tone_transitions, goertzel_power, max_step, peak, tone_envelope, TransitionKind,
@@ -76,7 +77,7 @@ fn milestone1_scripted_bus_changes_land_on_beat_across_tempo_change() {
     assert_eq!(lpf_at, 960_000, "bar 11 is the tempo anchor");
     assert_eq!(rise_at, 1_152_000, "two 3/4 bars past the anchor");
 
-    // --- home_theme (880 Hz) drops and rises exactly on beat ----------------
+    // --- the bell (880 Hz) drops and rises exactly on beat -----------------
     // Tolerance: analysis window + one kira chunk + the 10 ms ramp reaching
     // the -20 dB detection floor. All ≪ one beat (24000/32000 samples).
     let tol = (2 * WINDOW + CHUNK + 480) as i64;
@@ -101,7 +102,7 @@ fn milestone1_scripted_bus_changes_land_on_beat_across_tempo_change() {
          scheduled AFTER the tempo change"
     );
 
-    // --- texture low-pass engages at the anchor, not before -----------------
+    // --- the rain's low-pass engages at the anchor, not before -------------
     let p8k = |from: i64, to: i64| goertzel_power(audio, SR, 8_000.0, from as usize, to as usize);
     let before_early = p8k(200_000, 500_000);
     let before_late = p8k(600_000, 900_000);

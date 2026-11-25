@@ -11,7 +11,13 @@
 //! and `web` is the main-thread stream it falls back to. `page` suspends
 //! both while the page is hidden (#162).
 
+pub mod bus;
+/// Each bus's own low-pass (#1218), the worklet's file, so both mixers
+/// filter alike.
+#[path = "../../flint-audio-worklet/src/bus_filter.rs"]
+pub(crate) mod bus_filter;
 pub mod clock;
+pub mod clocked;
 pub mod decode;
 pub mod engine;
 pub mod handle;
@@ -26,8 +32,9 @@ pub mod web;
 #[cfg(target_arch = "wasm32")]
 pub mod worklet;
 
+pub use bus::{Bus, BusDecl, Buses};
 use engine::AudioEngine;
-pub use engine::{Bus, MixCounts};
+pub use engine::{MixCounts, Unhosted};
 use flint_core::{Result, Vec3};
 use flint_ecs::FlintWorld;
 use flint_runtime::{GameEvent, RuntimeSystem};
@@ -39,6 +46,9 @@ pub struct AudioSystem {
     pub engine: AudioEngine,
     pub sync: AudioSync,
     pub triggers: AudioTrigger,
+    /// Silent on purpose ([`AudioSystem::silent`]): a run with no sound to
+    /// play doesn't warn that it has none.
+    meant_silent: bool,
 }
 
 impl Default for AudioSystem {
@@ -53,6 +63,19 @@ impl AudioSystem {
             engine: AudioEngine::new(),
             sync: AudioSync::new(),
             triggers: AudioTrigger::new(),
+            meant_silent: false,
+        }
+    }
+
+    /// A system that opens no device and plays nothing, saying nothing of
+    /// it: sounds still load (so a missing file still warns), nothing is
+    /// heard. A headless playtest's (#714).
+    pub fn silent() -> Self {
+        Self {
+            engine: AudioEngine::silent(),
+            sync: AudioSync::new(),
+            triggers: AudioTrigger::new(),
+            meant_silent: true,
         }
     }
 
@@ -82,6 +105,7 @@ impl AudioSystem {
         self.sync.clear();
         self.triggers = AudioTrigger::new();
         self.engine.clear_oneshots();
+        self.engine.stop_keyed_loops();
     }
 
     /// Update the listener position (called from PlayerApp after camera update)
@@ -138,11 +162,17 @@ impl AudioSystem {
         self.engine.set_bus_volume(bus, volume);
     }
 
+    /// Set a mixer bus's own low-pass cutoff, Hz (20000 is open, #1218)
+    pub fn set_bus_lowpass(&mut self, bus: Bus, hz: f64) {
+        self.engine.set_bus_lowpass(bus, hz);
+    }
+
     /// Process game events and execute resulting audio commands
     pub fn process_events(&mut self, events: &[GameEvent], world: &FlintWorld) {
         if !self.engine.is_available() {
             return;
         }
+        flint_core::scope!("audio::triggers", events.len());
         let commands = self.triggers.process_events(events, world);
 
         for cmd in commands {
@@ -158,7 +188,7 @@ impl AudioSystem {
                         }
                     } else if let Err(e) =
                         self.engine
-                            .play_non_spatial(&sound, volume, 1.0, false, Bus::Sfx)
+                            .play_non_spatial(&sound, volume, 1.0, false, Bus::SFX)
                     {
                         // One-shot non-spatial: handle not needed
                         tracing::warn!("{:?}", e);
@@ -178,7 +208,9 @@ impl RuntimeSystem for AudioSystem {
         if !self.engine.is_available() {
             // No device, or (in the browser) no click yet: `start` picks up
             // the rest.
-            tracing::warn!("No sound yet, running silent");
+            if !self.meant_silent {
+                tracing::warn!("No sound yet, running silent");
+            }
             return Ok(());
         }
 
@@ -198,6 +230,7 @@ impl RuntimeSystem for AudioSystem {
         if !self.engine.is_available() {
             return Ok(());
         }
+        flint_core::scope!("audio::update");
 
         // The browser's worklet failed after it started and the main thread
         // took over (#136): what played there is gone, so start it again.
@@ -211,27 +244,36 @@ impl RuntimeSystem for AudioSystem {
         }
 
         // Sync any new audio source entities
-        self.sync.sync_new_sources(world, &mut self.engine);
+        {
+            flint_core::scope!("audio::sync_sources", self.sync.spatial_track_count());
+            self.sync.sync_new_sources(world, &mut self.engine);
 
-        // Update spatial positions for moving sources
-        self.sync.update_positions(world);
+            // Update spatial positions for moving sources
+            self.sync.update_positions(world);
 
-        // Propagate per-frame pitch/volume changes from ECS to Kira handles
-        self.sync.update_parameters(world);
+            // Propagate per-frame pitch/volume changes from ECS to Kira handles
+            self.sync.update_parameters(world);
+        }
 
         // Pause loops nobody can hear: out of earshot, or at volume 0
         self.sync.cull_inaudible(self.engine.listener_position());
 
         // Steer placed sounds to the listener, once a frame (#138)
-        let ears = self.engine.ears();
-        self.sync.pan_sources(&ears);
-        self.engine.pan_oneshots();
+        {
+            flint_core::scope!("audio::pan");
+            let ears = self.engine.ears();
+            self.sync.pan_sources(&ears);
+            self.engine.pan_oneshots();
+        }
 
         // Reload trigger rules for any new entities
         self.triggers.load_rules(world);
 
         // Clean up finished one-shot spatial sounds
         self.engine.cleanup_finished_oneshots();
+
+        // Duck each bus whose `under` bus has something sounding (#1218)
+        self.engine.update_ducks(self.sync.sounding_buses());
 
         Ok(())
     }
@@ -265,8 +307,8 @@ mod tests {
         let events = vec![
             GameEvent::ActionPressed("jump".into()),
             GameEvent::CollisionStarted {
-                entity_a: flint_core::EntityId::new(),
-                entity_b: flint_core::EntityId::new(),
+                entity_a: flint_core::EntityId::from_raw(1),
+                entity_b: flint_core::EntityId::from_raw(2),
             },
         ];
 

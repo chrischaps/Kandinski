@@ -18,7 +18,7 @@ pub const SOFT_DISC_TEXTURE: &str = "__particle_soft_disc";
 impl SceneRenderer {
     /// Upload every packed emitter of a [`ParticleSync`]. Call after
     /// `ParticleSystem::pack`.
-    pub fn update_particles_from(
+    pub(crate) fn update_particles_from(
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
@@ -38,14 +38,19 @@ impl SceneRenderer {
     }
 
     /// Low-level upload: concatenate all emitters' instances into the shared
-    /// storage buffer (one `write_buffer`) and build sorted draw calls.
+    /// storage buffer (one `write_buffer`) and build sorted draw calls. For
+    /// a host with particle draws of its own, after `prepare` (which uploads
+    /// `FrameInputs::particles` and clears the last frame's otherwise), so
+    /// they last one frame like every other input.
     pub fn update_particles(
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         draws: &[ParticleDrawData<'_>],
     ) {
+        flint_core::scope!("particles::upload", draws.len());
         self.particle_draws.clear();
+        self.draws.set_particles(std::iter::empty());
         if self.pipelines.particle.is_none() || self.particle_buffers.is_none() {
             return;
         }
@@ -84,6 +89,7 @@ impl SceneRenderer {
             buffers.write_instances(queue, &scratch);
         }
         sort_particle_draws(&mut calls);
+        self.draws.set_particles(calls.iter());
         self.particle_draws = calls;
         self.particle_upload_scratch = scratch;
     }
@@ -191,20 +197,6 @@ impl SceneRenderer {
         self.debug_overlay_draws.clear();
     }
 
-    /// Depth-tested world lines for the frames that follow, until replaced
-    /// (ADR 0083). They're projected with each frame's own camera and drawn
-    /// over the finished image, hidden behind nearer geometry. Widths are in
-    /// logical points; `px_per_point` converts them to the target's pixels.
-    /// Pass an empty `Vec` to clear them.
-    pub fn set_world_lines(
-        &mut self,
-        lines: Vec<flint_core::world_line::WorldLine>,
-        px_per_point: f32,
-    ) {
-        self.world_lines = lines;
-        self.world_line_px_per_point = px_per_point;
-    }
-
     /// Whether, once `render` returns, the context's depth view holds the
     /// frame's scene depth, single sample, for overlays drawn against it
     /// such as world text (ADR 0104). It doesn't with MSAA and no HDR
@@ -262,7 +254,7 @@ fn load_textures_found(
         match find(&tex_name) {
             Ok(path) => match renderer.load_texture_file(device, queue, &tex_name, &path) {
                 Ok(true) => {
-                    eprintln!("Loaded particle texture: {tex_name}");
+                    tracing::debug!(target: "load", kind = "texture", "Loaded particle texture: {tex_name}");
                     any_new = true;
                 }
                 Ok(false) => {} // already cached

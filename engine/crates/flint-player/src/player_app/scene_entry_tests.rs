@@ -117,6 +117,7 @@ fn started_in_a(gpu: Option<&'static HeadlessContext>) -> PlayerApp {
             dirs: Vec::new(),
             source: SchemaSource::Flags,
             dropped: Vec::new(),
+            packages: None,
         },
     );
     if let Some(gpu) = gpu {
@@ -201,6 +202,7 @@ fn a_scene_that_cannot_load_leaves_the_current_one_and_fails_the_run() {
         // back to idle (#362), not stuck loading
         app.transition_phase = super::TransitionPhase::Loading {
             target_scene: "missing.scene.toml".into(),
+            covered: false,
         };
         app.advance_transition();
         assert!(matches!(app.transition_phase, super::TransitionPhase::Idle));
@@ -229,6 +231,7 @@ fn a_scene_that_cannot_load_fades_back_in_over_the_current_one() {
 
         app.transition_phase = super::TransitionPhase::Loading {
             target_scene: "missing.scene.toml".into(),
+            covered: false,
         };
         app.advance_transition();
         assert_eq!(app.core.scene_path, A, "the scene playing is kept");
@@ -244,14 +247,100 @@ fn a_scene_that_cannot_load_fades_back_in_over_the_current_one() {
 }
 
 /// One device for this binary, never dropped: a device per test deadlocked
-/// NVIDIA's Vulkan driver as test threads exited (#598).
-fn gpu() -> Option<&'static HeadlessContext> {
+/// NVIDIA's Vulkan driver as test threads exited (#598). World text's GPU
+/// test takes it too.
+pub(super) fn gpu() -> Option<&'static HeadlessContext> {
     static GPU: OnceLock<Option<&'static HeadlessContext>> = OnceLock::new();
     *GPU.get_or_init(|| {
         pollster::block_on(HeadlessContext::new(64, 64))
             .ok()
             .map(|ctx| &*Box::leak(Box::new(ctx)))
     })
+}
+
+/// #496: a look fades in over game time, fires `look_faded` and ends on
+/// the cut's config; a cut during a fade ends it.
+#[test]
+fn a_look_fades_in_on_game_time_and_says_when_it_arrives() {
+    let Some(gpu) = gpu() else {
+        flint_render::gpu_select::skip_without_gpu("look fade test");
+        return;
+    };
+    vfs::scoped(Arc::new(game()), || a_look_fades(gpu));
+}
+
+fn a_look_fades(gpu: &'static HeadlessContext) {
+    let mut app = started_in_a(Some(gpu));
+    let drawn = |app: &PlayerApp| {
+        app.scene_renderer
+            .as_ref()
+            .unwrap()
+            .post_process_config()
+            .clone()
+    };
+    let exposure = drawn(&app).exposure;
+
+    app.fade_to_look(Some("watercolor"), 2.0).unwrap();
+    assert_eq!(
+        app.current_look(),
+        Some("watercolor"),
+        "the look is the new one at once"
+    );
+    assert!(app.look_fading());
+    assert!(
+        !drawn(&app).styles.is_enabled("watercolor"),
+        "nothing moves before a step"
+    );
+
+    app.lay_look_fade(1.0);
+    let half = drawn(&app);
+    assert!(half.styles.is_enabled("watercolor"));
+    assert!(
+        (half.styles.blend("watercolor") - 0.5).abs() < 1e-5,
+        "smoothstep(0.5) is 0.5"
+    );
+    assert_eq!(
+        half.exposure, exposure,
+        "the scene's own exposure is under both looks"
+    );
+    assert!(app.core.events.drain().is_empty(), "no arrival yet");
+
+    app.lay_look_fade(2.5);
+    assert!(!app.look_fading());
+    let arrived: Vec<_> = app
+        .core
+        .events
+        .drain()
+        .into_iter()
+        .filter_map(|e| match e {
+            flint_runtime::GameEvent::Custom { name, data } if name == crate::LOOK_FADED => {
+                Some(data)
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(arrived.len(), 1);
+    assert_eq!(
+        arrived[0].get("look").and_then(|v| v.as_str()),
+        Some("watercolor")
+    );
+    let cut = app.scene_post_config();
+    assert_eq!(
+        format!("{:?}", drawn(&app).styles),
+        format!("{:?}", cut.styles),
+        "the fade ends on what the cut would draw"
+    );
+
+    // A cut during a fade takes over at once
+    app.fade_to_look(None, 3.0).unwrap();
+    app.lay_look_fade(0.5);
+    assert!(app.look_fading());
+    app.set_look(Some("graphite")).unwrap();
+    assert!(!app.look_fading());
+    let graphite = drawn(&app);
+    assert!(graphite.styles.is_enabled("pencil"));
+    assert!(!graphite.styles.is_enabled("watercolor"));
+    assert!(app.core.events.drain().is_empty(), "a cut fires nothing");
 }
 
 #[test]
@@ -357,6 +446,7 @@ fn fonts_resolve_beside_the_scene_a_transition_reaches() {
                 dirs: Vec::new(),
                 source: SchemaSource::Flags,
                 dropped: Vec::new(),
+                packages: None,
             },
         );
         app.scene_renderer = Some(SceneRenderer::new_headless(
@@ -389,7 +479,7 @@ fn fonts_resolve_beside_the_scene_a_transition_reaches() {
                 .atlas()
                 .cell_size();
             (
-                renderer.scene_dir.clone(),
+                renderer.scene_dir().map(std::path::Path::to_path_buf),
                 scope.scene_dir.clone(),
                 ui_text,
                 styles,

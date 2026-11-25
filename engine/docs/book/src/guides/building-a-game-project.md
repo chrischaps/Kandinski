@@ -8,6 +8,8 @@ Game projects live in their own git repositories with the Flint engine included 
 
 ### 1. Start the project with `flint init`
 
+Run it from the folder that will hold the game, outside the Flint checkout: it creates `my_game/` under the directory you're in. This uses a `flint` on your PATH; without one, call the engine's build by its path ([Installation](../getting-started/installation.md#running-without-installing)).
+
 ```bash
 flint init my_game --engine subtree
 ```
@@ -31,11 +33,14 @@ Next steps:
 
 Run the git lines it printed. The `--squash` flag collapses engine history into one commit, keeping your game history clean. Full engine history stays in the Flint repo. Until the subtree is there, the manifest names a directory that doesn't exist, and every command says so (`schema directory not found: .../engine/schemas`).
 
-Then build the engine the game now carries, and put its `flint` on your PATH (or call it by path):
+Then build the engine the game now carries. The first time there is no `flint` yet, so Cargo builds one and runs its `build` command, from the engine folder:
 
 ```bash
-cargo build --release --manifest-path engine/Cargo.toml
+cd engine
+cargo run -p flint-cli -- build --release
 ```
+
+That builds the game's `flint-player` and `flint` with the packages its `flint.toml` lists, and prints where they landed: put that `flint` on your PATH (or call it by path). From then on, `flint build` in the project rebuilds the pair ([Building the game](#building-the-game-flint-build)).
 
 ### Trying a game before it has a repository
 
@@ -73,7 +78,10 @@ my_game/                         (your git repo)
 ├── scenes/
 │   └── main.scene.toml          # The first scene: lit, with a [camera]
 ├── scripts/
-│   └── hud.rhai                 # The HUD, on the scene's hud_controller
+│   └── hud.rhai                 # The HUD, on the scene's hud_controller, and the pause menu's controller
+├── ui/
+│   ├── pause.ui.toml            # The pause menu: Escape or a pad's Start
+│   └── pause.style.toml         # Its look
 ├── schemas/
 │   ├── components/              # Game-specific component definitions (empty)
 │   └── archetypes/              # Game-specific archetype bundles (empty)
@@ -98,14 +106,14 @@ strict = true                             # a field no schema declares is an err
 save_version = 2                          # the version save files are written at
 ```
 
-Every key is optional, and so is the `[project]` table: an empty `flint.toml` is still a root marker. Paths are relative to the folder the file is in. Other tables in the file are left alone.
+Every key is optional, and so is the `[project]` table: an empty `flint.toml` is still a root marker. Paths are relative to the folder the file is in. `[packages]`, beside `[project]`, says which of the engine's packages the game uses ([below](#packages-a-game-uses)). Other tables in the file are left alone.
 
 Flint finds the manifest by walking up from a scene or from the working directory, so it is found from any folder of the project, and from inside `engine/` too (an engine checkout is passed through to the game above it). Without a `flint.toml`, a `.flint/` directory or `schemas/` beside `scenes/` or `levels/` marks the root, as before. `--project <dir>` on any `flint` command names the root outright and reads that folder's `flint.toml`.
 
 The file is checked when it is read. A value of the wrong type, or a key in `[project]` that Flint doesn't know, is an error that names the file and the key, so a typo doesn't pass silently:
 
 ```
-flint.toml: unknown key `shcemas` in [project] (the keys are id, schemas, scene, input, strict, save_version)
+flint.toml: unknown key `shcemas` in [project] (the keys are id, schemas, scene, input, strict, save_version, diagnostics)
 flint.toml: `project.schemas` must be a list of strings, found a string
 ```
 
@@ -117,9 +125,11 @@ flint.toml: `project.schemas` must be a list of strings, found a string
 | `id` | `flint bundle` and `flint export web`: the bundle's name and the game's `?game=` id, when `bundle.toml` has no `name` (`--name` wins over both). The player: save data lives under the OS user directory in a folder of this name, `<config>/<id>/saves/` ([Where saves live](../concepts/scripting.md#where-saves-live)); without it the input config's `game_id` is used, and a game with neither saves inside its own folder. Input rebinds are still named for the input config's `game_id` |
 | `schemas` | Every command, the viewer and the player: the schema directories, in override order, whenever no `--schemas` flag is given. `flint bundle` writes the same list into the bundle. See [Multi-Schema Layering](#multi-schema-layering) |
 | `scene` | `flint play` and `flint-player` with no scene argument open it. `flint bundle` starts the bundle there when `bundle.toml` has no `scene` |
-| `strict` | `flint validate`: `true` makes a field that its component's schema doesn't declare an error (`unknown-field`), where it is a warning otherwise; the same as `--strict` on one run. It changes what `flint validate` fails on, nothing about how a scene loads or plays. See [Scene Diagnostics](../concepts/schemas.md#unknown-fields-and-strict) |
+| `strict` | `flint validate`: `true` makes a field that its component's schema doesn't declare an error (`unknown-field`), where it is a warning otherwise; the same as `--strict` on one run. It changes what `flint validate`, `flint check` and the viewer's panel report, nothing about how a scene loads or plays: a load's summary keeps an unknown field a warning. See [Scene Diagnostics](../concepts/schemas.md#unknown-fields-and-strict) |
+| `[project.diagnostics] allow` | A list of diagnostic codes the project accepts, each optionally at a place: `["unknown-field:material.wetness", "unknown-table"]`. What it names is left out of every report, which says how many it left out. See [Allowing a code](../concepts/schemas.md#allowing-a-code) |
 | `input` | The player: the game layer of the [input config](../concepts/physics-and-runtime.md#config-layering), unless the scene names its own with `[scene] input_config` |
 | `save_version` | The player: a whole number, 0 when left out. A save file at a lower version is handed to the scripts' `on_persist_migrate(from)` before `on_init`, then stamped with this one ([Versions and migration](../concepts/scripting.md#versions-and-migration)) |
+| `[packages]` | Every command that loads schemas, `flint script api`, `flint script check` and `flint check`: which packages' components, scene tables and script modules the game has ([Packages a game uses](#packages-a-game-uses)) |
 
 ```bash
 flint play                 # opens [project] scene
@@ -134,6 +144,91 @@ Error: no scene given: pass one (a path to a .scene.toml), or name the project's
 
 `bundle.toml` stays a separate file: it holds the packing rules (`exclude`, `include`, `[late]`, `[mount]`, `[web]`), and its `name`, `scene` and `schemas` are needed only to say something other than the manifest does. The manifest itself is packed into the bundle, so the web player finds the same project there. `flint init` writes the manifest with all four keys. The design is [ADR 0114](https://github.com/chrischaps/Flint/blob/main/docs/adr/0114-project-manifest-and-one-resolver.md).
 
+
+## Packages a game uses
+
+The engine comes in packages ([Packages](../concepts/packages.md) says what one is and walks through adding one; [The `package` Command](../cli-reference/overview.md#the-package-command) lists them): the kernel every game has, the standard `procgen` and `debug-hud`, and the features `living` (living props and the wooze field), `music`, `rhythm` and `ai`. `[packages]` in `flint.toml` lists the ones the game uses:
+
+```toml
+[packages]
+living = "*"        # a feature package: in only when listed
+debug-hud = false   # a standard package: in unless set to false
+```
+
+- **No `[packages]` table: every package**, as before there was one. A project that never writes it changes nothing.
+- **With it:** the kernel, every standard package not set to `false`, every feature package listed, and what those require (`living` brings `procgen`). An empty table is the kernel and the standard packages. `flint init` writes one, empty, in every template.
+- A value is a version requirement (`"*"`, `"^0.1"`), checked for its syntax and kept; nothing is held to it until packages have versions of their own. `false` drops a standard package. A table (`{ version, path }`) is for a game's own packages and package sources, which come later, and is refused until then.
+
+The list decides what the game has. Only the listed packages' schemas load, so `flint schema` lists no `living_prop` in a game without `living`, and `flint script api` lists none of its script functions (it ends naming what it left out). A scene or script that uses one is an `unlisted-package` error in `flint check`, `flint validate` and `flint script check`, naming the package and the line to add, once a file and item:
+
+```text
+$ flint check scenes/woozy_grove/woozy_grove.scene.toml
+  ...
+  error[unlisted-package] entity 'birch_00' component 'living_prop': the component `living_prop` is the `living` package's, and [packages] doesn't list it (37 other entities too)
+      hint: add `living = "*"` under [packages] in flint.toml
+$ flint script check scripts/breeze.rhai
+scripts/breeze.rhai:2:13: error[unlisted-package]: `wooze_at` is in the script module `wooze`, the `living` package's, and [packages] doesn't list it
+    hint: add `living = "*"` under [packages] in flint.toml
+```
+
+A name no package has, `false` on the kernel or a feature package, and `false` on a package a listed one requires are `bad-manifest` errors naming the line (`packages.livng`, with `did you mean `living`?`), and every command that loads schemas stops on them.
+
+`flint package used` reads the project's scenes, chunks, prefabs and scripts and says which packages they reach: each component, archetype and scene table by the package that provides it, each script call by its module's package, and each name of a procgen spec by `procgen`. What those require comes along. `--write` adds what it found to `[packages]`, keeping every line already there:
+
+```text
+$ flint package used
+procgen  standard  required by living
+                   specs grove_birch, grove_cypress, grove_floor, grove_oak, grove_thorn in scenes/woozy_grove/woozy_grove.scene.toml
+living   feature   components living_prop, shallow_wooze in scenes/woozy_grove/woozy_grove.scene.toml
+                   scene table wooze in scenes/woozy_grove/woozy_grove.scene.toml
+                   script module wooze in scripts/breeze.rhai
+
+[packages]
+procgen = "*"
+living = "*"
+
+(`--write` adds these to flint.toml)
+```
+
+Under `--json` it is one document: `root`, `packages` (each with `name`, `tier`, `uses` as `file`, `kind`, `item`, `required_by`, and `set_to_false`), `lines` (what `--write` would add), `unused` (listed with a version, reached by nothing scanned) and `written`. A player links what it was built with, whatever the list says; [`flint build`](#building-the-game-flint-build) builds one with the listed packages and nothing else.
+
+### Building the game: `flint build`
+
+`flint build` builds the project's `flint-player` and `flint` from its package list. It reads `[packages]` against the engine's manifests, turns each package that is in into the Cargo features its manifest names (on `flint-player`, `flint-cli`, or both: whichever has the feature), keeps each crate's build options (`audio`, `gamepad`, `frame-history`, `dialogs`), and runs `cargo build --no-default-features` with those features in the engine workspace. It prints the plan, the exact cargo command and where the binaries landed. `--dry-run` prints the same and builds nothing:
+
+```text
+$ flint build --dry-run
+project   C:/games/my_game
+engine    C:/games/my_game/engine (the project's engine/)
+packages  engine (the kernel), debug-hud (standard), procgen (listed)
+left out  ai, living, music, rhythm
+player    debug-hud, procgen + audio, gamepad, frame-history
+flint     procgen + audio, gamepad, dialogs
+
+cargo build -p flint-player -p flint-cli --bin flint-player --bin flint --no-default-features --features flint-player/debug-hud,flint-player/procgen,flint-player/audio,flint-player/gamepad,flint-player/frame-history,flint-cli/procgen,flint-cli/audio,flint-cli/gamepad,flint-cli/dialogs
+  in C:/games/my_game/engine
+
+Would write (--dry-run built nothing):
+  flint-player  C:/games/my_game/engine/target/debug/flint-player.exe
+  flint         C:/games/my_game/engine/target/debug/flint.exe
+```
+
+- `--release` builds optimized binaries, `--target <triple>` for another platform (the binaries land under `target/<triple>/`).
+- The engine is `--engine-path <dir>`, else the project's `engine/` subtree, else the engine its schemas name, else the tree this `flint` was built from.
+- With no `[packages]` table every package is in: the same binaries as a plain `cargo build`.
+- A project that drops `debug-hud` is built in two cargo runs, the player alone and then the CLI. `flint-cli` turns on the player's debug panels (its windows draw them), and one run would give them back to the player.
+- Under `--json` it is one document: `packages` (each with `name`, `tier` and `why`), `left_out`, `features`, `commands`, `argv`, `binaries`, `dry_run`, and after a build `built`, `seconds` and `set_aside`.
+
+On Windows a running binary can't be overwritten, and the `flint.exe` running the build is one of the two it writes. So before Cargo runs, `flint build` renames each output binary that exists to `<name>.old.exe` beside it. Windows allows that while it runs. A failed build renames it back. A copy still running is deleted the next time that binary starts ([ADR 0136](https://github.com/chrischaps/Flint/blob/main/docs/adr/0136-the-package-model.md), decision 10).
+
+A binary built some other way can lack a package the list names. With a `[packages]` table, `flint play`, `flint-player` and `flint render` refuse to run then (exit 2 for `flint`), and `flint check` reports it as an `unbuilt-package` error:
+
+```text
+$ flint check
+flint.toml: 1 error
+  error[unbuilt-package]: this flint was built without the `living` package, which flint.toml uses
+      hint: run `flint build` in the project: it builds a flint and a flint-player with the packages flint.toml lists (`flint build --dry-run` shows the cargo command)
+```
 ## Multi-Schema Layering
 
 A game loads two schema directories, in order, with the later one overriding the earlier:
@@ -141,7 +236,7 @@ A game loads two schema directories, in order, with the later one overriding the
 1. **Engine schemas** from `engine/schemas/` --- built-in components like `transform`, `material`, `rigidbody`, `collider`, `character_controller`, `sprite`, etc.
 2. **Game schemas** from `schemas/` --- game-specific components like `health`, `weapon`, `enemy_ai`
 
-If both directories define a component with the same name, the game's version takes priority.
+If both directories define a component with the same name, the game's version replaces the engine's whole. To add a field to an engine component instead (a `wetness` on every `material`), the game's file says `extend = true` and declares only the new field; the engine's fields stay as the engine declares them. See [Schemas: Adding a field to an engine component](../concepts/schemas.md#adding-a-field-to-an-engine-component). An archetype is the same: `[archetype.player]` with `extend = true` adds the components it lists and merges its defaults into the engine's ([Adding a component to an engine archetype](../concepts/schemas.md#adding-a-component-to-an-engine-archetype)).
 
 The engine's set has no room-builder vocabulary in it: `furniture`, `wall`, `floor`, `ceiling`, `pillar`, `room` and `door` are the layer the engine's example scenes are written in, `engine/schemas/examples`. A game that wants them lists that directory between the two (`["engine/schemas", "engine/schemas/examples", "schemas"]`); most games define archetypes of their own instead. See [Schemas: The Examples Layer](../concepts/schemas.md#the-examples-layer).
 
@@ -321,6 +416,8 @@ cargo run --manifest-path engine/Cargo.toml --bin flint -- play
 cargo run --manifest-path engine/Cargo.toml --bin flint-player -- scenes/level_1.scene.toml
 ```
 
+Built this way the engine's workspace is cargo's root, and its `[patch.crates-io]` applies. A game that builds a binary of its own (a [player extension](player-extensions.md#a-game-binary)) has a workspace of its own, whose root `Cargo.toml` names the engine's patches itself; `flint check` says when one is missing.
+
 ## Asset Resolution
 
 A game keeps each kind of asset in its folder at the project root: `scripts/`, `audio/`, `sprites/`, `models/` and the rest.
@@ -341,6 +438,18 @@ git subtree push --prefix=engine flint-engine main
 
 Engine edits are normal commits in your game repo. The subtree commands handle splitting and merging the `engine/` prefix.
 
+### What `engine/` carries, and leaving some of it out
+
+A subtree is the engine's whole tree, so a game carries the engine's book, its test fixtures and the showcase game along with the crates. The examples are not in it: they are their own repository, [flint-examples](https://github.com/chrischaps/flint-examples), since #984. The engine keeps the tree under a budget ([ADR 0122](https://github.com/chrischaps/Flint/blob/main/docs/adr/0122-what-a-games-engine-carries.md)): 175 MB in all, no file stored twice, no texture over 2048 texels a side, checked on every engine PR. `python3 engine/scripts/size-check.py --report` prints each part's size (in a sparse checkout, of what is written out).
+
+Nothing a game builds reads `engine/docs`, `engine/tests` or `engine/showcase_game`, so each clone or worktree of the game can leave them out of its working tree with a sparse checkout:
+
+```bash
+git sparse-checkout set --no-cone '/*' '!/engine/docs/' '!/engine/tests/' '!/engine/showcase_game/'
+```
+
+On a game with the engine of 2026-11-14 (examples and all) this took the working tree from 166 MB to 41 MB; since the examples left, the engine's whole tree is about 158 MB. A game with the old recipe can drop its `'!/engine/examples/'`. The engine still builds (`cargo build --manifest-path engine/Cargo.toml`), and `git subtree pull` and `push` work as before: the files are still in the repository, just not written out. `git sparse-checkout disable` brings them back. In Git Bash, prefix the command with `MSYS_NO_PATHCONV=1`, or Git Bash rewrites `'/*'` as a Windows path and the checkout keeps everything.
+
 ### After a pull: read the changelog
 
 `--squash` folds the engine's commits into one, so their subjects are gone from your history. The engine's changelog is where to read what changed: every change a game can notice (scene and schema keys, script functions, CLI flags, formats, Cargo features, and changes in how something looks, sounds or behaves), each with what to do about it. Before pulling, note the day of your last pull; after it, print what is new since then:
@@ -352,6 +461,8 @@ bash engine/scripts/changelog.sh since 2026-11-02   # newest first
 ```
 
 The entries live one file a month in `engine/changelog/` (`engine/CHANGELOG.md` links them), and `since` also reads the ones not yet gathered into a month, in `engine/changelog.d/`. It prints every entry dated that day or later, so a pull made the same day may show an entry you already had. Then run your scenes through `flint validate` and play the game once, watching the log: several entries are new warnings for mistakes that used to pass in silence.
+
+A pull that moves a dependency your own Rust uses too (wgpu and egui, in November 2026) has a port on [Upgrading the Engine](upgrading-the-engine.md).
 
 ## Further Reading
 

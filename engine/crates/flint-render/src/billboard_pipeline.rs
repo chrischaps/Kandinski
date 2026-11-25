@@ -3,6 +3,8 @@
 //! Renders camera-facing quads for Doom-style sprite entities.
 //! Uses a dedicated pipeline separate from PBR to keep things clean.
 
+use crate::gpu_counts::CountedDevice;
+use crate::TrustedShader;
 use bytemuck::{Pod, Zeroable};
 
 /// Uniform data shared across all billboards in a frame (camera vectors)
@@ -39,7 +41,23 @@ pub struct BillboardDrawCall {
     pub sprite_buffer: wgpu::Buffer,
     pub billboard_bind_group: wgpu::BindGroup,
     pub texture_bind_group: wgpu::BindGroup,
-    pub entity_id: Option<flint_core::EntityId>,
+    /// A world box the quad lies in whichever way the camera turns it
+    /// ([`sprite_bounds`]), for a styled billboard's style scissor (#1011).
+    pub world_aabb: ([f32; 3], [f32; 3]),
+}
+
+/// A world box that holds a billboard's quad under any camera: the quad's
+/// corners are `world_pos + right * x * width + up * (y - anchor_y) * height`
+/// with `x` in -0.5..0.5, `y` in 0..1 and `right`, `up` unit and at right
+/// angles, so every corner is within the corner reach of `world_pos`.
+pub fn sprite_bounds(sprite: &SpriteInstance) -> ([f32; 3], [f32; 3]) {
+    let reach_y = sprite.anchor_y.abs().max((1.0 - sprite.anchor_y).abs()) * sprite.height.abs();
+    let reach = (0.5 * sprite.width).hypot(reach_y);
+    let p = sprite.world_pos;
+    (
+        [p[0] - reach, p[1] - reach, p[2] - reach],
+        [p[0] + reach, p[1] + reach, p[2] + reach],
+    )
 }
 
 /// The billboard rendering pipeline
@@ -53,7 +71,7 @@ pub struct BillboardPipeline {
 
 impl BillboardPipeline {
     pub fn new(device: &wgpu::Device, format: wgpu::TextureFormat, sample_count: u32) -> Self {
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        let shader = device.create_trusted_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Billboard Shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("billboard_shader.wgsl").into()),
         });
@@ -114,11 +132,14 @@ impl BillboardPipeline {
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("Billboard Pipeline Layout"),
-            bind_group_layouts: &[&billboard_bind_group_layout, &texture_bind_group_layout],
-            push_constant_ranges: &[],
+            bind_group_layouts: &[
+                Some(&billboard_bind_group_layout),
+                Some(&texture_bind_group_layout),
+            ],
+            immediate_size: 0,
         });
 
-        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        let pipeline = device.create_render_pipeline_counted(&wgpu::RenderPipelineDescriptor {
             label: Some("Billboard Render Pipeline"),
             layout: Some(&pipeline_layout),
             vertex: wgpu::VertexState {
@@ -148,8 +169,8 @@ impl BillboardPipeline {
             },
             depth_stencil: Some(wgpu::DepthStencilState {
                 format: wgpu::TextureFormat::Depth32Float,
-                depth_write_enabled: true,
-                depth_compare: wgpu::CompareFunction::Less,
+                depth_write_enabled: Some(true),
+                depth_compare: Some(wgpu::CompareFunction::Less),
                 stencil: wgpu::StencilState::default(),
                 bias: wgpu::DepthBiasState::default(),
             }),
@@ -157,17 +178,18 @@ impl BillboardPipeline {
                 count: sample_count,
                 ..Default::default()
             },
-            multiview: None,
+            multiview_mask: None,
             cache: None,
         });
 
         // Shared quad index buffer: 2 triangles = 6 indices
         let quad_indices: [u32; 6] = [0, 1, 2, 2, 1, 3];
-        let quad_index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Billboard Quad Index Buffer"),
-            contents: bytemuck::cast_slice(&quad_indices),
-            usage: wgpu::BufferUsages::INDEX,
-        });
+        let quad_index_buffer =
+            device.create_buffer_init_counted(&wgpu::util::BufferInitDescriptor {
+                label: Some("Billboard Quad Index Buffer"),
+                contents: bytemuck::cast_slice(&quad_indices),
+                usage: wgpu::BufferUsages::INDEX,
+            });
 
         Self {
             pipeline,
@@ -177,5 +199,3 @@ impl BillboardPipeline {
         }
     }
 }
-
-use wgpu::util::DeviceExt;

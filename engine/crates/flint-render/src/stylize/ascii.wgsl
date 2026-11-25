@@ -22,13 +22,13 @@
 // of such a cell draws as the variant, whatever the mask says there, and
 // its own pixels in a cell it doesn't hold draw as the whole frame does. So
 // each pixel asks, per grid a snapping variant uses, which variant holds its
-// cell (`resolve`): the question is the cell's, and every pixel of the cell
-// gets the same answer.
+// cell (`resolve`): the question is the cell's, so the snap owner pass
+// answers it once a cell (#929) and every pixel of the cell reads the answer.
 
 @group(1) @binding(0) var cells: texture_2d<u32>;
 @group(2) @binding(0) var atlas: texture_2d<f32>;
 @group(3) @binding(0) var entity_input: texture_2d<f32>;
-@group(3) @binding(1) var style_mask: texture_2d<u32>;
+@group(3) @binding(1) var flint_mask_texture: texture_2d<u32>;
 // The edge cell pass's texel per cell (#267, ascii_edge_cells.wgsl): x =
 // line glyph slot + 1 (0 = none), y = its length in cell widths, z = the
 // outline and cross-axis bits plus the near side's hue above them, 7 bits
@@ -44,25 +44,35 @@
 // Each dissolving variant's cells' ranks in its dissolve order (#398,
 // ascii_dissolve_rank.wgsl)
 @group(3) @binding(6) var dissolve_ranks: texture_2d<f32>;
+// Each edge cell's glyph, decided once per cell (#910,
+// ascii_edge_corners.wgsl): the slots packed for 0, 4 and 9 corner glyphs
+@group(3) @binding(7) var edge_slots: texture_2d<u32>;
+// Which snapping variant holds each cell of each snapping grid (#929,
+// ascii_snap_owner.wgsl): slot | the blend at its first sample << 16
+@group(3) @binding(8) var snap_owners: texture_2d<u32>;
 
 // The tone luminance of a colour in `slot`: stretched over the slot's range
 fn slot_luma(col: vec3<f32>, slot: u32) -> f32 {
     let amount = slot_normalize(slot);
     if amount <= 0.0 {
-        return luma(col);
+        return flint_luma(col);
     }
-    return stretched(luma(col), textureLoad(tone_stats, vec2<i32>(i32(slot), 0), 0), amount);
+    return stretched(flint_luma(col), textureLoad(tone_stats, vec2<i32>(i32(slot), 0), 0), amount);
 }
 
 // The edge glyph slot of the screen-grid cell `cell`, or NO_EDGE: the
 // edge cell's line, thinned where a line splits between two cells, or the
 // corner its neighbours' lines meet in (#348) when the drawing font has
-// `corners` corner glyphs (ascii_edge_thin.wgsl, which follows this file).
+// `corners` corner glyphs. The edge thin and corner passes decided it for
+// the cell (#910, ascii_edge_corners.wgsl); ascii_edge_slot.wgsl follows
+// this file.
 fn edge_slot(cell: vec2<f32>, corners: u32) -> u32 {
     if u.edge_on == 0u {
         return NO_EDGE;
     }
-    return cornered_slot(vec2<i32>(cell) + vec2<i32>(CELL_OFFSET), corners);
+    let cmax = vec2<i32>(textureDimensions(edge_slots)) - vec2<i32>(1);
+    let c = clamp(vec2<i32>(cell) + vec2<i32>(CELL_OFFSET), vec2<i32>(0), cmax);
+    return slot_for(textureLoad(edge_slots, c, 0).x, corners);
 }
 
 // How many corner glyphs look `v`'s font has (#348): a variant in a font
@@ -246,7 +256,7 @@ fn mode_ink(v: Variant, col: vec3<f32>, t: f32, cell: vec2<f32>) -> vec3<f32> {
 }
 
 fn cell_inks(v: Variant, col: vec3<f32>, t: f32, cell: vec2<f32>) -> Inks {
-    let lum = luma(col);
+    let lum = flint_luma(col);
     let ink = mode_ink(v, col, t, cell);
     var ground = col * v.background;
     switch v.color_mode {
@@ -350,21 +360,11 @@ fn shade_edge(v: Variant, col: vec3<f32>, t: f32, step: u32, cell: vec2<f32>, lo
 // The variant slot of the pixel at `p` (output pixels): the mask is at the
 // scene's resolution, so it is read by position scaled to it.
 fn mask_texel(p: vec2<f32>) -> vec2<u32> {
-    let msize = vec2<i32>(textureDimensions(style_mask));
-    let mp = vec2<i32>(floor(p * vec2<f32>(msize) / u.size));
-    return textureLoad(style_mask, clamp(mp, vec2<i32>(0), msize - 1), 0).rg;
+    return flint_mask_load(flint_mask_texel_of(p, u.size));
 }
 
 fn slot_at(p: vec2<f32>) -> u32 {
     return slot_of(mask_texel(p).x);
-}
-
-// A variant's flag: its silhouette snaps to whole cells (#338)
-const SNAP: u32 = 4u;
-
-// Whether slot `slot` is a drawn variant whose silhouette snaps
-fn snaps(slot: u32) -> bool {
-    return slot != 0u && (variants[slot].flags & (SNAP | 1u)) == SNAP;
 }
 
 // Who draws a pixel: a variant slot (0 = the whole frame), how much of
@@ -374,12 +374,6 @@ struct Owner {
     slot: u32,
     blend: f32,
     read_at: vec2<f32>,
-}
-
-// The lattice sample `k` (0..16, row by row) of the cell whose top left is
-// `cell_min`, `cell` wide: a pixel's top left
-fn lattice(cell_min: vec2<f32>, cell: vec2<f32>, k: i32) -> vec2<f32> {
-    return floor(cell_min + (vec2<f32>(f32(k & 3), f32(k >> 2u)) + 0.5) / 4.0 * cell);
 }
 
 // A snapped variant's pixel in a cell it doesn't hold shows the scene, not
@@ -403,67 +397,23 @@ fn scene_behind(p: vec2<f32>, slot: u32) -> vec2<f32> {
     return best;
 }
 
-fn same_grid(slot: u32, cell: vec2<f32>, origin: vec2<f32>) -> bool {
-    let v = variants[slot];
-    return all(v.cell == cell) && all(v.origin == origin);
-}
-
 // The snapping variant on the grid (`cell`, `origin`) that holds the cell
-// under `p`: of the variants on that grid that snap, the one with the most
-// of the cell's 16 lattice samples (the first met on a tie), if it has at
-// least its `cell_share` of them; slot 0 for none. One pass, in registers:
-// it counts the first two such variants met in the cell, which is every one
-// unless three snapping variants of one grid meet in a cell (the third is
-// then left out). Private arrays would spill to memory: every pixel on the
-// screen runs this once a snapping grid. The blend is the one at the
-// variant's first sample, so the whole cell fades alike.
-fn grid_owner(p: vec2<f32>, cell: vec2<f32>, origin: vec2<f32>) -> Owner {
-    let c = floor((p - origin) / cell);
-    let cell_min = c * cell + origin;
-    var a = 0u;
-    var a_n = 0u;
-    var a_blend = 1.0;
-    var b = 0u;
-    var b_n = 0u;
-    var b_blend = 1.0;
-    for (var k = 0; k < 16; k++) {
-        let m = mask_texel(lattice(cell_min, cell, k));
-        // Most samples are unstyled: no table reads for them
-        if m.x == 0u {
-            continue;
-        }
-        let s = slot_of(m.x);
-        if s == 0u {
-            continue;
-        }
-        if s == a {
-            a_n += 1u;
-        } else if s == b {
-            b_n += 1u;
-        } else if snaps(s) && same_grid(s, cell, origin) {
-            if a == 0u {
-                a = s;
-                a_n = 1u;
-                a_blend = f32(m.y) / 65535.0;
-            } else if b == 0u {
-                b = s;
-                b_n = 1u;
-                b_blend = f32(m.y) / 65535.0;
-            }
-        }
-    }
+// under `p`, slot 0 for none: the snap owner pass (#929,
+// ascii_snap_owner.wgsl) decided it once for the cell, in the grid's band
+// `band` (`snap_bands`' layout), and a cell outside the band holds no
+// snapping variant of the grid. The blend is the one at the variant's first
+// sample in the cell, so the whole cell fades alike.
+fn held_cell(p: vec2<f32>, cell: vec2<f32>, origin: vec2<f32>, band: vec4<i32>) -> Owner {
     var out: Owner;
     out.slot = 0u;
     out.blend = 1.0;
     out.read_at = p;
-    if b_n > a_n {
-        a = b;
-        a_n = b_n;
-        a_blend = b_blend;
-    }
-    if a != 0u && f32(a_n) + 1e-3 >= variants[a].cell_share * 16.0 {
-        out.slot = a;
-        out.blend = a_blend;
+    let t = vec2<i32>(floor((p - origin) / cell)) - band.xy;
+    let n = vec2<i32>(band.w & 0xffff, band.w >> 16u);
+    if band.z > 0 && all(t >= vec2<i32>(0)) && all(t < n) {
+        let held = textureLoad(snap_owners, vec2<i32>(t.x, t.y + band.z - 1), 0).r;
+        out.slot = held & 0xffffu;
+        out.blend = f32(held >> 16u) / 65535.0;
     }
     return out;
 }
@@ -472,12 +422,18 @@ fn grid_owner(p: vec2<f32>, cell: vec2<f32>, origin: vec2<f32>) -> Owner {
 // in the frame (#338) the variant holding the pixel's cell. A pixel of a
 // variant that cuts its silhouette to the pixel keeps its own; the pixel's
 // own variant's grid is asked first, then each snapping grid in turn.
+// Each answer is one texel of the snap owner pass's (#929): asking it here,
+// 16 mask loads a grid, was most of the 6 s FXC (DX12's compiler) spent on
+// this shader, since FXC inlines every call and every loop (#910). A
+// snapping pixel whose own grid got no band keeps its own pixel.
 fn resolve(p: vec2<f32>) -> Owner {
     var o: Owner;
     o.slot = 0u;
     o.blend = 1.0;
     o.read_at = p;
-    if u.variant_meta.x <= 1u {
+    // Far from every variant's draws (#507): no id here, nor in any cell
+    // or silhouette test this pixel would make
+    if u.variant_meta.x <= 1u || !in_mask_rect(p) {
         return o;
     }
     let m = mask_texel(p);
@@ -488,22 +444,32 @@ fn resolve(p: vec2<f32>) -> Owner {
     }
     var own_cell = vec2<f32>(-1.0);
     var own_origin = vec2<f32>(0.0);
+    var own_band = vec4<i32>(0);
     if o.slot != 0u {
         own_cell = variants[o.slot].cell;
         own_origin = variants[o.slot].origin;
-        let w = grid_owner(p, own_cell, own_origin);
-        if w.slot != 0u {
-            return w;
+        own_band = variants[o.slot].owner;
+        if own_band.z == 0 {
+            return o;
         }
     }
-    for (var g = 0u; g < min(u.variant_meta.w, MAX_SNAP_GRIDS); g++) {
-        let grid = u.snap_grids[g];
-        if all(grid.xy == own_cell) && all(grid.zw == own_origin) {
-            continue;
+    let grids = i32(min(u.variant_meta.w, MAX_SNAP_GRIDS));
+    for (var g = select(0, -1, o.slot != 0u); g < grids; g++) {
+        var cell = own_cell;
+        var origin = own_origin;
+        var band = own_band;
+        if g >= 0 {
+            let grid = u.snap_grids[g];
+            cell = grid.xy;
+            origin = grid.zw;
+            band = u.snap_bands[g];
         }
-        let w = grid_owner(p, grid.xy, grid.zw);
-        if w.slot != 0u {
-            return w;
+        // The own grid is asked once, first
+        if g < 0 || !(all(cell == own_cell) && all(origin == own_origin)) {
+            let w = held_cell(p, cell, origin, band);
+            if w.slot != 0u {
+                return w;
+            }
         }
     }
     // Nobody holds the cell: the whole frame's, and a dropped pixel of a
@@ -540,7 +506,7 @@ fn dissolve_place(slot: u32, p: vec2<f32>) -> f32 {
 fn shown_entity(p: vec2<i32>) -> vec3<f32> {
     let max_px = vec2<i32>(u.size) - vec2<i32>(1);
     let c = clamp(textureLoad(entity_input, clamp(p, vec2<i32>(0), max_px), 0).rgb, vec3<f32>(0.0), vec3<f32>(1.0));
-    return select(c, to_display(c), u.srgb == 1u);
+    return select(c, flint_to_display(c), u.srgb == 1u);
 }
 
 // The picture as it came, for pixels no style of this one's covers
@@ -657,8 +623,11 @@ fn variant_pixel(slot: u32, p: vec2<f32>) -> vec3<f32> {
 // Whether the pixel at `p`, of variant `slot`, lies within `width` output
 // pixels of a pixel of another slot: rings of the 8 compass neighbours at
 // each whole pixel out to the width (at most 4), the last at the width.
+// A ring's 8 reads are all made, not left at the first hit, so they are in
+// flight together (#507: 0.004 ms of a styled prop's 0.007 at 1080p)
 fn on_silhouette(slot: u32, p: vec2<f32>, width: f32) -> bool {
     let rings = min(i32(ceil(width)), 4);
+    var hit = false;
     for (var k = 1; k <= rings; k++) {
         let r = min(f32(k), width);
         for (var i = 0; i < 8; i++) {
@@ -669,12 +638,13 @@ fn on_silhouette(slot: u32, p: vec2<f32>, width: f32) -> bool {
             if (i & 1) == 1 {
                 d = sign(d);
             }
-            if slot_at(p + d * r) != slot {
-                return true;
-            }
+            hit = hit | (slot_at(p + d * r) != slot);
+        }
+        if hit {
+            break;
         }
     }
-    return false;
+    return hit;
 }
 
 @fragment
@@ -719,7 +689,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         let t = banded(tone(slot_luma(col, 0u)));
         out = shade(frame_look(), col, t, state.a, cell, local, edge_slot(cell, u.corners), 0.0);
     }
-    return vec4<f32>(select(out, to_linear(out), u.srgb == 1u), 1.0);
+    return vec4<f32>(select(out, flint_to_linear(out), u.srgb == 1u), 1.0);
 }
 
 // The glyph grid as text (#317): one fragment a screen-grid cell, the

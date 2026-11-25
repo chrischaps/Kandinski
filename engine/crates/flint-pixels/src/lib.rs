@@ -1,11 +1,13 @@
 //! The CPU loops over every texel of a texture on its way to the GPU: widening
 //! a decoded image to RGBA8 ([`to_rgba8`]) and box-filtering its mip chain
-//! ([`mip_chain`]).
+//! ([`mip_chain`]); and back, a read-back's rows packed as RGB8 for a PNG
+//! ([`rgb8_from_rows`]).
+
 //!
 //! They live in a crate of their own so the dev profile can build them
 //! optimized (#326). Unoptimized, they were three quarters of what a debug
 //! `flint render` spent loading a scene with two large models: 13.6 s of
-//! 18.6 s for `examples/style_mask.scene.toml`'s eight 2K and 4K textures,
+//! 18.6 s for `flint-examples/style_mask.scene.toml`'s eight 2K and 4K textures,
 //! against 4 s for decoding the files. Optimized, the eight cost 1.6 s.
 //! `flint-render`, which calls them, is the crate agents edit most, so it
 //! stays unoptimized and quick to rebuild; this one has no dependencies and
@@ -42,6 +44,30 @@ pub fn to_rgba8(data: &[u8], format: &str, width: u32, height: u32) -> Vec<u8> {
         "r8" => data.iter().flat_map(|&v| [v, v, v, 255]).collect(),
         _ => vec![255u8; pixel_count * 4],
     }
+}
+
+/// Tightly packed RGB8 from a GPU read-back of 8-bit, four-channel texels:
+/// `rows` of `row_bytes` each (padded to the copy alignment), `width` x
+/// `height` texels, BGRA swizzled when `bgra`, alpha dropped. The player's
+/// recording (#583) writes the window's frames with it: unoptimized, this
+/// loop took longer than the PNG encode.
+pub fn rgb8_from_rows(
+    rows: &[u8],
+    row_bytes: usize,
+    width: usize,
+    height: usize,
+    bgra: bool,
+) -> Vec<u8> {
+    let mut rgb = Vec::with_capacity(width * height * 3);
+    for row in rows.chunks(row_bytes).take(height) {
+        let texels = row[..width * 4].as_chunks::<4>().0;
+        if bgra {
+            rgb.extend(texels.iter().flat_map(|&[b, g, r, _]| [r, g, b]));
+        } else {
+            rgb.extend(texels.iter().flat_map(|&[r, g, b, _]| [r, g, b]));
+        }
+    }
+    rgb
 }
 
 /// Number of mip levels down to 1x1 for a `width` x `height` image.
@@ -93,8 +119,9 @@ pub fn memoize_mip_chains(on: bool) {
 }
 
 /// A 64-bit FNV-1a over the pixels, eight bytes a step: the memo's key
-/// with the size and colour space, cheap next to the chain it saves.
-fn fingerprint(bytes: &[u8]) -> u64 {
+/// with the size and colour space, cheap next to the chain it saves. Also
+/// the key flint-render keeps a texture on the device by (#961).
+pub fn fingerprint(bytes: &[u8]) -> u64 {
     let mut h = 0xcbf2_9ce4_8422_2325u64;
     let (words, rest) = bytes.as_chunks::<8>();
     for w in words {
@@ -185,6 +212,23 @@ fn build_mip_chain(rgba: &[u8], width: u32, height: u32, srgb: bool) -> (Vec<u8>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_padded_read_back_packs_to_rgb() {
+        // Two texels a row, padded to 12 bytes; two rows
+        let rows = [
+            1, 2, 3, 9, 4, 5, 6, 9, 0, 0, 0, 0, //
+            7, 8, 9, 9, 10, 11, 12, 9, 0, 0, 0, 0,
+        ];
+        assert_eq!(
+            rgb8_from_rows(&rows, 12, 2, 2, false),
+            [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+        );
+        assert_eq!(
+            rgb8_from_rows(&rows, 12, 2, 2, true),
+            [3, 2, 1, 6, 5, 4, 9, 8, 7, 12, 11, 10]
+        );
+    }
 
     /// The memo (#329) hands back what building would, and two textures
     /// differing in one byte don't share a chain.

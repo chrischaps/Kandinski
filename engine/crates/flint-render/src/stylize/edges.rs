@@ -33,6 +33,7 @@
 use super::kit;
 use super::targets::StyleTexture;
 use super::StyleFrame;
+use crate::gpu_counts::{CountedDevice, CountedQueue};
 use bytemuck::{Pod, Zeroable};
 use std::sync::Arc;
 
@@ -46,7 +47,7 @@ pub(crate) const EDGE_TARGET: &str = "style edges";
 pub const EDGE_LABEL: &str = "Style edges";
 
 /// The thresholds' floor, so a slider at 0 can't divide by it.
-const MIN_THRESHOLD: f32 = 1e-3;
+pub(crate) const MIN_THRESHOLD: f32 = 1e-3;
 
 #[repr(C)]
 #[derive(Copy, Clone, Pod, Zeroable)]
@@ -60,7 +61,10 @@ struct EdgeUniforms {
 
 /// The pipeline, made the first time a style needs edges.
 pub(crate) struct EdgePass {
-    pipeline: wgpu::RenderPipeline,
+    pipeline: std::sync::Arc<wgpu::RenderPipeline>,
+    /// The depth steps alone (`fs_steps`, #743), for a frame no reader
+    /// asks creases of.
+    steps_pipeline: std::sync::Arc<wgpu::RenderPipeline>,
     uniforms: wgpu::Buffer,
     uniform_bgl: wgpu::BindGroupLayout,
     depth_bgl: wgpu::BindGroupLayout,
@@ -82,32 +86,58 @@ impl EdgePass {
                 count: None,
             }],
         });
-        let pipeline = kit::fullscreen_pipeline(
+        let shader = kit::shader(
             device,
-            "Style Edges Pipeline",
-            &kit::shader(device, "Style Edges Shader", kit::wgsl!("edges.wgsl")),
-            &[&uniform_bgl, &depth_bgl],
-            EDGE_FORMAT,
+            "Style Edges Shader",
+            kit::wgsl!("prelude_core.wgsl", "edges.wgsl"),
         );
+        let pipeline = |label: &str, entry: &str| {
+            kit::fullscreen_pipeline_entry(
+                device,
+                label,
+                &shader,
+                entry,
+                &[&uniform_bgl, &depth_bgl],
+                EDGE_FORMAT,
+            )
+        };
         Self {
-            pipeline,
+            pipeline: pipeline("Style Edges Pipeline", "fs_main"),
+            steps_pipeline: pipeline("Style Edge Steps Pipeline", "fs_steps"),
             uniforms: kit::uniform_buffer::<EdgeUniforms>(device, "Style Edges Uniforms"),
             uniform_bgl,
             depth_bgl,
         }
     }
 
+    /// The chain's edge target at the depth's size, made the first time:
+    /// what [`encode`](Self::encode) draws into, and what readers get as it
+    /// was last drawn while a pass knob skips the pass (#1317).
+    pub(crate) fn target(frame: &StyleFrame<'_>) -> Arc<StyleTexture> {
+        let [w, h] = frame.depth_size;
+        frame
+            .targets
+            .get(frame.device, EDGE_TARGET, EDGE_FORMAT, w, h)
+    }
+
     /// Draw this frame's edges from `frame`'s depth and camera into the
-    /// chain's edge target, and return it.
+    /// chain's edge target, and return it: with the creases, or (`creases`
+    /// false, every reader's need [`StyleNeed::EdgeSteps`]) the depth steps
+    /// alone, g left 0.
+    ///
+    /// [`StyleNeed::EdgeSteps`]: super::StyleNeed::EdgeSteps
+    ///
+    /// Inside `rect` (depth pixels; `None` the whole frame) when every
+    /// reader reads only near its entities, 0 outside it.
     pub(crate) fn encode(
         &self,
         frame: &StyleFrame<'_>,
         encoder: &mut wgpu::CommandEncoder,
+        creases: bool,
+        rect: Option<kit::PixelRect>,
     ) -> Arc<StyleTexture> {
         let [w, h] = frame.depth_size;
-        let target = frame
-            .targets
-            .get(frame.device, EDGE_TARGET, EDGE_FORMAT, w, h);
+        let target = Self::target(frame);
         let uniforms = EdgeUniforms {
             inv_view_proj: frame.camera.inv_view_proj,
             camera_pos: frame.camera.position,
@@ -117,24 +147,32 @@ impl EdgePass {
         };
         frame
             .queue
-            .write_buffer(&self.uniforms, 0, bytemuck::cast_slice(&[uniforms]));
+            .write_buffer_counted(&self.uniforms, 0, bytemuck::cast_slice(&[uniforms]));
         let uniform_bg = frame.uniform("Style Edges Uniform BG", &self.uniform_bgl, &self.uniforms);
         let depth_bg = frame.depth_bind("Style Edges Depth BG", 0, || {
-            frame.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("Style Edges Depth BG"),
-                layout: &self.depth_bgl,
-                entries: &[wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(frame.depth),
-                }],
-            })
+            frame
+                .device
+                .create_bind_group_counted(&wgpu::BindGroupDescriptor {
+                    label: Some("Style Edges Depth BG"),
+                    layout: &self.depth_bgl,
+                    entries: &[wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(frame.depth),
+                    }],
+                })
         });
-        kit::fullscreen_pass(
+        kit::fullscreen_pass_in(
             encoder,
             "Style Edges Pass",
             &target.view,
-            &self.pipeline,
+            [w, h],
+            if creases {
+                &self.pipeline
+            } else {
+                &self.steps_pipeline
+            },
             &[&uniform_bg, &depth_bg],
+            rect,
         );
         target
     }

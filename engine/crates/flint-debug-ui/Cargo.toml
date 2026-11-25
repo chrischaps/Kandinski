@@ -14,12 +14,20 @@ living = ["dep:flint-procgen"]
 
 [dependencies]
 flint-core = { workspace = true }
-flint-wooze = { workspace = true }
 flint-geometry = { workspace = true }
 flint-render = { workspace = true }
 flint-terrain = { workspace = true }
 flint-scene = { workspace = true }
+flint-ecs = { workspace = true }
+flint-particles = { workspace = true }
+flint-schema = { workspace = true }
+wgpu = { workspace = true }
 flint-procgen = { workspace = true, optional = true }
 egui = { workspace = true }
 toml = { workspace = true }
 tracing = { workspace = true }
+
+# egui frames go through run_headless_frame in tests; the list is the
+# workspace clippy.toml (#944), denied workspace-wide (#979).
+[lints]
+workspace = true

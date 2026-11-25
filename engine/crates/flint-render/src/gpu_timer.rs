@@ -18,6 +18,7 @@
 //! scopes its own phases; hosts add theirs through
 //! [`SceneRenderer::gpu_timer_mut`](crate::SceneRenderer::gpu_timer_mut).
 
+use crate::gpu_counts::CountedDevice;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
 
@@ -27,6 +28,10 @@ pub const MAX_SCOPES: u32 = 32;
 /// Read-backs in flight at once. A frame that finds them all busy is not
 /// timed, so the figures come from at most every frame but never stall.
 const READBACKS: usize = 3;
+
+/// Frames [`GpuTimer::tally`] keeps at most: an hour at 60 fps, about
+/// 80 MB at twenty scopes a frame.
+pub const TALLY_FRAMES: usize = 216_000;
 
 /// How much of each new frame's time goes into the smoothed figure.
 const SMOOTHING: f32 = 0.1;
@@ -49,11 +54,157 @@ pub struct GpuTimings {
     pub frame_ms: f32,
 }
 
+/// One frame's scopes as measured, for a trace (#1097): each scope's start
+/// from the frame's first timestamp and its length, unsmoothed, under the
+/// tag the host gave the frame ([`GpuTimer::set_frame_tag`]), so a trace
+/// can lay a read-back a frame or two late beside the frame that drew it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TracedGpuFrame {
+    pub tag: u64,
+    pub passes: Vec<TracedPass>,
+}
+
+/// One scope of a [`TracedGpuFrame`], ms.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TracedPass {
+    pub label: &'static str,
+    /// From the frame's first timestamp to this scope's first.
+    pub start_ms: f32,
+    pub ms: f32,
+}
+
+/// Traced frames kept for the host to take; more and the oldest go.
+const TRACED_KEPT: usize = 16;
+
+/// One frame's GPU busy time, ms and unsmoothed, under the index the host
+/// gave the frame when it was resolved ([`GpuTimer::set_frame_index`]), so
+/// the host can lay it on the frame it timed rather than the one it came
+/// back in (#1104). Read-backs come back a frame or two late, and not
+/// always in the order the frames were drawn.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct GpuFrameTime {
+    /// The host's index for the frame; `None` when it gave none.
+    pub index: Option<u64>,
+    pub ms: f32,
+}
+
+/// Frame times kept for the host to take; more and the oldest go.
+const FRAME_TIMES_KEPT: usize = 16;
+
+/// Frames read back before [`TimestampCheck`] gives a verdict, and again
+/// for each one after: a second at 60 fps.
+pub const TIMESTAMP_WINDOW: u32 = 60;
+
+/// Whether an adapter's timestamps read as pass times (#1316).
+///
+/// On the Pixel 8 Pro (Mali-G715, Chrome) every scope after `Scene` reads
+/// exactly zero ticks, frame after frame, so a readout would list zeros
+/// that look like an answer. A real pass is never exactly zero ticks for a
+/// whole window: an empty one is ~2 us (#507), thousands of ticks, and
+/// even a browser that rounds timestamps to 100 us reads a small pass as
+/// non-zero on the frames it straddles a step.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum TimestampHealth {
+    /// Fewer than [`TIMESTAMP_WINDOW`] frames read back yet: the times are
+    /// shown as they are.
+    #[default]
+    Unchecked,
+    /// The last window's scopes read as times.
+    Usable,
+    /// In the last window, `zero` of its `scopes` read exactly zero ticks
+    /// in every frame that timed them: at least two, and at least half.
+    Unusable { zero: u32, scopes: u32 },
+}
+
+impl TimestampHealth {
+    /// Whether the pass times are known to be empty, so a reader should say
+    /// so instead of listing them.
+    pub fn unusable(self) -> bool {
+        matches!(self, TimestampHealth::Unusable { .. })
+    }
+
+    /// Why, for a reader with room for a clause: `None` while the times
+    /// can be shown.
+    pub fn why(self) -> Option<String> {
+        match self {
+            TimestampHealth::Unusable { zero, scopes } => Some(format!(
+                "{zero} of {scopes} scopes read 0 ticks for {TIMESTAMP_WINDOW} frames"
+            )),
+            _ => None,
+        }
+    }
+}
+
+/// What every reader says in place of the pass times (#1316).
+pub const TIMESTAMPS_UNAVAILABLE: &str = "GPU pass times unavailable on this adapter";
+
+/// Judges [`TimestampHealth`] from the raw frames read back, a window of
+/// [`TIMESTAMP_WINDOW`] at a time; once warm it allocates nothing.
+#[derive(Debug, Clone, Default)]
+pub struct TimestampCheck {
+    /// Frames observed in the window under way.
+    frames: u32,
+    /// Each scope (label, which of that label in its frame) seen in the
+    /// window, and whether every frame that timed it read exactly zero.
+    scopes: Vec<(&'static str, usize, bool)>,
+    verdict: TimestampHealth,
+}
+
+impl TimestampCheck {
+    /// Fold in one frame as measured (unsmoothed: a smoothed time decays
+    /// toward zero but never reaches it). A frame's time is zero only when
+    /// its two ticks are the same, so this is a test on raw ticks.
+    pub fn observe(&mut self, frame: &GpuTimings) {
+        if frame.passes.is_empty() {
+            return;
+        }
+        for (i, pass) in frame.passes.iter().enumerate() {
+            let nth = frame.passes[..i]
+                .iter()
+                .filter(|p| p.label == pass.label)
+                .count();
+            let zero = pass.ms == 0.0;
+            match self
+                .scopes
+                .iter_mut()
+                .find(|(l, n, _)| *l == pass.label && *n == nth)
+            {
+                Some((_, _, all_zero)) => *all_zero &= zero,
+                None => self.scopes.push((pass.label, nth, zero)),
+            }
+        }
+        self.frames += 1;
+        if self.frames >= TIMESTAMP_WINDOW {
+            let scopes = self.scopes.len() as u32;
+            let zero = self.scopes.iter().filter(|s| s.2).count() as u32;
+            self.verdict = if zero >= 2 && zero * 2 >= scopes {
+                TimestampHealth::Unusable { zero, scopes }
+            } else {
+                TimestampHealth::Usable
+            };
+            self.frames = 0;
+            self.scopes.clear();
+        }
+    }
+
+    /// The last whole window's verdict.
+    pub fn verdict(&self) -> TimestampHealth {
+        self.verdict
+    }
+}
+
 /// A scope [`GpuTimer::begin`] opened, to hand back to [`GpuTimer::end`].
 /// One past the frame's capacity times nothing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[must_use = "a scope is timed only once ended"]
 pub struct GpuScope(Option<u32>);
+
+impl GpuScope {
+    /// Whether the frame had room to time it ([`MAX_SCOPES`]).
+    pub fn is_timed(self) -> bool {
+        self.0.is_some()
+    }
+}
 
 struct Scope {
     label: &'static str,
@@ -71,6 +222,14 @@ struct Readback {
     /// Whether recording was on when this frame was resolved, so a frame
     /// drawn before [`GpuTimer::record`] and read back after isn't kept.
     record: bool,
+    /// The same for the run's tally ([`GpuTimer::tally`]).
+    tally: bool,
+    /// The host's tag for the frame, and whether tracing was on when it
+    /// was resolved.
+    tag: u64,
+    trace: bool,
+    /// The host's index for the frame ([`GpuTimer::set_frame_index`]).
+    index: Option<u64>,
     /// 0 while the map is pending, 1 mapped, 2 failed
     state: Arc<AtomicU8>,
 }
@@ -90,6 +249,22 @@ pub struct GpuTimer {
     /// Every frame read back, raw, while [`record`](Self::record) is on
     /// (#292); `None` keeps nothing, so a long-running player doesn't grow.
     recorded: Option<Vec<GpuTimings>>,
+    /// Every frame read back while [`tally`](Self::tally) is on: a whole
+    /// run's, for a perf report (#1093). Apart from `recorded`, which a
+    /// frame capture turns on and off around its one frame.
+    tallied: Option<Vec<GpuTimings>>,
+    /// Each frame read back since the last
+    /// [`take_frame_times`](Self::take_frame_times), oldest first.
+    frame_times: std::collections::VecDeque<GpuFrameTime>,
+    /// What [`set_frame_tag`](Self::set_frame_tag) said last.
+    frame_tag: u64,
+    /// What [`set_frame_index`](Self::set_frame_index) said last.
+    frame_index: Option<u64>,
+    /// Frames read back while [`trace`](Self::trace) is on, until
+    /// [`take_traced`](Self::take_traced) takes them.
+    traced: Option<std::collections::VecDeque<TracedGpuFrame>>,
+    /// Whether the timestamps read as times at all (#1316).
+    check: TimestampCheck,
 }
 
 impl GpuTimer {
@@ -111,7 +286,7 @@ impl GpuTimer {
             ty: wgpu::QueryType::Timestamp,
             count: queries,
         });
-        let resolve = device.create_buffer(&wgpu::BufferDescriptor {
+        let resolve = device.create_buffer_counted(&wgpu::BufferDescriptor {
             label: Some("GPU Timer Resolve"),
             size,
             usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC,
@@ -119,7 +294,7 @@ impl GpuTimer {
         });
         let readbacks = (0..READBACKS)
             .map(|_| Readback {
-                buffer: device.create_buffer(&wgpu::BufferDescriptor {
+                buffer: device.create_buffer_counted(&wgpu::BufferDescriptor {
                     label: Some("GPU Timer Read-back"),
                     size,
                     usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
@@ -129,6 +304,10 @@ impl GpuTimer {
                 count: 0,
                 in_flight: false,
                 record: false,
+                tally: false,
+                tag: 0,
+                trace: false,
+                index: None,
                 state: Default::default(),
             })
             .collect();
@@ -141,6 +320,12 @@ impl GpuTimer {
             timings: GpuTimings::default(),
             resolved: None,
             recorded: None,
+            tallied: None,
+            frame_times: std::collections::VecDeque::with_capacity(FRAME_TIMES_KEPT),
+            frame_tag: 0,
+            frame_index: None,
+            traced: None,
+            check: TimestampCheck::default(),
         })
     }
 
@@ -149,6 +334,60 @@ impl GpuTimer {
     /// spread, which [`spread`] makes of [`recorded`](Self::recorded).
     pub fn record(&mut self, on: bool) {
         self.recorded = on.then(Vec::new);
+    }
+
+    /// Keep every frame's raw times from now on for the run's tally, or
+    /// stop and drop them (#1093). Apart from [`record`](Self::record), so a
+    /// frame capture in the middle of a run neither clears nor joins it. At
+    /// most [`TALLY_FRAMES`] are kept; the frames after are left out.
+    pub fn tally(&mut self, on: bool) {
+        self.tallied = on.then(Vec::new);
+    }
+
+    /// Whether the run's tally is on.
+    pub fn tallying(&self) -> bool {
+        self.tallied.is_some()
+    }
+
+    /// The frames [`tally`](Self::tally) kept, oldest first.
+    pub fn tallied(&self) -> &[GpuTimings] {
+        self.tallied.as_deref().unwrap_or(&[])
+    }
+
+    /// Keep each frame read back from now on as a [`TracedGpuFrame`], for a
+    /// trace (#1097), or stop. Turning it on again keeps what waits.
+    pub fn trace(&mut self, on: bool) {
+        if !on {
+            self.traced = None;
+        } else if self.traced.is_none() {
+            self.traced = Some(Default::default());
+        }
+    }
+
+    /// The tag the frames resolved from now on carry (the host's frame
+    /// index), until it says another.
+    pub fn set_frame_tag(&mut self, tag: u64) {
+        self.frame_tag = tag;
+    }
+
+    /// The index the frames resolved from now on carry back with their
+    /// times ([`GpuFrameTime::index`]): the host's number for the frame
+    /// under way, said once a frame before
+    /// [`resolve_into`](Self::resolve_into) or
+    /// [`finish_frame`](Self::finish_frame), and kept until it says
+    /// another. Apart from [`set_frame_tag`](Self::set_frame_tag), whose
+    /// number is a trace's.
+    pub fn set_frame_index(&mut self, index: Option<u64>) {
+        self.frame_index = index;
+    }
+
+    /// The traced frames read back since the last take, oldest first: at
+    /// most the last 16, so a host that takes once a frame misses none.
+    pub fn take_traced(&mut self) -> Vec<TracedGpuFrame> {
+        self.traced
+            .as_mut()
+            .map(|t| t.drain(..).collect())
+            .unwrap_or_default()
     }
 
     /// The frames resolved since [`record`](Self::record) was turned on and
@@ -163,7 +402,7 @@ impl GpuTimer {
     /// loop: it blocks on the GPU.
     pub fn flush(&mut self, device: &wgpu::Device) {
         if self.readbacks.iter().any(|r| r.in_flight) {
-            device.poll(wgpu::Maintain::Wait);
+            let _ = crate::wait_for_gpu(device);
         }
         self.poll(device);
     }
@@ -274,6 +513,10 @@ impl GpuTimer {
         readback.count = count;
         readback.in_flight = true;
         readback.record = self.recorded.is_some();
+        readback.tally = self.tallied.is_some();
+        readback.tag = self.frame_tag;
+        readback.trace = self.traced.is_some();
+        readback.index = self.frame_index;
         readback.state.store(0, Ordering::Release);
         self.resolved = Some(slot);
         true
@@ -295,9 +538,26 @@ impl GpuTimer {
             });
     }
 
+    /// Every frame read back since the last take, in the order they came
+    /// back, each with the index it was resolved under: a frame's own
+    /// figure for the player's frame history (#1076, #1104). A read-back
+    /// is a frame or two late, so each belongs to an earlier frame than the
+    /// one taking it; none come on some frames and two on others. At most
+    /// the last 16 wait, so a host that takes once a frame misses none.
+    pub fn take_frame_times(&mut self) -> std::collections::vec_deque::Drain<'_, GpuFrameTime> {
+        self.frame_times.drain(..)
+    }
+
     /// The smoothed times of the frames read back so far.
     pub fn timings(&self) -> &GpuTimings {
         &self.timings
+    }
+
+    /// Whether those times can be read as pass times (#1316): a reader
+    /// says [`TIMESTAMPS_UNAVAILABLE`] in place of a list of zeros when
+    /// they can't.
+    pub fn timestamps(&self) -> TimestampHealth {
+        self.check.verdict()
     }
 
     /// Fold in every read-back that has come in. Polls without blocking.
@@ -305,7 +565,7 @@ impl GpuTimer {
         if !self.readbacks.iter().any(|r| r.in_flight) {
             return;
         }
-        device.poll(wgpu::Maintain::Poll);
+        let _ = device.poll(wgpu::PollType::Poll);
         for readback in &mut self.readbacks {
             if !readback.in_flight {
                 continue;
@@ -314,14 +574,40 @@ impl GpuTimer {
                 1 => {
                     let bytes = readback.count as u64 * wgpu::QUERY_SIZE as u64;
                     let ticks: Vec<u64> = {
-                        let data = readback.buffer.slice(..bytes).get_mapped_range();
+                        let data = readback
+                            .buffer
+                            .slice(..bytes)
+                            .get_mapped_range()
+                            .expect("mapped buffer range");
                         bytemuck::pod_collect_to_vec(&data)
                     };
                     readback.buffer.unmap();
                     readback.in_flight = false;
+                    if let (Some(traced), true) = (&mut self.traced, readback.trace) {
+                        if traced.len() >= TRACED_KEPT {
+                            traced.pop_front();
+                        }
+                        traced.push_back(TracedGpuFrame {
+                            tag: readback.tag,
+                            passes: traced_times(&readback.labels, &ticks, self.period_ns),
+                        });
+                    }
                     let frame = frame_times(&readback.labels, &ticks, self.period_ns);
+                    self.check.observe(&frame);
+                    if self.frame_times.len() >= FRAME_TIMES_KEPT {
+                        self.frame_times.pop_front();
+                    }
+                    self.frame_times.push_back(GpuFrameTime {
+                        index: readback.index,
+                        ms: frame.frame_ms,
+                    });
                     if let (Some(recorded), true) = (&mut self.recorded, readback.record) {
                         recorded.push(frame.clone());
+                    }
+                    if let (Some(tallied), true) = (&mut self.tallied, readback.tally) {
+                        if tallied.len() < TALLY_FRAMES {
+                            tallied.push(frame.clone());
+                        }
                     }
                     smooth(&mut self.timings, frame);
                 }
@@ -362,6 +648,29 @@ fn frame_times(labels: &[&'static str], ticks: &[u64], period_ns: f32) -> GpuTim
     }
     let frame_ms = passes.iter().map(|p| p.ms).sum();
     GpuTimings { passes, frame_ms }
+}
+
+/// One frame's scopes laid from its first timestamp, as
+/// [`frame_times`] reads them.
+fn traced_times(labels: &[&'static str], ticks: &[u64], period_ns: f32) -> Vec<TracedPass> {
+    let ms = |ticks: u64| (ticks as f64 * period_ns as f64 / 1e6) as f32;
+    let pairs: Vec<(&'static str, u64, u64)> = labels
+        .iter()
+        .enumerate()
+        .map_while(|(i, label)| Some((*label, *ticks.get(2 * i)?, *ticks.get(2 * i + 1)?)))
+        .filter(|&(_, start, end)| start != 0 && end >= start)
+        .collect();
+    let Some(base) = pairs.iter().map(|&(_, start, _)| start).min() else {
+        return Vec::new();
+    };
+    pairs
+        .into_iter()
+        .map(|(label, start, end)| TracedPass {
+            label,
+            start_ms: ms(start - base),
+            ms: ms(end - start),
+        })
+        .collect()
 }
 
 /// One scope's times over many frames (#292), in milliseconds. A
@@ -414,6 +723,28 @@ impl PassSpread {
     }
 }
 
+impl PassSpread {
+    /// The pass as JSON (#1093), the shape every Flint perf file shares
+    /// (`flint render --gpu-time-json`, `flint-player --perf-report`):
+    /// `label`, `frames`, `min_ms`, `p50_ms`, `p90_ms`, `max_ms`, `mean_ms`,
+    /// and with `samples` each frame's time as `samples_ms`.
+    pub fn to_json(&self, samples: bool) -> serde_json::Value {
+        let mut v = serde_json::json!({
+            "label": self.name(),
+            "frames": self.samples.len(),
+            "min_ms": self.min,
+            "p50_ms": self.p50,
+            "p90_ms": self.p90,
+            "max_ms": self.max,
+            "mean_ms": self.mean,
+        });
+        if samples {
+            v["samples_ms"] = serde_json::json!(self.samples);
+        }
+        v
+    }
+}
+
 /// Every scope's [`PassSpread`] over a run of frames, and the frame total's.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct GpuSpread {
@@ -425,6 +756,19 @@ pub struct GpuSpread {
     pub passes: Vec<PassSpread>,
     /// Each frame's total ([`GpuTimings::frame_ms`]); `None` with no frames.
     pub frame: Option<PassSpread>,
+}
+
+impl GpuSpread {
+    /// The spread as JSON (#1093): `frames_kept`, `frames_dropped`,
+    /// `passes` (each [`PassSpread::to_json`]) and `frame`, the total's.
+    pub fn to_json(&self, samples: bool) -> serde_json::Value {
+        serde_json::json!({
+            "frames_kept": self.frames,
+            "frames_dropped": self.dropped,
+            "passes": self.passes.iter().map(|p| p.to_json(samples)).collect::<Vec<_>>(),
+            "frame": self.frame.as_ref().map(|f| f.to_json(samples)),
+        })
+    }
 }
 
 /// The spread of `frames` (raw, from [`GpuTimer::recorded`]) after leaving
@@ -508,6 +852,29 @@ mod tests {
     }
 
     #[test]
+    fn a_traced_frame_lays_each_scope_from_its_first_timestamp() {
+        // b was never written (0): left out, as frame_times leaves it
+        let ticks = [5_000_000, 7_000_000, 0, 0, 8_000_000, 9_500_000];
+        let passes = traced_times(&["a", "b", "c"], &ticks, 1.0);
+        assert_eq!(
+            passes,
+            [
+                TracedPass {
+                    label: "a",
+                    start_ms: 0.0,
+                    ms: 2.0
+                },
+                TracedPass {
+                    label: "c",
+                    start_ms: 3.0,
+                    ms: 1.5
+                }
+            ]
+        );
+        assert!(traced_times(&["a"], &[0, 0], 1.0).is_empty());
+    }
+
+    #[test]
     fn unwritten_or_backward_scopes_are_left_out() {
         let ticks = [0, 5, 9, 7, 10, 30];
         let frame = frame_times(&["unwritten", "backward", "ok"], &ticks, 2.0);
@@ -575,6 +942,112 @@ mod tests {
         let spread = spread(&[timed(&[("a", 1.0)])], 5);
         assert_eq!((spread.frames, spread.dropped), (0, 1));
         assert!(spread.passes.is_empty() && spread.frame.is_none());
+    }
+
+    /// The Pixel 8 Pro's frames (#1316): Shadows and Scene take time, every
+    /// scope after them reads exactly zero ticks.
+    fn mali_frame(scene_ms: f32) -> GpuTimings {
+        timed(&[
+            ("Shadows", 0.8),
+            ("Scene", scene_ms),
+            ("Bloom", 0.0),
+            ("ASCII", 0.0),
+            ("Composite", 0.0),
+            ("World lines", 0.0),
+            ("UI", 0.0),
+        ])
+    }
+
+    fn checked(frames: impl IntoIterator<Item = GpuTimings>) -> TimestampHealth {
+        let mut check = TimestampCheck::default();
+        for frame in frames {
+            check.observe(&frame);
+        }
+        check.verdict()
+    }
+
+    #[test]
+    fn later_scopes_reading_zero_ticks_for_a_window_are_unusable() {
+        let window = TIMESTAMP_WINDOW as usize;
+        let mali = (0..window).map(|i| mali_frame(6.0 + i as f32 * 0.01));
+        assert_eq!(
+            checked(mali),
+            TimestampHealth::Unusable { zero: 5, scopes: 7 }
+        );
+        let early = (0..window - 1).map(|_| mali_frame(6.0));
+        assert_eq!(
+            checked(early),
+            TimestampHealth::Unchecked,
+            "no verdict before a whole window"
+        );
+        let why = TimestampHealth::Unusable { zero: 5, scopes: 7 }.why();
+        assert_eq!(
+            why.as_deref(),
+            Some("5 of 7 scopes read 0 ticks for 60 frames")
+        );
+        assert_eq!(TimestampHealth::Usable.why(), None);
+    }
+
+    #[test]
+    fn real_times_are_usable_even_with_tiny_or_rounded_scopes() {
+        let window = TIMESTAMP_WINDOW as usize;
+        // The test is on raw ticks: only equal ticks read zero, one tick
+        // apart does not
+        let one_tick = frame_times(&["a", "b"], &[10, 10, 20, 21], 1.0);
+        assert_eq!(one_tick.passes[0].ms, 0.0, "equal ticks read zero");
+        assert!(one_tick.passes[1].ms > 0.0, "one tick reads above zero");
+        // A desktop frame: an empty World lines pass is ~2 us
+        let desktop = (0..window).map(|_| {
+            timed(&[
+                ("Shadows", 0.31),
+                ("Scene", 1.92),
+                ("Bloom", 0.12),
+                ("Composite", 0.04),
+                ("World lines", 0.002),
+                ("UI", 0.05),
+            ])
+        });
+        assert_eq!(checked(desktop), TimestampHealth::Usable);
+
+        // A browser rounding to 100 us: the small scopes read 0 on most
+        // frames, but not on every one of them, and an always-zero one
+        // alone isn't most of the frame
+        let rounded = (0..window).map(|i| {
+            let step = |every: usize| if i % every == 0 { 0.1 } else { 0.0 };
+            timed(&[
+                ("Scene", 1.9),
+                ("Bloom", step(4)),
+                ("Composite", step(9)),
+                ("World lines", 0.0),
+                ("UI", step(3)),
+            ])
+        });
+        assert_eq!(checked(rounded), TimestampHealth::Usable);
+
+        // One non-zero read of the later scopes clears them for the window
+        let mut frames: Vec<GpuTimings> = (0..window).map(|_| mali_frame(6.0)).collect();
+        for p in &mut frames[30].passes[2..] {
+            p.ms = 0.05;
+        }
+        assert_eq!(checked(frames), TimestampHealth::Usable);
+    }
+
+    #[test]
+    fn each_window_judges_afresh() {
+        let window = TIMESTAMP_WINDOW as usize;
+        let mut check = TimestampCheck::default();
+        for _ in 0..window {
+            check.observe(&mali_frame(6.0));
+        }
+        assert!(check.verdict().unusable());
+        // The scene changes and the passes read as times again
+        for _ in 0..window {
+            check.observe(&timed(&[("Scene", 2.0), ("Composite", 0.1), ("UI", 0.2)]));
+        }
+        assert_eq!(check.verdict(), TimestampHealth::Usable);
+        // An untimed frame isn't counted
+        check.observe(&GpuTimings::default());
+        assert_eq!(check.frames, 0);
     }
 
     #[test]

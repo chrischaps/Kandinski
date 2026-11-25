@@ -4,6 +4,8 @@
 //!
 //! These need a GPU adapter. Without one each test prints a note and passes.
 
+#![allow(clippy::disallowed_methods)] // the test's own targets and read-backs, not the renderer's, so uncounted (#1091)
+
 mod shared_gpu;
 
 use flint_ecs::FlintWorld;
@@ -22,10 +24,11 @@ struct Gpu {
     _lease: shared_gpu::Lease,
 }
 
-/// The shared device (#598), with no other test on it: every frame here
-/// is drawn in an error scope, and wgpu 23 keeps those per device.
+/// The shared device (#598), alongside the other tests holding it. Every
+/// frame here is drawn in an error scope, which since wgpu 28 is this
+/// thread's alone.
 fn gpu() -> Option<Gpu> {
-    shared_gpu::lease_alone().map(frame_for)
+    shared_gpu::lease().map(frame_for)
 }
 
 fn frame_for(lease: shared_gpu::Lease) -> Gpu {
@@ -144,8 +147,39 @@ impl Gpu {
     /// Panics on any validation error, which is what a pipeline left at
     /// the wrong sample count, or a target at the wrong size, would give.
     fn frame(&self, renderer: &mut SceneRenderer, world: &FlintWorld) -> Vec<u8> {
-        self.device.push_error_scope(wgpu::ErrorFilter::Validation);
-        renderer.update_from_world(world, self.device);
+        self.frame_of(renderer, world, &Extras::default())
+    }
+
+    /// [`frame`](Self::frame) with the frame's shallow wooze and particles,
+    /// which every frame hands over again (#739).
+    fn frame_of(
+        &self,
+        renderer: &mut SceneRenderer,
+        world: &FlintWorld,
+        extras: &Extras,
+    ) -> Vec<u8> {
+        let scope = self.device.push_error_scope(wgpu::ErrorFilter::Validation);
+        renderer.prepare(
+            self.device,
+            self.queue,
+            world,
+            &flint_render::FrameInputs {
+                shallow_wooze: &extras.shallow,
+                ..Default::default()
+            },
+        );
+        if !extras.particles.is_empty() {
+            renderer.update_particles(
+                self.device,
+                self.queue,
+                &[flint_render::ParticleDrawData {
+                    instances: &extras.particles,
+                    texture: "",
+                    blend: flint_render::ParticleBlendMode::Additive,
+                    sort_key: 0.0,
+                }],
+            );
+        }
         renderer.render_to(
             self.device,
             self.queue,
@@ -154,7 +188,7 @@ impl Gpu {
             &self.color_view,
         );
         let pixels = self.read();
-        if let Some(e) = pollster::block_on(self.device.pop_error_scope()) {
+        if let Some(e) = pollster::block_on(scope.pop()) {
             panic!("validation error at {:?}: {e}", renderer.quality());
         }
         pixels
@@ -172,9 +206,9 @@ impl Gpu {
         let mut encoder = self.device.create_command_encoder(&Default::default());
         encoder.copy_texture_to_buffer(
             self.color.as_image_copy(),
-            wgpu::ImageCopyBuffer {
+            wgpu::TexelCopyBufferInfo {
                 buffer: &buffer,
-                layout: wgpu::ImageDataLayout {
+                layout: wgpu::TexelCopyBufferLayout {
                     offset: 0,
                     bytes_per_row: Some(row),
                     rows_per_image: None,
@@ -190,8 +224,11 @@ impl Gpu {
         buffer
             .slice(..)
             .map_async(wgpu::MapMode::Read, |r| r.unwrap());
-        self.device.poll(wgpu::Maintain::Wait);
-        let data = buffer.slice(..).get_mapped_range();
+        let _ = flint_render::wait_for_gpu(&self.device);
+        let data = buffer
+            .slice(..)
+            .get_mapped_range()
+            .expect("mapped buffer range");
         let mut out = Vec::with_capacity((SIZE * SIZE * 4) as usize);
         for y in 0..SIZE {
             let at = (row * y) as usize;
@@ -361,7 +398,7 @@ fn each_setting_changes_what_is_drawn() {
     );
 
     // FLINT_QUALITY_PNG=<dir> writes the frames, to look at.
-    if let Ok(dir) = std::env::var("FLINT_QUALITY_PNG") {
+    if let Some(dir) = flint_core::env::QUALITY_PNG.path() {
         let frames = [
             ("base", &base),
             ("msaa", &msaa),
@@ -372,7 +409,7 @@ fn each_setting_changes_what_is_drawn() {
             ("one_cascade_40m", &one_near),
         ];
         for (name, px) in frames {
-            let path = format!("{dir}/{name}.png");
+            let path = dir.join(format!("{name}.png"));
             image::save_buffer(path, px, SIZE, SIZE, image::ColorType::Rgba8).unwrap();
         }
     }
@@ -454,6 +491,58 @@ fn the_shadow_settings_hold_through_a_resolution_change() {
     assert_eq!(renderer.collect_stats().shadow_draw_calls, 0);
 }
 
+/// The distance levers are quality keys (#1149): `set_quality` moves what
+/// the LOD cull draws, and `set_lod_settings` (a script's `set_lod_scale`)
+/// is read back through `quality()`, so the two are one state.
+#[test]
+fn the_distance_levers_are_quality_keys() {
+    let gpu = gpu_or_skip!();
+    let (mut renderer, mut world) = scene(&gpu);
+    // The slab stops drawing 4 m out; the default camera is about 15 m away
+    let slab = world.get_id("slab").unwrap();
+    let mut lod = toml::Table::new();
+    lod.insert("draw_distance".into(), 4.0.into());
+    world.set_component(slab, "lod", lod.into()).unwrap();
+
+    let plain = gpu.frame(&mut renderer, &world);
+    assert_eq!(
+        renderer.collect_stats().lod_culled_draws,
+        1,
+        "past its draw distance"
+    );
+
+    let far = QualitySettings {
+        draw_distance_scale: 10.0,
+        lod_scale: 0.5,
+        ..*renderer.quality()
+    };
+    let applied = renderer.set_quality(gpu.device, &far);
+    assert_eq!(
+        (applied.lod_scale, applied.draw_distance_scale),
+        (0.5, 10.0)
+    );
+    let s = renderer.lod_settings();
+    assert_eq!((s.lod_scale, s.draw_distance_scale), (0.5, 10.0));
+    let drawn = gpu.frame(&mut renderer, &world);
+    assert_eq!(
+        renderer.collect_stats().lod_culled_draws,
+        0,
+        "40 m reaches it"
+    );
+    assert!(differing(&plain, &drawn, 2) > 50, "the slab is drawn");
+
+    // The script's setter is the same two keys
+    renderer.set_lod_settings(flint_render::LodSettings {
+        lod_scale: 2.0,
+        draw_distance_scale: 1.0,
+    });
+    assert_eq!(renderer.quality().lod_scale, 2.0);
+    assert_eq!(renderer.quality().draw_distance_scale, 1.0);
+    let again = gpu.frame(&mut renderer, &world);
+    assert_eq!(renderer.collect_stats().lod_culled_draws, 1);
+    assert_eq!(differing(&plain, &again, 0), 0, "back to the first frame");
+}
+
 /// A skinned quad of half-width `half` at height `y`, every vertex on the
 /// one joint, so a bone matrix moves it whole.
 fn skinned_square(name: &str, half: f32, y: f32) -> flint_import::ImportResult {
@@ -530,7 +619,14 @@ fn set_material(world: &mut FlintWorld, name: &str, keys: &[(&str, toml::Value)]
 /// Every kind of scene draw at once (#735): plain and blended static meshes,
 /// both woozy (#215), a skinned mesh woozy too, a skinned prop with a
 /// `lighten` echo and a soft-edged part (#582), a billboard and particles.
-fn every_draw_kind(gpu: &Gpu) -> (SceneRenderer, FlintWorld) {
+/// What a frame draws beyond the world: shallow wooze and particles.
+#[derive(Default)]
+struct Extras {
+    shallow: Vec<(flint_core::EntityId, flint_render::ShallowWoozeDraw)>,
+    particles: Vec<flint_render::ParticleInstance>,
+}
+
+fn every_draw_kind(gpu: &Gpu) -> (SceneRenderer, FlintWorld, Extras) {
     let (mut renderer, mut world) = scene(gpu);
     for (name, (vertices, indices)) in [
         ("woozy", square(0.8, 1.0, [0.2, 0.9, 0.3, 1.0])),
@@ -595,9 +691,9 @@ fn every_draw_kind(gpu: &Gpu) -> (SceneRenderer, FlintWorld) {
         index: 3,
         weight: 0.4,
     };
-    renderer.set_shallow_wooze(
-        ["woozy", "woozy_glass", "woozy_figure"].map(|n| (world.get_id(n).unwrap(), woozy)),
-    );
+    let shallow = ["woozy", "woozy_glass", "woozy_figure"]
+        .map(|n| (world.get_id(n).unwrap(), woozy))
+        .to_vec();
 
     let sprite_id = world.spawn("sprite").unwrap();
     let mut transform = toml::Table::new();
@@ -623,17 +719,14 @@ fn every_draw_kind(gpu: &Gpu) -> (SceneRenderer, FlintWorld) {
             vel_stretch: [0.0, 0.0, 0.0, 0.4],
         })
         .collect();
-    renderer.update_particles(
-        gpu.device,
-        gpu.queue,
-        &[flint_render::ParticleDrawData {
-            instances: &instances,
-            texture: "",
-            blend: flint_render::ParticleBlendMode::Additive,
-            sort_key: 0.0,
-        }],
-    );
-    (renderer, world)
+    (
+        renderer,
+        world,
+        Extras {
+            shallow,
+            particles: instances,
+        },
+    )
 }
 
 /// MSAA 1 to 4 to 1 at run time with every kind of draw on screen (#735).
@@ -647,18 +740,18 @@ fn msaa_switches_with_every_draw_kind_on_screen() {
     let d = QualitySettings::default();
     let four = QualitySettings { msaa: 4, ..d };
     for built_first in [true, false] {
-        let (mut renderer, world) = every_draw_kind(&gpu);
+        let (mut renderer, world, extras) = every_draw_kind(&gpu);
         let base = if built_first {
-            Some(gpu.frame(&mut renderer, &world))
+            Some(gpu.frame_of(&mut renderer, &world, &extras))
         } else {
             None
         };
         renderer.set_quality(gpu.device, &four);
         assert_eq!(renderer.msaa(), 4);
-        let smooth = gpu.frame(&mut renderer, &world);
+        let smooth = gpu.frame_of(&mut renderer, &world, &extras);
         renderer.set_quality(gpu.device, &d);
         assert_eq!(renderer.msaa(), 1);
-        let back = gpu.frame(&mut renderer, &world);
+        let back = gpu.frame_of(&mut renderer, &world, &extras);
         if let Some(base) = base {
             assert!(brightness(&base) > 0, "the scene drew nothing");
             assert_eq!(

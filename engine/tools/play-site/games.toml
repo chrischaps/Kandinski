@@ -26,17 +26,24 @@
 #           or a path in the game's repo, copied beside its bundle
 #   poster  that film's first frame, also the chooser's picture (URL or path)
 #   film    a line under the film, saying what it shows
+#   path    instead of repo and ref: a folder in this repo, packed from the
+#           checkout the site is built from, so it plays at Flint's own
+#           commit and needs no pin (#430). For the engine's own small games
 
 [[game]]
 id = "float"
 title = "SET + DRIFT"
 line = "Sit at the edge of a raft at sea, from sunrise to stars. There is nothing to win."
 repo = "chrischaps/Float"
-# master, now that engine-catchup is merged into it: the engine subtree at
-# Flint main, bundle.toml (#102), the early ambience bundle (#124), the touch
-# layout (#134), the iPad pointer-lock fix (#153, Float#4), the raft polish
-# (Float#7) and the body playtest pass (Float#8)
-ref = "3e0b75f4f40fb30fde7247d45ee68e91bd43087d"
+# engine-sync-2026-11-21, four commits on master: bundle.toml (#102), the
+# early ambience bundle (#124), the touch layout (#134), the iPad
+# pointer-lock fix (#153, Float#4), the raft polish (Float#7) and the body
+# playtest pass (Float#8), now with the engine subtree at Flint main
+# 3772abca. Its F3 panels are schema lines (#744); the reality tears and the
+# underwater dunk are display styles (#746, ported off the render-mode shims
+# with #1035's patch, so #1036 can drop them); no deprecated script names
+# (set_post, self_entity, draw_sprite); and lightning puts the exposure back
+ref = "e9d4efc7e3a5da333b7cbd9c4493bae95608b618"
 page = "https://chaps.dev/projects/float/"
 video = "https://chaps.dev/projects/float/a-day-at-sea.mp4"
 poster = "https://chaps.dev/projects/float/poster-day.jpg"
@@ -55,10 +62,11 @@ repo = "chrischaps/FlintKart"
 # touch stick, DRIFT and ITEM, #134), the glow-up (FlintKart#14-#25), the
 # HUD, title and sky polish (FlintKart#28-#52), and runtime graphics: tiers
 # Low / Medium / High with Auto picking one from the device and frame time,
-# and distance LODs for set dressing (FlintKart#54-#63). Its engine subtree
-# is Flint main's tree as of #409. The poster and film are the Lighthouse
-# Bay retake (#158), now on master (FlintKart#67).
-ref = "bd910be3aa4eeac18e4a6c7a6594e7af7a1cdc08"
+# and distance LODs for set dressing (FlintKart#54-#63). The poster and film
+# are the Lighthouse Bay retake (#158, FlintKart#67). Its engine subtree is
+# Flint main's tree at 78bccb0 (FlintKart#68), the scenes without the
+# audio_listener #799 removed.
+ref = "e927c0406e04376fcf8b08b23180c66fd642052a"
 page = "https://chaps.dev/projects/flint-kart/"
 # Paths, not URLs: build.py copies them from the repo beside the bundle.
 video = "web/kart-race.mp4"
@@ -78,6 +86,23 @@ repo = "chrischaps/Kandinski"
 # engine subtree is Flint main as of 9886650. No film yet, so a browser
 # without WebGPU sees the poster alone.
 # Now with touch controls: a stick, BRAKE, DRIFT and BOOST, and menus by tap.
-ref = "167e7e25d287d884aea9805c2c74bcd1afe6ad00"
+# Then a Settings menu (from the title and the pause menu), the
+# pulse (natively; it stays off on the web), and the engine subtree at Flint
+# main 5224a794 plus #899, with the HUD on the ADR 0116 script names.
+ref = "af91369d89308a3cdb26510f8df17a3491678872"
 # A path, not a URL: build.py copies it from the repo beside the bundle.
 poster = "web/afterglow-poster.jpg"
+
+[[game]]
+id = "sunprint"
+title = "Sun Prints"
+line = "A garden printed in sunlight, the way Anna Atkins printed her ferns."
+controls = "silent · WASD to walk, mouse to look · E turns the negative over · Esc frees the pointer"
+touch = "silent · the left thumb walks, the rest of the screen looks · TURN turns the negative over"
+# The site's user-style game (#430): its look is a cyanotype the game writes
+# itself, a .shader.toml and two WGSL functions in styles/, which the
+# browser compiles at load. In this repo, so every deploy plays the
+# user-style path at the engine's commit. No film: a browser without WebGPU
+# sees the poster, a `flint render` of the opening view.
+path = "tools/play-site/sunprint"
+poster = "web/poster.jpg"

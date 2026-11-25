@@ -10,10 +10,10 @@ description = "Rhai scripting system for Flint engine"
 # tools only; the player and the web build leave it off.
 [features]
 metadata = ["rhai/metadata"]
-# `check`: `flint script check` (#694) walks a script's syntax tree, which
-# Rhai exposes under `internals`, and needs `metadata` for its packages'
-# functions. Native tools only, like `metadata`.
-check = ["metadata", "rhai/internals"]
+# `check`: `flint script check` (#694) walks a script's syntax tree (Rhai's
+# `internals`, which every build has now, #692), and needs `metadata` for
+# its packages' functions. Native tools only, like `metadata`.
+check = ["metadata"]
 
 [dependencies]
 web-time = { workspace = true }
@@ -24,9 +24,19 @@ flint-runtime = { workspace = true }
 flint-physics = { workspace = true }
 flint-animation = { workspace = true }
 flint-terrain = { workspace = true }
-rhai = { workspace = true }
+# The [post_process] keys `set_post` takes (#853)
+flint-schema = { workspace = true }
+# `internals` for the top-level statements (#692): a callback is called on
+# the script's `import`s and functions alone (`instance::callable`), which
+# needs the AST's statements. It only makes Rhai's own types public.
+rhai = { workspace = true, features = ["internals"] }
 toml = { workspace = true }
+# The order a `.ui.toml` writes its elements in (#731): `toml::Table`
+# sorts its keys. Already in the tree under `toml`.
+toml_edit = { workspace = true }
 tracing = { workspace = true }
+# What `test_log` records, as a playtest's report holds it (#714)
+serde_json = { workspace = true }
 
 # The web player trims rhai (#123): no AST optimizer, no custom syntax and
 # i64 as the only integer type. Flint registers no syntax, sets no
@@ -39,5 +49,8 @@ rhai = { workspace = true, features = ["no_optimize", "no_custom_syntax", "only_
 flint-core = { workspace = true }
 flint-ecs = { workspace = true }
 flint-scene = { workspace = true }
-flint-schema = { workspace = true }
 flint-procgen = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[lints]
+workspace = true

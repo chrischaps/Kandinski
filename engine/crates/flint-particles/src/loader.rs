@@ -122,7 +122,7 @@ pub fn load_particle_effects_from_world(
                     );
                     continue;
                 }
-                eprintln!(
+                tracing::debug!(target: "load", kind = "particle_effect",
                     "Loaded particle effect: {} ({} emitter{})",
                     fx.name,
                     fx.emitters.len(),
@@ -143,9 +143,9 @@ mod tests {
 
     fn demo_dir() -> PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../examples")
+            .join("../../tests/fixtures/scenes")
             .canonicalize()
-            .expect("examples dir")
+            .expect("the fixture scenes' folder")
     }
 
     #[test]

@@ -29,7 +29,7 @@ The terrain system provides heightmap-based outdoor environments with full autho
 - **Camera** — orbit controller with right-click drag
 - **Keyboard shortcuts** — Tab (toggle UI), 1/2/3 (mode switch), R (randomize seed), Ctrl+S (save), Ctrl+E (export), [/] (brush size)
 - **File watching** — auto-reloads spec on external edit
-- **Export** — saves heightmap and splat map as 16-bit and 8-bit PNG respectively
+- **Export** — saves heightmap and splat map as 16-bit and 8-bit PNG respectively; `flint gen x.terrain.toml -o dir/` writes the same bytes with no window (#719)
 
 ### Rendering (`flint-render`)
 
@@ -114,7 +114,7 @@ Remove the single-terrain limitation. Support multiple terrain entities per scen
 
 ### Later: World Features
 
-- **Water planes** — flat or animated water surface with reflection/refraction, foam at terrain intersection
+- ~~**Water planes**~~ — shipped as the ocean, with shoreline foam where it meets the ground ([Ocean](https://docs.chaps.dev/flint/concepts/ocean.html))
 - **Terrain holes** — alpha mask regions for cave entrances, tunnels, mine shafts
 - **Decals** — projected textures (paths, scorch marks, tire tracks) on terrain surface
 - **Streaming/paging** — load chunks on demand for worlds larger than memory
@@ -122,6 +122,6 @@ Remove the single-terrain limitation. Support multiple terrain entities per scen
 ### Later: Integration
 
 - **AI terrain generation** — integrate with asset generation pipeline for AI-created heightmaps and splat maps
-- **NavMesh generation** — build navigation mesh from terrain + static geometry for AI pathfinding
+- **NavMesh generation** — build navigation mesh from terrain + static geometry for AI pathfinding (#969)
 - **Terrain-aware audio** — surface material detection for footstep sounds (grass, dirt, rock, sand)
 - **Weather interaction** — snow accumulation on upward-facing surfaces, rain puddles in concavities

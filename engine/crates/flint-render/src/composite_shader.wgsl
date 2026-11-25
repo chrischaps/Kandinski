@@ -37,18 +37,16 @@ struct PostProcessUniforms {
     dof_strength: f32,
     dof_focus_distance: f32,
     dof_focus_range: f32,
-    _pad2: f32,
-    // Render mode: 0 none, 1 Matrix, 2 blood, 3 drunk, 4 Tron (reality
-    // tears), 5 underwater (submerged-eye moments; not a tear — no mask).
-    render_mode: u32,
-    mode_mix: f32,
-    mode_time: f32,
-    _pad_mode: f32,
-    // Per-mode meaning. Tears (1-4): x = bleed-mask scale, y = mask style
-    // (0 fbm / 1 iris), z = rate, w = spare. Underwater (5): x = signed eye
-    // depth in meters (+ = submerged; waterline Y = camera_pos.y + x),
-    // y = sea energy/turbidity 0..1, z = daylight 0..1, w = biolum 0..1.
-    mode_params: vec4<f32>,
+    // Where dither is added (#503; rides the former _pad2): 0 = linear
+    // light, 1 = Bayer in display levels, 2 = triangular noise in display
+    // levels.
+    dither_style: f32,
+    // The post time film grain reads. The render modes that shared this
+    // row are display styles since #746 (stylize/matrix.rs and the rest).
+    post_time: f32,
+    _pad_time0: f32,
+    _pad_time1: f32,
+    _pad_time2: f32,
     // Color grade (ADR 0050): pow(max(color * gain + lift, 0), 1/gamma),
     // applied right after ACES. grade_enabled is CPU-computed so the
     // neutral path is the original code verbatim.
@@ -116,6 +114,15 @@ var volumetric_sampler: sampler;
 @group(3) @binding(6)
 var ground_fog_map: texture_2d<f32>;
 
+// The fog veil (#513, `scene_renderer/fog_veil.rs`), read only where
+// FOG_VEILED, which Rust prepends: the picture as it stood before the
+// first translucent draw, and the veil (r = weight x (1 - depth),
+// g = weight, a = the share of what's behind that still shows).
+@group(3) @binding(7)
+var fog_behind_texture: texture_2d<f32>;
+@group(3) @binding(8)
+var fog_veil_texture: texture_2d<f32>;
+
 struct VsOut {
     @builtin(position) position: vec4<f32>,
     @location(0) uv: vec2<f32>,
@@ -134,15 +141,7 @@ fn vs_composite(@builtin(vertex_index) vid: u32) -> VsOut {
     return out;
 }
 
-// ACES filmic tone mapping curve
-fn aces_filmic(x: vec3<f32>) -> vec3<f32> {
-    let a = 2.51;
-    let b = 0.03;
-    let c = 2.43;
-    let d = 0.59;
-    let e = 0.14;
-    return saturate((x * (a * x + b)) / (x * (c * x + d) + e));
-}
+// ACES filmic tone mapping: `aces_filmic`, tonemap.wgsl (#738), put in front
 
 // Linear to sRGB gamma correction
 fn linear_to_srgb(color: vec3<f32>) -> vec3<f32> {
@@ -328,6 +327,11 @@ fn ground_fog_depth(uv: vec2<f32>, depth: f32, pixel: vec2<f32>) -> f32 {
 // aerial tint's share (0..fog_tint_strength), both 0 for the sky.
 fn compute_fog(uv: vec2<f32>) -> vec2<f32> {
     let depth = textureSample(depth_texture, depth_sampler_nn, uv).r;
+    return fog_at(uv, depth);
+}
+
+// The same at a depth of the caller's: the fog veil's (#513).
+fn fog_at(uv: vec2<f32>, depth: f32) -> vec2<f32> {
     // Skip the sky; everything drawn is fogged, however far
     if (is_sky_depth(depth)) {
         return vec2<f32>(0.0, 0.0);
@@ -356,6 +360,27 @@ fn compute_fog(uv: vec2<f32>) -> vec2<f32> {
     return vec2<f32>(clamp(fog, 0.0, 1.0), tint);
 }
 
+// The ground fog, aerial tint and fog over one layer of a pixel (#513):
+// `c` is the layer's light, already weighted by `share`, the part of the
+// pixel it holds, at `depth`; each fog takes its colour by that share. A
+// pixel's two layers (the picture behind a translucent draw and the draw's
+// own light) are fogged apart and added.
+fn fog_layer(c_in: vec3<f32>, share: f32, uv: vec2<f32>, depth: f32, pixel: vec2<f32>) -> vec3<f32> {
+    var c = c_in;
+    if (params.ground_fog_enabled > 0.5) {
+        let optical = ground_fog_depth(uv, depth, pixel);
+        c = mix(c, params.ground_fog_color * share, 1.0 - exp(-optical));
+    }
+    if (params.fog_enabled > 0.5) {
+        let fog = fog_at(uv, depth);
+        if (fog.y > 0.0) {
+            c = mix(c, params.fog_tint_color * share, fog.y);
+        }
+        c = mix(c, params.fog_color * share, fog.x);
+    }
+    return c;
+}
+
 // 8x8 Bayer ordered dither matrix — returns value in [0, 1)
 fn bayer8(pos: vec2<f32>) -> f32 {
     let x = u32(pos.x) % 8u;
@@ -376,248 +401,51 @@ fn bayer8(pos: vec2<f32>) -> f32 {
     return f32(value) / 64.0;
 }
 
-// ── Reality-tear helpers ────────────────────────────────────────────────
-// hash2, value_noise, fbm and tear_mask_at live in tear_mask.wgsl, which
-// Rust prepends to this file (`postprocess::COMPOSITE_WGSL`, #397): the
-// style mask reads the same tear for `blend_source = "tear"`.
-
-fn luma(c: vec3<f32>) -> f32 {
-    return dot(c, vec3<f32>(0.2126, 0.7152, 0.0722));
+// The exact sRGB curves (IEC 61966-2-1), the ones the target's encode uses,
+// so a value dithered in display levels comes back out where it was put.
+// Not linear_to_srgb above, which is a 2.2 power.
+fn srgb_encode(c: vec3<f32>) -> vec3<f32> {
+    let x = max(c, vec3<f32>(0.0));
+    let lo = x * 12.92;
+    let hi = 1.055 * pow(x, vec3<f32>(1.0 / 2.4)) - 0.055;
+    return select(hi, lo, x <= vec3<f32>(0.0031308));
 }
 
-// Where the other reality shows through: 1 = torn, 0 = normal view.
-// The mask itself (fbm patches or an iris; a scale of 0 or less is 3):
-// tear_mask.wgsl.
-fn tear_mask(uv: vec2<f32>) -> f32 {
-    let aspect = params.texel_size.y / params.texel_size.x; // width / height
-    return tear_mask_at(uv, aspect, params.mode_mix, params.mode_params, params.mode_time);
+fn srgb_decode(c: vec3<f32>) -> vec3<f32> {
+    let x = max(c, vec3<f32>(0.0));
+    let lo = x / 12.92;
+    let hi = pow((x + 0.055) / 1.055, vec3<f32>(2.4));
+    return select(hi, lo, x <= vec3<f32>(0.04045));
 }
 
-// Mode 1 — Matrix code: screen quantized into glyph cells, procedural
-// dot-matrix glyphs lit by the scene's own luminance (foam crests read as
-// bright code) with per-column falling rain heads.
-fn matrix_code(frag_xy: vec2<f32>) -> vec3<f32> {
-    let cell_px = vec2<f32>(8.0, 12.0);
-    let cell = floor(frag_xy / cell_px);
-    let cell_uv = fract(frag_xy / cell_px);
-
-    // Scene luminance at the cell center, taken through the same exposure +
-    // tonemap as the normal path so brightness matches what the eye saw.
-    let center_uv = (cell + 0.5) * cell_px * params.texel_size;
-    let hdr_c = textureSampleLevel(hdr_texture, hdr_sampler, center_uv, 0.0).rgb;
-    let lum = luma(aces_filmic(hdr_c * params.exposure));
-
-    // Glyph reroll: per-cell phase so the field flickers, not strobes.
-    var rate = params.mode_params.z;
-    if (rate < 0.01) { rate = 6.0; }
-    let gid = floor(params.mode_time * rate + hash2(cell) * 8.0);
-
-    // Luminance contrast curve: the cel ocean is uniformly bright, so a
-    // linear map saturates — square it and let glyph DENSITY carry the
-    // structure too (dark cells go sparse, foam crests go dense).
-    let li = clamp(lum * lum * 1.4, 0.0, 1.0);
-
-    // 3x5 live dots inside a 4x6 grid — the dead row/column separates glyphs.
-    let g = floor(cell_uv * vec2<f32>(4.0, 6.0));
-    let f = fract(cell_uv * vec2<f32>(4.0, 6.0));
-    var dot_on = step(mix(0.78, 0.38, li),
-        hash2(cell * 17.0 + g + vec2<f32>(gid * 31.0, gid * 7.0)));
-    dot_on *= step(g.x, 2.5) * step(g.y, 4.5);
-    let inset = step(0.15, f.x) * step(f.x, 0.85) * step(0.1, f.y) * step(f.y, 0.9);
-    let dots = dot_on * inset;
-
-    // Falling rain head per column: bright leader, exponential trail above.
-    let rows = 1.0 / (params.texel_size.y * cell_px.y);
-    let speed = 0.25 + 0.75 * hash2(vec2<f32>(cell.x, 7.0));
-    let head_row = fract(params.mode_time * speed * 0.12 + hash2(vec2<f32>(cell.x, 13.0)))
-        * (rows + 20.0) - 10.0;
-    let behind = head_row - cell.y; // >0 above/behind the falling head
-    var trail = 0.12;
-    if (behind >= 0.0) {
-        trail = 0.12 + 0.88 * exp(-0.2 * behind);
-    }
-    let head_glow = smoothstep(1.5, 0.0, abs(behind));
-
-    let intensity = clamp(li * 1.1 + 0.05, 0.0, 1.0) * trail * dots;
-    var mcol = mix(vec3<f32>(0.0, 0.025, 0.005), vec3<f32>(0.15, 1.0, 0.3), intensity);
-    mcol += vec3<f32>(0.7, 1.0, 0.8) * head_glow * dots * 0.6;
-    return mcol;
+// Roberts' R2 sequence over the pixel grid, in [0, 1): a quasi-random mask
+// with blue-noise-like spacing and no 8x8 tile to read.
+fn r2_dither(pos: vec2<f32>) -> f32 {
+    let p = floor(pos);
+    return fract(0.5 + p.x * 0.75487766624669 + p.y * 0.56984029099805);
 }
 
-// Mode 2 — blood grade (sky and geometry side; the ocean recolors itself with full
-// detail in ocean_shader.wgsl). Luminance-preserving crimson tint, weighted
-// away from pixels that are ALREADY red so the ocean's pools and pale-pink
-// foam keep their structure while the rest of the world sinks into key.
-fn blood_grade(mapped: vec3<f32>, mask: f32) -> vec3<f32> {
-    let l = luma(mapped);
-    let tinted = mix(vec3<f32>(0.02, 0.0, 0.004),
-        vec3<f32>(l * 1.45, l * 0.2, l * 0.24),
-        smoothstep(0.0, 0.18, l));
-    let redness = clamp((mapped.r - max(mapped.g, mapped.b)) * 3.0, 0.0, 1.0);
-    return mix(mapped, tinted, 0.85 * (1.0 - redness) * mask);
+// A uniform [0, 1) value to a triangular one in (-1, 1), through the
+// triangle's inverse CDF, so the mask keeps its spacing.
+fn tpdf(u: f32) -> f32 {
+    let r = u * 2.0 - 1.0;
+    return sign(r) * (1.0 - sqrt(1.0 - abs(r)));
 }
 
-// Linearize a conventional (0 = near, 1 = far) depth value.
-// Matches the wgpu-convention projection since ADR 0055.
-fn linearize_depth(d: f32) -> f32 {
-    return params.near * params.far / (params.far - d * (params.far - params.near));
-}
+// hash2 (film grain's) lives in tear_mask.wgsl, which Rust prepends to
+// this file (`postprocess::COMPOSITE_WGSL`). The tear itself is drawn by
+// the styles that follow it and the style mask, not here (#746).
 
-// Mode 4 — Tron: scene dimmed to a ghost, depth/luminance edges glow cyan,
-// and a world-space grid reconstructed from depth rides the wave surface.
-fn tron_view(mapped: vec3<f32>, uv: vec2<f32>) -> vec3<f32> {
-    let cyan = vec3<f32>(0.1, 0.9, 1.0);
-    let depth_c = textureSampleLevel(depth_texture, depth_sampler_nn, uv, 0.0).r;
-    var out_col = mapped * 0.08;
-
-    if (is_sky_depth(depth_c)) {
-        // Sky: keep only the dim ghost.
-        return mapped * 0.05;
-    }
-
-    let px = params.texel_size;
-    let lin_c = linearize_depth(depth_c);
-    let lin_l = linearize_depth(textureSampleLevel(depth_texture, depth_sampler_nn, uv - vec2<f32>(px.x, 0.0), 0.0).r);
-    let lin_r = linearize_depth(textureSampleLevel(depth_texture, depth_sampler_nn, uv + vec2<f32>(px.x, 0.0), 0.0).r);
-    let lin_u = linearize_depth(textureSampleLevel(depth_texture, depth_sampler_nn, uv - vec2<f32>(0.0, px.y), 0.0).r);
-    let lin_d = linearize_depth(textureSampleLevel(depth_texture, depth_sampler_nn, uv + vec2<f32>(0.0, px.y), 0.0).r);
-    // Depth discontinuities, normalized by view distance (silhouettes).
-    let d_edge = (abs(lin_r - lin_l) + abs(lin_d - lin_u)) / max(lin_c * 0.05, 0.05);
-
-    // Luminance gradient assist picks up interior detail (foam lace, logs).
-    let lum_l = luma(textureSampleLevel(hdr_texture, hdr_sampler, uv - vec2<f32>(px.x, 0.0), 0.0).rgb);
-    let lum_r = luma(textureSampleLevel(hdr_texture, hdr_sampler, uv + vec2<f32>(px.x, 0.0), 0.0).rgb);
-    let lum_u = luma(textureSampleLevel(hdr_texture, hdr_sampler, uv - vec2<f32>(0.0, px.y), 0.0).rgb);
-    let lum_d = luma(textureSampleLevel(hdr_texture, hdr_sampler, uv + vec2<f32>(0.0, px.y), 0.0).rgb);
-    let l_edge = (abs(lum_r - lum_l) + abs(lum_d - lum_u)) * 2.0;
-
-    let edge = smoothstep(0.25, 0.9, d_edge + l_edge);
-
-    // World-space grid that follows the displaced surface.
-    let wp = world_pos_from_depth(uv, depth_c);
-    let dist = length(wp - params.camera_pos);
-    let fade = exp(-dist * 0.02);
-    let g1 = abs(fract(wp.xz / 2.0) - 0.5) * 2.0;
-    let g2 = abs(fract(wp.xz / 10.0) - 0.5) * 2.0;
-    let line1 = max(smoothstep(0.93, 0.99, g1.x), smoothstep(0.93, 0.99, g1.y));
-    let line2 = max(smoothstep(0.96, 0.995, g2.x), smoothstep(0.96, 0.995, g2.y));
-    let pulse = 0.75 + 0.25 * sin(params.mode_time * 2.0 - dist * 0.15);
-    let grid = (line1 * 0.35 + line2 * 0.7) * fade * pulse;
-
-    out_col += cyan * (edge * 0.9 + grid * 0.5);
-    return out_col;
-}
-
-// Mode 5 — underwater: the sub-second moments when a swell buries the eye.
-// NOT a reality tear, so no tear_mask — the mask here is the WATERLINE,
-// tested per pixel against the flat plane y = camera_pos.y + mode_params.x
-// (the signed eye depth the driving script publishes). Cel grammar
-// throughout: banded absorption instead of an exponential gradient,
-// two-hard-step light shafts, and a flat white foam lip on the line.
-fn underwater_view(mapped: vec3<f32>, uv: vec2<f32>) -> vec3<f32> {
-    let mix_amt = params.mode_mix;
-    let eye_depth = params.mode_params.x; // + = submerged
-    let churn = clamp(params.mode_params.y, 0.0, 1.0);
-    let daylight = clamp(params.mode_params.z, 0.0, 1.0);
-    let biolum = clamp(params.mode_params.w, 0.0, 1.0);
-    let aspect = params.texel_size.y / params.texel_size.x;
-
-    // ── Waterline: near-plane world point vs the wobbled water plane. The
-    // near plane is only ~0.15 m tall in world units, so wobble amplitudes
-    // are millimeters — enough to break the ruler-straight edge.
-    let nearw = world_pos_from_depth(uv, 0.0);
-    let wobble = (value_noise(vec2<f32>(
-        uv.x * aspect * 9.0 + params.mode_time * 1.3,
-        params.mode_time * 0.7)) - 0.5) * (0.006 + 0.010 * churn);
-    let delta = (params.camera_pos.y + eye_depth + wobble) - nearw.y;
-    let under = smoothstep(-0.0015, 0.0015, delta);
-    if (under <= 0.0) {
-        return mapped;
-    }
-
-    // ── Water column length behind this pixel. Sky depth only survives the
-    // ocean grid's far fade, so treat it as a full column of water.
-    let depth = textureSampleLevel(depth_texture, depth_sampler_nn, uv, 0.0).r;
-    var dist = 60.0;
-    if (!is_sky_depth(depth)) {
-        dist = length(world_pos_from_depth(uv, depth) - params.camera_pos);
-    }
-
-    // ── Banded absorption: 3 hard cel steps toward flat murk. Turbidity
-    // (churn) and depth pull the bands closer; night kills the value.
-    let absorb = 0.22 + 0.45 * churn + 0.15 * clamp(eye_depth, 0.0, 1.0);
-    let t = 1.0 - exp(-dist * absorb);
-    let ts = t * 3.0;
-    let tq = clamp((floor(ts) + smoothstep(0.88, 0.97, fract(ts))) / 3.0, 0.0, 1.0);
-
-    let light = 0.12 + 0.88 * daylight;
-    let murk_near = mix(vec3<f32>(0.07, 0.30, 0.46), vec3<f32>(0.08, 0.30, 0.30), churn);
-    let murk_far = mix(vec3<f32>(0.015, 0.10, 0.24), vec3<f32>(0.02, 0.10, 0.14), churn);
-
-    let tint = mapped * vec3<f32>(0.45, 0.82, 1.05);
-    var wcol = mix(tint, mix(murk_near, murk_far, tq) * light, tq);
-
-    // ── Snell window: the hard-rimmed bright circle straight overhead.
-    let vdir = normalize(nearw - params.camera_pos);
-    let snell = smoothstep(0.62, 0.68, vdir.y);
-    wcol += snell * daylight * vec3<f32>(0.18, 0.28, 0.30);
-
-    // ── Light shafts: 1D noise over a slanted screen coordinate, quantized
-    // to two hard steps, drifting slowly. Fade down-screen, drown in churn.
-    let sc = uv.x * aspect * 2.2 - uv.y * 0.8 + params.mode_time * 0.06;
-    let sn = value_noise(vec2<f32>(sc * 7.0, params.mode_time * 0.11));
-    let shaft = (step(0.68, sn) * 0.5 + step(0.80, sn) * 0.5)
-        * (1.0 - uv.y * 0.75) * daylight * (1.0 - 0.7 * churn);
-    wcol += shaft * tq * vec3<f32>(0.05, 0.11, 0.13);
-
-    // ── Bioluminescent specks (night foam glow carried underwater).
-    if (biolum > 0.001) {
-        let sp = uv * vec2<f32>(aspect, 1.0) * 42.0
-            + vec2<f32>(params.mode_time * 0.15, params.mode_time * 0.35);
-        let h = hash2(floor(sp));
-        let dotd = length(fract(sp) - 0.5);
-        let tw = 0.5 + 0.5 * sin(params.mode_time * 3.0 + h * 40.0);
-        wcol += step(0.965, h) * smoothstep(0.22, 0.06, dotd) * tw
-            * biolum * vec3<f32>(0.15, 0.9, 0.8) * 0.8;
-    }
-
-    // ── Soft edge darkening, kept local to the mode (the sticky vignette
-    // knob belongs to reality mode 1 — never write it from here).
-    let vd = length((uv - vec2<f32>(0.5, 0.5)) * vec2<f32>(aspect, 1.0));
-    wcol *= 1.0 - 0.4 * smoothstep(0.45, 0.95, vd);
-
-    // ── Hard white foam lip riding the line itself.
-    let lip = under * (1.0 - smoothstep(0.005, 0.009, delta));
-    var outc = mix(mapped, clamp(wcol, vec3<f32>(0.0), vec3<f32>(1.5)), under * mix_amt);
-    outc = mix(outc, vec3<f32>(0.94, 0.98, 1.0), lip * mix_amt);
-    return clamp(outc, vec3<f32>(0.0), vec3<f32>(4.0));
-}
-
-@fragment
-fn fs_composite(in: VsOut) -> @location(0) vec4<f32> {
-    var uv = in.uv;
-
-    // ── Hook A: drunk sway (mode 3) and underwater refraction sway (mode 5)
-    // warp the UV every downstream sample uses, so the whole frame (blur,
-    // CA, fog, bloom) moves together.
-    if ((params.render_mode == 3u || params.render_mode == 5u)
-        && params.mode_mix > 0.001) {
-        let t = params.mode_time;
-        var amp = 0.006 * params.mode_mix;
-        if (params.render_mode == 5u) {
-            // Only sway once genuinely submerged: a straddle frame keeps
-            // its above-water half rock steady.
-            amp = 0.004 * params.mode_mix
-                * smoothstep(0.1, 0.3, params.mode_params.x);
-        }
-        uv += vec2<f32>(
-            sin(t * 0.7 + uv.y * 3.0),
-            cos(t * 0.9 + uv.x * 2.5) * 0.6
-        ) * amp;
-    }
-
-    let center = vec2<f32>(0.5, 0.5);
-    let dir_from_center = uv - center;
+// What the lens makes of the HDR picture at `uv`: the radial blur, then
+// depth of field. Chromatic aberration reads red and blue through this at
+// its offsets, so all three channels go through the same blurs; it read
+// them from the sharp source once, and wherever DoF or the radial blur
+// spread a bright surface, green spread with it and red and blue didn't
+// (#1156: emissive edges ringed green). textureSampleLevel throughout: the
+// HDR target has one mip, so it reads what textureSample did, and the
+// gathers are free to run from non-uniform control flow.
+fn lens(uv: vec2<f32>) -> vec3<f32> {
+    let dir_from_center = uv - vec2<f32>(0.5, 0.5);
     let dist = length(dir_from_center);
 
     // ── Radial Blur (8-tap, center stays sharp, edges blur) ──
@@ -626,19 +454,19 @@ fn fs_composite(in: VsOut) -> @location(0) vec4<f32> {
         let blur_str = params.radial_blur * dist * 0.04;
         let blur_dir = normalize(dir_from_center + vec2<f32>(0.0001, 0.0001)) * blur_str;
         var acc = vec3<f32>(0.0);
-        acc += textureSample(hdr_texture, hdr_sampler, uv + blur_dir * -3.5).rgb;
-        acc += textureSample(hdr_texture, hdr_sampler, uv + blur_dir * -2.5).rgb;
-        acc += textureSample(hdr_texture, hdr_sampler, uv + blur_dir * -1.5).rgb;
-        acc += textureSample(hdr_texture, hdr_sampler, uv + blur_dir * -0.5).rgb;
-        acc += textureSample(hdr_texture, hdr_sampler, uv + blur_dir *  0.5).rgb;
-        acc += textureSample(hdr_texture, hdr_sampler, uv + blur_dir *  1.5).rgb;
-        acc += textureSample(hdr_texture, hdr_sampler, uv + blur_dir *  2.5).rgb;
-        acc += textureSample(hdr_texture, hdr_sampler, uv + blur_dir *  3.5).rgb;
+        acc += textureSampleLevel(hdr_texture, hdr_sampler, uv + blur_dir * -3.5, 0.0).rgb;
+        acc += textureSampleLevel(hdr_texture, hdr_sampler, uv + blur_dir * -2.5, 0.0).rgb;
+        acc += textureSampleLevel(hdr_texture, hdr_sampler, uv + blur_dir * -1.5, 0.0).rgb;
+        acc += textureSampleLevel(hdr_texture, hdr_sampler, uv + blur_dir * -0.5, 0.0).rgb;
+        acc += textureSampleLevel(hdr_texture, hdr_sampler, uv + blur_dir *  0.5, 0.0).rgb;
+        acc += textureSampleLevel(hdr_texture, hdr_sampler, uv + blur_dir *  1.5, 0.0).rgb;
+        acc += textureSampleLevel(hdr_texture, hdr_sampler, uv + blur_dir *  2.5, 0.0).rgb;
+        acc += textureSampleLevel(hdr_texture, hdr_sampler, uv + blur_dir *  3.5, 0.0).rgb;
         let blurred = acc / 8.0;
         let blur_mix = smoothstep(0.1, 0.7, dist) * params.radial_blur;
-        color = mix(textureSample(hdr_texture, hdr_sampler, uv).rgb, blurred, clamp(blur_mix, 0.0, 1.0));
+        color = mix(textureSampleLevel(hdr_texture, hdr_sampler, uv, 0.0).rgb, blurred, clamp(blur_mix, 0.0, 1.0));
     } else {
-        color = textureSample(hdr_texture, hdr_sampler, uv).rgb;
+        color = textureSampleLevel(hdr_texture, hdr_sampler, uv, 0.0).rgb;
     }
 
     // ── Depth of Field (single-pass CoC-weighted disc gather) ──
@@ -662,20 +490,27 @@ fn fs_composite(in: VsOut) -> @location(0) vec4<f32> {
             color = mix(color, acc / wsum, center_coc);
         }
     }
+    return color;
+}
 
-    // ── Reality tear: drunk double vision (ghost image drifts sideways) ──
-    if (params.render_mode == 3u && params.mode_mix > 0.001) {
-        let ghost_off = vec2<f32>(0.012 + 0.010 * sin(params.mode_time * 0.5), 0.0)
-            * params.mode_mix;
-        let ghost = textureSampleLevel(hdr_texture, hdr_sampler, uv + ghost_off, 0.0).rgb;
-        color = mix(color, ghost, 0.35 * params.mode_mix);
-    }
+@fragment
+fn fs_composite(in: VsOut) -> @location(0) vec4<f32> {
+    let uv = in.uv;
+
+    let center = vec2<f32>(0.5, 0.5);
+    let dir_from_center = uv - center;
+    let dist = length(dir_from_center);
+
+    var color = lens(uv);
 
     // ── Chromatic Aberration (R/B offset radially, G stays) ──
+    // Red and blue through the same lens as green (see `lens`). With no
+    // blur on, lens() is one plain read, so this costs what it always did;
+    // under DoF it is the gather three times, while both are on.
     if (params.chromatic_aberration > 0.001) {
         let offset = dir_from_center * params.chromatic_aberration * 0.012;
-        let r = textureSample(hdr_texture, hdr_sampler, uv + offset).r;
-        let b = textureSample(hdr_texture, hdr_sampler, uv - offset).b;
+        let r = lens(uv + offset).r;
+        let b = lens(uv - offset).b;
         color = vec3<f32>(r, color.g, b);
     }
 
@@ -690,6 +525,30 @@ fn fs_composite(in: VsOut) -> @location(0) vec4<f32> {
     // ── Bloom ──
     let bloom = textureSample(bloom_texture, bloom_sampler, uv).rgb;
     color = color + bloom * params.bloom_intensity;
+
+    // ── The fog veil (#513): where a translucent draw lies, the pixel is
+    // two layers, fogged apart. What still shows of the picture behind it
+    // (`shows` x that picture) at the scene's depth, as any pixel is; the
+    // draw's own light (the rest) at the veil's depth, so an echo in front
+    // of a horizon is one colour across it. Everywhere else, the fog below,
+    // which runs everywhere so its texture reads stay in uniform control
+    // flow; the veiled pixels take this instead after it.
+    var veiled = false;
+    var veiled_color = vec3<f32>(0.0);
+    if (FOG_VEILED) {
+        let veil = textureSampleLevel(fog_veil_texture, depth_sampler_nn, uv, 0.0);
+        let behind = textureSampleLevel(fog_behind_texture, hdr_sampler, uv, 0.0).rgb;
+        let drawn = textureSampleLevel(hdr_texture, hdr_sampler, uv, 0.0).rgb;
+        let depth = textureSampleLevel(depth_texture, depth_sampler_nn, uv, 0.0).r;
+        if (veil.g > 1e-4 && (params.fog_enabled > 0.5 || params.ground_fog_enabled > 0.5)) {
+            veiled = true;
+            let shows = clamp(veil.a, 0.0, 1.0);
+            let own = drawn - shows * behind;
+            let veil_depth = clamp(1.0 - veil.r / veil.g, 0.0, 1.0);
+            veiled_color = fog_layer(color - own, shows, uv, depth, in.position.xy)
+                + fog_layer(own, 1.0 - shows, uv, veil_depth, in.position.xy);
+        }
+    }
 
     // ── Ground fog (ADR 0106): a mist on floors of its own, under the
     // aerial tint and the fog, which take it with what lies behind it ──
@@ -708,6 +567,9 @@ fn fs_composite(in: VsOut) -> @location(0) vec4<f32> {
             color = mix(color, params.fog_tint_color, fog.y);
         }
         color = mix(color, params.fog_color, fog.x);
+    }
+    if (veiled) {
+        color = veiled_color;
     }
 
     // ── Exposure → Tonemapping ──
@@ -731,26 +593,6 @@ fn fs_composite(in: VsOut) -> @location(0) vec4<f32> {
         mapped = mix(mapped, vec3<f32>(luma * 0.62), clamp(params.desaturate, 0.0, 1.0));
     }
 
-    // ── Hook B: stylization owns the display-referred color. After ACES so
-    // phosphor greens / duotones aren't compressed; before vignette + dither
-    // so those still apply on top (CRT cohesion). Underwater (5) is not a
-    // tear — it masks by the per-pixel waterline, never tear_mask.
-    if (params.render_mode == 5u && params.mode_mix > 0.001) {
-        mapped = underwater_view(mapped, uv);
-    } else if (params.render_mode != 0u && params.render_mode != 6u
-        && params.mode_mix > 0.001) {
-        // Mode 6 (#397) is a tear with no look of its own: only the styled
-        // props with `blend_source = "tear"` show it, in the style mask.
-        let mask = tear_mask(uv);
-        if (params.render_mode == 1u) {
-            mapped = mix(mapped, matrix_code(in.position.xy), mask);
-        } else if (params.render_mode == 2u) {
-            mapped = blood_grade(mapped, mask);
-        } else if (params.render_mode == 4u) {
-            mapped = mix(mapped, tron_view(mapped, uv), mask);
-        }
-    }
-
     // ── Vignette (linear-space attenuation) ──
     if (params.vignette_intensity > 0.0) {
         let vdist = dist * 1.41421356;
@@ -762,10 +604,10 @@ fn fs_composite(in: VsOut) -> @location(0) vec4<f32> {
     // to 24 Hz (film cadence; the Tier-3 "on twos" tie-in is this one
     // constant), luma-weighted so highlights stay clean. Before dither —
     // grain is signal, dither is a quantization aid and stays last. Uses
-    // the shared post time (mode_time), which headless render fixes at 0
-    // so PNG gates stay deterministic.
+    // the shared post time, which headless render fixes at 0 so PNG gates
+    // stay deterministic.
     if (params.grain_intensity > 0.0) {
-        let grain_frame = floor(params.mode_time * 24.0);
+        let grain_frame = floor(params.post_time * 24.0);
         let n = hash2(in.position.xy + vec2<f32>(grain_frame * 17.0, grain_frame * 61.0)) - 0.5;
         let g_luma = dot(mapped, vec3<f32>(0.299, 0.587, 0.114));
         let weight = 0.3 + 0.7 * (1.0 - saturate(g_luma));
@@ -773,11 +615,32 @@ fn fs_composite(in: VsOut) -> @location(0) vec4<f32> {
         mapped = max(mapped, vec3<f32>(0.0));
     }
 
-    // ── Ordered (Bayer) Dither ──
+    // ── Dither (#503) ──
+    // Style 0 adds Bayer in linear light, before the target's sRGB encode,
+    // so its size on screen follows the encode's slope: about 13x one level
+    // near black, well under one in the highlights. Kept as it was, a look
+    // of its own. Styles 1 and 2 add it in display levels, where the 8-bit
+    // quantization happens, so dither_intensity is the same number of
+    // levels at every brightness (1/255 = one step) and then decode again
+    // for the hardware to encode.
     if (params.dither_intensity > 0.0) {
-        let dither = bayer8(in.position.xy) - 0.5;
-        mapped = mapped + vec3<f32>(dither * params.dither_intensity);
-        mapped = max(mapped, vec3<f32>(0.0));
+        if (params.dither_style < 0.5) {
+            let dither = bayer8(in.position.xy) - 0.5;
+            mapped = mapped + vec3<f32>(dither * params.dither_intensity);
+            mapped = max(mapped, vec3<f32>(0.0));
+        } else {
+            var d: f32;
+            if (params.dither_style < 1.5) {
+                // [-0.5, 0.5): one step of intensity is ±half a step
+                d = bayer8(in.position.xy) - 0.5;
+            } else {
+                // Triangular in (-1, 1): one step of intensity is ±1 step,
+                // which leaves no banding and no error tied to the signal
+                d = tpdf(r2_dither(in.position.xy));
+            }
+            let encoded = srgb_encode(mapped) + vec3<f32>(d * params.dither_intensity);
+            mapped = srgb_decode(max(encoded, vec3<f32>(0.0)));
+        }
     }
 
     return vec4<f32>(mapped, 1.0);

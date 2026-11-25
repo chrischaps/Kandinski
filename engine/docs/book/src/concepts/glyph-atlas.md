@@ -1,5 +1,7 @@
 # Glyph Atlas
 
+> **Package:** `engine`: every game has it. Its stylize render feature is grouped in the engine's manifest as the package it becomes in a later phase, with no switch yet ([Packages](packages.md)).
+
 Every ASCII look needs glyphs on the GPU. `flint_render::glyph_atlas` rasterizes a monospaced font into one coverage texture and pairs it with the data a style reads: **ramps**, glyphs ordered from no ink to the most, and **edge glyphs** for silhouettes. The full-screen and per-entity ASCII styles of epic #260 build on it, and so can any later text-based look.
 
 ![The built-in 8x8 atlas](../images/glyph-atlas-builtin.png)
@@ -25,7 +27,7 @@ An atlas comes from one of four sources:
 - **The built-in set** (`GlyphSet::builtin()`), a hand-drawn 8x8 font made for the engine (`crates/flint-render/src/glyph_atlas/builtin_8x8.txt`, editable as text) with no font licence attached. Built once per process.
 - **A TTF or OTF**, rasterized with `ab_glyph` at a line height in pixels. The cell is the line height by the widest advance, and each glyph sits on the baseline, centred in its cell.
 - **A bitmap grid image** (PNG or JPEG), cut into cells left to right, top to bottom.
-- **Pixel text** (`.txt`), cells drawn by hand in the built-in set's format: `== c` starts a glyph, then a row of `#` ink and `.` paper per pixel row. Give the cell, `cell = [w, h]`, under `[font]`. `examples/fonts/halftone.txt` is one: a dot screen in 8x12 cells.
+- **Pixel text** (`.txt`), cells drawn by hand in the built-in set's format: `== c` starts a glyph, then a row of `#` ink and `.` paper per pixel row. Give the cell, `cell = [w, h]`, under `[font]`. [`flint-examples/fonts/halftone.txt`](https://github.com/chrischaps/flint-examples/blob/main/fonts/halftone.txt) is one: a dot screen in 8x12 cells.
 
 ## Built-in ramps
 
@@ -52,7 +54,7 @@ The two sub-cell ramps (#285) trade letterforms for resolution. `quadrants` is c
 
 ![The lantern scene in the quadrants and braille ramps](../images/ascii-lantern-sub-cell-ramps.png)
 
-*`flint render examples/ascii_lantern.scene.toml --sweep ascii.ramp=quadrants,braille --width 960 --height 540`*
+*`flint render flint-examples/ascii_lantern.scene.toml --sweep ascii.ramp=quadrants,braille --width 960 --height 540`*
 
 Both ramps still pick a glyph by the cell's mean luminance, one step of the ramp per band. Picking a pattern to match the cell's *sub-cell* luminance instead (a quadrant or braille pattern from each part's own brightness, so an edge falls inside a cell) needs the glyph pass to sample those parts, and isn't done yet; every one of the 16 quadrant and 256 braille patterns is in the atlas for it.
 
@@ -91,7 +93,7 @@ corners = "┌┐└┘├┤┬┴┼"       # optional (#348): 4 glyphs (the c
 
 - `corners` lists the glyphs where edge lines meet, in this order: `┌ ┐ └ ┘` (corners), `├ ┤ ┬ ┴` (tees), `┼`. Without it, ASCII edges keep their line glyphs at corners ([corners](stylize-passes.md#corners)).
 
-- A TTF atlas holds printable ASCII plus every glyph the set's ramps and edges name. A glyph the font lacks is an error that names it (`the font has no glyph for '漢'`).
+- A TTF atlas holds the printable ASCII its font has plus every glyph the set's ramps and edges name. A ramp or edge glyph the font lacks is an error that names it (`the font has no glyph for '漢'`); ASCII it lacks is left out (#935), so a font of emoji, cuneiform or any other script loads with no Latin letters at all, as long as its ramps and `[edges]` name only its own glyphs.
 - A set with no `[ramps]` gets the built-in ramps that its font can draw, re-sorted by coverage in that font.
 - Unknown keys are errors, so a misspelled `glyph =` fails loudly rather than being ignored.
 - A ramp in a project's set that steps backwards in ink in its font (a later glyph with less than the one before) is logged when the set loads, naming the pairs: `ramp `x` gives a brighter input less ink in its font at ':' > '-'`. The built-in `classic` is left as written on purpose and isn't reported.
@@ -115,6 +117,36 @@ On the GPU the ASCII style packs each step's band start beside its glyph in the 
 
 *A set loading Hack at 16 px (9x16 cells), drawn through the coverage-sorted `detailed` ramp. The ASCII edge glyphs don't fill their cells, so the outline reads as strokes, not a line.*
 
+## Sets in the examples
+
+Eleven sets beside the scenes in [`flint-examples/fonts/`](https://github.com/chrischaps/flint-examples/tree/main/fonts) give the look other characters (#935). Each draws a bundled font under the SIL Open Font License, with the licence beside the font in `flint-examples/fonts/ofl/<Family>/OFL.txt`; [`flint-examples/fonts/ofl/README.md`](https://github.com/chrischaps/flint-examples/blob/main/fonts/ofl/README.md) lists where each came from and how it was cut down to the glyphs its set uses. Name one as any set: `ascii.font = "kana"` in a scene, `--style ascii:font=kana` on a command line.
+
+![The lantern scene in every set](../images/ascii-lantern-glyph-sets.png)
+
+*`flint render flint-examples/ascii_lantern.scene.toml --style "ascii:ramp=,cell=14" --sweep ascii.font=builtin,phosphor,typewriter,poster,geometric,stars,kana,brush,hangul,cuneiform,moon,runes --width 1920 --height 1080 --sweep-crop 700,380,480,270`: each cell 1:1 from a 1080p frame. `ramp=` gives each set its own default ramp in place of the scene's `classic`.*
+
+| Set | Font | Cell | Ramps (default first) | What it does to the look |
+|---|---|---|---|---|
+| `phosphor` | VT323 | 8x20 | `listing`, `classic` | A DEC terminal's letters in cells two and a half times as tall as wide: the frame splits into rows with dark lines between them, a green-screen listing. Corners are `+`. |
+| `typewriter` | Cutive Mono | 10x18 | `ink` | Thin slab serifs. Its densest glyph inks 0.15 of a cell, so the frame reads pale and printed. Corners are `+`. |
+| `poster` | Rubik Mono One | 11x16 | `shout`, `letters` | Heavy capitals, inked up to 0.43 of a cell: tone climbs in big loud steps. |
+| `geometric` | Major Mono Display | 12x16 | `drafting` | Circles and rules, its lowercase drawn as small capitals: a blueprint. |
+| `stars` | Noto Sans Symbols 2 | 11x16 | `night`, `chess`, `rings` | Dots, stars and sparks; a chessboard from white pawn to black king; rings that fill. |
+| `kana` | DotGothic16 | 12x16 | `katakana`, `hiragana`, `strokes`, `kanji` | A Japanese pixel font: falling-code katakana, softer hiragana, kanji by stroke count. Box-drawing edges and corners. |
+| `brush` | Yuji Syuku | 14x20 | `kanji`, `strokes`, `hiragana` | The same kanji in a brush hand: sumi ink, the darkest cells a blot of 鬱. |
+| `hangul` | Gowun Batang | 13x18 | `syllables` | A Korean serif: a dot, a stroke, a circle, then syllable blocks of two to four jamo. |
+| `cuneiform` | Noto Sans Cuneiform | 11x16 | `count`, `clay` | One wedge, two, then the numerals three to nine; the edges are wedges too (𒀸 𒁹 𒀹). Rows of small signs, like a tablet. |
+| `moon` | Noto Emoji | 18x16 | `phases`, `weather` | No letters at all: tone is the moon's phase (the heaviest ramp here, up to half a cell of ink), or the weather from cloud to sun. Outlines are ✨. |
+| `runes` | Noto Sans Runic | 11x16 | `futhark` | The Elder Futhark. Runes were cut across the grain of wood and have no horizontal staves, so the level edges stay `-`. |
+
+What the comparison showed:
+
+- **Cell size decides whether a script reads.** At the default `cell = 8` every set but the Latin ones is texture, a tone in a grain of its own; kana, kanji, Hangul, cuneiform and the moons read as themselves from about 14 points, and are fully legible at 16. The cell is in points at any resolution, so a 960x540 frame doesn't draw smaller glyphs than a 1080p one: it draws half as many, and a prop gets half as many columns of them. At 960x540 and `cell = 8` the sets differ mostly in brightness (how much ink their ramp reaches) and grain; `phosphor`'s tall cells stripe the frame, and `moon` is much the brightest.
+- **Ink falls in two ramps written in a meaningful order**, which are kept as written so you can see it: `brush`'s `strokes` (13-stroke 雷 inks less than 8-stroke 画 in a brush hand, where in DotGothic16 the same ramp rises cleanly) and `cuneiform`'s `count` (four wedges stacked in two rows ink less than three in one). Each has a twin with `map = "coverage"` (`kanji`, `clay`), which the other ramps use too, so every default ramp is monotone; `flint gen` on the set shows the fall.
+- **Per-script Noto fonts keep Latin's line metrics**, so a cuneiform sign fills less than half its cell's height. The cell is the line height by the widest advance of what the set holds; a CJK or Hangul font gives a squarer cell than a Latin one, and an emoji font a wider one.
+- **Box drawing joins in CJK and Hangul fonts** (they carry `─ │ ┌ ┐ ...` from their national character sets), so `kana`, `brush` and `hangul` outline with closed lines and corners as the built-in set does. A Latin font's `- | / \` leave gaps between cells.
+- **Dropped: handwriting.** Caveat, a handwritten script, was tried: it is proportional, so each glyph sits in a cell as wide as its widest letter, and its strokes are thin (a densest glyph of 0.15). At ASCII cell sizes the hand disappears into a field of `#` and `@`. A hand-drawn look is better drawn as pixel text, as `halftone` is.
+
 ## Naming a set
 
 `GlyphSetCache::get(name)` resolves:
@@ -127,7 +159,7 @@ On the GPU the ASCII style packs each step's band start beside its glyph in the 
 
 Failures are cached too, so a bad name warns once rather than every frame, and the warning lists every path tried.
 
-**Hot reload** (#323). Natively, `GlyphSetCache::poll` checks the modified times of every file a cached set depended on: its `.glyphs.toml`, the font file that names, and every place searched ahead of it (absent ones too: a set that appears beside the scene takes over from the project's at the next poll). When one changes it clears the cache, the next `get` reads the set again, and the ASCII style, which polls a few times a second, uploads the new atlas. So a ramp edited with `flint edit` or `flint play` open redraws the frame within a second, and a name that failed (a typo, a missing font file) loads once the file is there. A set that loaded and then breaks (a half-typed table, a font file deleted) keeps drawing its last good glyphs, with one warning that ends `keeping the previous glyphs`, until the next save that changes the files (#286). On the web the bundle is fixed and nothing is polled. `examples/ascii_tidepool.scene.toml` names `examples/fonts/tidepool.glyphs.toml` to try it on.
+**Hot reload** (#323). Natively, `GlyphSetCache::poll` checks the modified times of every file a cached set depended on: its `.glyphs.toml`, the font file that names, and every place searched ahead of it (absent ones too: a set that appears beside the scene takes over from the project's at the next poll). When one changes it clears the cache, the next `get` reads the set again, and the ASCII style, which polls a few times a second, uploads the new atlas. So a ramp edited with `flint edit` or `flint play` open redraws the frame within a second, and a name that failed (a typo, a missing font file) loads once the file is there. A set that loaded and then breaks (a half-typed table, a font file deleted) keeps drawing its last good glyphs, with one warning that ends `keeping the previous glyphs`, until the next save that changes the files (#286). On the web the bundle is fixed and nothing is polled. [`flint-examples/ascii_tidepool.scene.toml`](https://github.com/chrischaps/flint-examples/blob/main/ascii_tidepool.scene.toml) names [`flint-examples/fonts/tidepool.glyphs.toml`](https://github.com/chrischaps/flint-examples/blob/main/fonts/tidepool.glyphs.toml) to try it on.
 
 ## Sprite text
 
@@ -167,9 +199,9 @@ flint gen fonts/terminal.glyphs.toml -o out/            # the sheet and every pi
 flint gen fonts/terminal.glyphs.toml --dry-run          # the summary alone
 ```
 
-![flint gen on examples/fonts/halftone.glyphs.toml](../images/glyph-set-sheet-halftone.png)
+![flint gen on flint-examples/fonts/halftone.glyphs.toml](../images/glyph-set-sheet-halftone.png)
 
-*`flint gen examples/fonts/halftone.glyphs.toml -o halftone.png`: the atlas as packed, the edge glyphs, then a row for each ramp with the sphere specimen next to the ramp's measured ink, one bar per step with its glyph underneath. The dotted line runs evenly from the first step's ink to the last. A step whose ink falls below the step before it is drawn in red, and so is the note above the chart.*
+*`flint gen flint-examples/fonts/halftone.glyphs.toml -o halftone.png`: the atlas as packed, the edge glyphs, then a row for each ramp with the sphere specimen next to the ramp's measured ink, one bar per step with its glyph underneath. The dotted line runs evenly from the first step's ink to the last. A step whose ink falls below the step before it is drawn in red, and so is the note above the chart.*
 
 Every run prints a summary with a line for each ramp: its glyphs, each step's ink, and either `rises`, `calibrated` for a `map = "coverage"` ramp, or the neighbours where a brighter input gets less ink (`GlyphRamp::inversions`):
 

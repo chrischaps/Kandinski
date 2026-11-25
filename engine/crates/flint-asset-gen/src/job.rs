@@ -1,7 +1,10 @@
-//! Job tracking for async generation tasks
+//! Job tracking for generations that wait in a provider's queue (Meshy's
+//! models, which take minutes; Flux's images, queued on fal, #1186).
 //!
-//! Jobs are persisted as `.job.toml` files in `.flint/jobs/` so they
-//! survive process restarts.
+//! A job is written to `.flint/jobs/<id>.job.toml` the moment the provider
+//! accepts (and bills) the task, and updated as it is polled, so a paid task
+//! outlives the process that started it: `flint asset job list` shows it and
+//! `flint asset job resume <id>` finishes it (#721).
 
 use flint_core::{FlintError, Result};
 use serde::{Deserialize, Serialize};
@@ -22,9 +25,18 @@ pub enum JobStatus {
 pub struct GenerationJob {
     /// Unique job ID (UUID)
     pub id: String,
-    /// Provider-specific remote job ID (if any)
+    /// Provider-specific remote job ID (if any): for Meshy, the preview task
     #[serde(default)]
     pub remote_id: Option<String>,
+    /// Where the provider's result is fetched, when its id alone doesn't
+    /// say (fal's `response_url`; its status is this plus `/status`)
+    #[serde(default)]
+    pub remote_url: Option<String>,
+    /// The task that builds on `remote_id`'s, once it is submitted: Meshy's
+    /// refine of its preview (#1187). A job with none resumes at the first
+    /// stage, without paying for it again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refine_id: Option<String>,
     /// Provider name
     pub provider: String,
     /// Asset name being generated
@@ -45,6 +57,9 @@ pub struct GenerationJob {
     /// Output path once complete
     #[serde(default)]
     pub output_path: Option<String>,
+    /// What its submits were recorded as costing in the ledger, summed
+    #[serde(default)]
+    pub estimated_usd: Option<f64>,
 }
 
 impl GenerationJob {
@@ -53,6 +68,8 @@ impl GenerationJob {
         Self {
             id: uuid::Uuid::new_v4().to_string(),
             remote_id: None,
+            remote_url: None,
+            refine_id: None,
             provider: provider.to_string(),
             asset_name: asset_name.to_string(),
             status: JobStatus::Submitted,
@@ -61,11 +78,13 @@ impl GenerationJob {
             error: None,
             prompt: None,
             output_path: None,
+            estimated_usd: None,
         }
     }
 }
 
 /// File-based job store in `.flint/jobs/`
+#[derive(Debug, Clone)]
 pub struct JobStore {
     root: PathBuf,
 }
@@ -137,6 +156,7 @@ impl JobStore {
             }
         }
 
+        jobs.sort_by(|a, b| a.submitted_at.cmp(&b.submitted_at).then(a.id.cmp(&b.id)));
         Ok(jobs)
     }
 

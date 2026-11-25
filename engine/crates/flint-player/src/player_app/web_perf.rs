@@ -9,9 +9,10 @@
 //! earlier or later from frame to frame, so timing those would show
 //! jitter that no one sees.
 //!
-//! wgpu can't say which adapter it got on the web (its `AdapterInfo` is
-//! empty there), so the page asks the browser itself, once, with the same
-//! high-performance preference wgpu asks with.
+//! wgpu can't say which adapter it got on the web (its `AdapterInfo` has
+//! only a `name`, the browser's `GPUAdapterInfo.description`, which Chrome
+//! and Firefox leave empty; #949), so the page asks the browser itself,
+//! once, with the same high-performance preference wgpu asks with.
 //!
 //! The WebGPU calls are counted by the page, which wraps `submit`,
 //! `writeBuffer`, `createBindGroup`, `createBuffer` and `beginRenderPass`
@@ -84,20 +85,19 @@ pub(super) fn record_frame(t: f64) {
     });
 }
 
-/// The rAF intervals in the window, and the seconds they cover.
-fn raf_frames() -> Option<(Spread, f64)> {
+/// The rAF intervals in the window, the seconds they cover, and the
+/// refresh they fall on, ms (`frame_rate::estimate_refresh`).
+fn raf_frames() -> Option<(Spread, f64, Option<f32>)> {
     RAF.with(|r| {
         let r = r.borrow();
-        let ms: Vec<f32> = r
-            .iter()
-            .zip(r.iter().skip(1))
-            .map(|(a, b)| (b - a) as f32)
-            .collect();
+        let ms: Vec<f64> = r.iter().zip(r.iter().skip(1)).map(|(a, b)| b - a).collect();
         let secs = match (r.front(), r.back()) {
             (Some(a), Some(b)) => (b - a) / 1000.0,
             _ => 0.0,
         };
-        Spread::of(&ms).map(|s| (s, secs))
+        let refresh = super::frame_rate::estimate_refresh(&ms).map(|p| p as f32);
+        let ms: Vec<f32> = ms.iter().map(|&m| m as f32).collect();
+        Spread::of(&ms).map(|s| (s, secs, refresh))
     })
 }
 
@@ -180,12 +180,19 @@ impl PlayerApp {
                     .map(|p| (p.id, p.position)),
             )
         });
+        // The page's Save trace (#1097), shown while the recorder records
+        if self.stats.perf.trace.is_some() && super::web_page::trace_wanted() {
+            self.ask_trace("Save trace");
+        }
         if !self.perf_due(EVERY) {
             return;
         }
         let Some(panel) = element("perf") else {
             return;
         };
+        if self.stats.perf.trace.is_some() {
+            let _ = panel.set_attribute("data-trace", "");
+        }
         let user_agent = web_sys::window()
             .and_then(|w| w.navigator().user_agent().ok())
             .unwrap_or_default();
@@ -194,11 +201,17 @@ impl PlayerApp {
         else {
             return;
         };
-        let frames_begun = self.stats.perf.as_ref().map_or(0, |p| p.frames_begun);
+        let frames_begun = self.stats.perf.frames_begun;
         context.webgpu = calls_per_frame(frames_begun);
-        if let Some((frames, secs)) = raf_frames() {
+        // The renderer's own count beside the page's (#1091): two readings
+        // of the same frames, which should agree in kind
+        context.gpu_calls = self.window_gpu_calls();
+        if let Some((frames, secs, refresh_ms)) = raf_frames() {
             summary.frames = frames;
             summary.secs = secs;
+            // Unpaced, nothing measured the refresh: read it from the same
+            // intervals, which fall on the display's frames (#1318)
+            context.refresh_ms = context.refresh_ms.or(refresh_ms);
         }
         let _ = panel.remove_attribute("hidden");
         let (touch_rows, touch_part) = TOUCHES.with(|t| {

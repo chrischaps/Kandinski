@@ -1,6 +1,8 @@
 # Rendering
 
-Flint uses wgpu 23 for cross-platform GPU rendering, providing physically-based rendering (PBR) with a Cook-Torrance BRDF, cascaded shadow mapping, optional 4x MSAA, and full glTF mesh support.
+> **Package:** `engine`, the kernel: every game has it ([Packages](packages.md)).
+
+Flint uses wgpu 30 for cross-platform GPU rendering, providing physically-based rendering (PBR) with a Cook-Torrance BRDF, cascaded shadow mapping, optional 4x MSAA, and full glTF mesh support.
 
 ## PBR Shading
 
@@ -34,9 +36,9 @@ The camera mode is determined by the entry point: `edit` uses orbit, `play` uses
 
 ### World lines
 
-`SceneRenderer::set_world_lines(Vec<WorldLine>, pixels_per_point)` gives the renderer segments to draw in every following frame, until they're replaced. Each `flint_core::world_line::WorldLine` has two world points, a display-space RGBA colour and a width in logical points. The player sets them each frame from the scripts' `draw_world_line` calls.
+A frame's `FrameInputs::world_lines` are the segments the renderer draws that frame (a frame that passes none draws none), at the frame's `pixels_per_point`. Each `flint_core::world_line::WorldLine` has two world points, a display-space RGBA colour and a width in logical points. The player passes the scripts' `draw_world_line` calls each frame.
 
-They're drawn after the composite and FXAA, straight onto the final target, before the HUD. Each segment is projected with the frame's own camera and cut at the near plane. It's expanded on the CPU into a screen-space quad of the requested width, with a one-pixel feather that the fragment shader fades. That's the anti-aliasing, since the pass comes after MSAA and FXAA. The pass tests against the frame's resolved single-sample depth (`LessEqual`) and doesn't write depth. Each end is pulled toward the eye by 0.2% of its distance (`world_line_pipeline::DEPTH_SLACK`), so a line lying on a surface doesn't fight it for depth. The colours are display-space, like the HUD's, and they're linearised when the target is sRGB, so a ring keeps the colour it had as a HUD line. The pipeline is built on the first frame that has lines, and its vertex buffer grows to fit the busiest frame. A renderer without the HDR chain and with MSAA has no resolved depth, so it skips the pass.
+They're drawn after the composite and FXAA, straight onto the final target, before the HUD. Each segment is projected with the frame's own camera and cut at the near plane. It's expanded on the CPU into a screen-space quad of the requested width, with a one-pixel feather that the fragment shader fades. That's the anti-aliasing, since the pass comes after MSAA and FXAA. The pass tests against the frame's resolved single-sample depth (`LessEqual`) and doesn't write depth. Each end is pulled toward the eye by 0.2% of its distance (`flint_render::WORLD_LINE_DEPTH_SLACK`), so a line lying on a surface doesn't fight it for depth. The colours are display-space, like the HUD's, and they're linearised when the target is sRGB, so a ring keeps the colour it had as a HUD line. The pipeline is built on the first frame that has lines, and its vertex buffer grows to fit the busiest frame. A renderer without the HDR chain and with MSAA has no resolved depth, so it skips the pass.
 
 ### World text
 
@@ -85,7 +87,7 @@ Code can build meshes while the game runs and draw them like imported models. A 
 
 **Vertex colours.** `ImportedMaterial::vertex_colored(name)` makes a material that takes its colour from each vertex. One mesh can then carry many colours without one material per colour. Vertex colours are **linear**, so convert sRGB values such as hex codes with `flint_render::srgb_to_linear`, or they wash out.
 
-**Ray targets.** A runtime mesh can also be something rays meet ([ADR 0105](https://github.com/chrischaps/Flint/blob/main/docs/adr/0105-rays-against-drawn-meshes.md)), so a game describes a building once, to draw it, and a camera keeping out of walls or a click picking a roof meets the same triangles. `SceneRenderer::set_ray_mesh(name, Some(mesh))` hands over a `flint_geometry::ray_mesh::RayMesh` built from the positions and indices the mesh was uploaded with: its triangles under a bounding volume hierarchy, kept on the CPU. Each `update_from_world` then places it, for every entity drawing the mesh, at that entity's world matrix, in a new `RayScene`, which `SceneRenderer::ray_scene()` hands out. Uploading the mesh again or removing it stops it being a target, so set it after each upload. A player extension does both at once with `ExtensionGpu::upload_mesh_with(.., MeshOptions { ray_target: true })`.
+**Ray targets.** A runtime mesh can also be something rays meet ([ADR 0105](https://github.com/chrischaps/Flint/blob/main/docs/adr/0105-rays-against-drawn-meshes.md)), so a game describes a building once, to draw it, and a camera keeping out of walls or a click picking a roof meets the same triangles. `SceneRenderer::set_ray_mesh(name, Some(mesh))` hands over a `flint_geometry::ray_mesh::RayMesh` built from the positions and indices the mesh was uploaded with: its triangles under a bounding volume hierarchy, kept on the CPU. Each frame's `prepare` then places it, for every entity drawing the mesh, at that entity's world matrix, in a new `RayScene`, which `SceneRenderer::ray_scene()` hands out. Uploading the mesh again or removing it stops it being a target, so set it after each upload. A player extension does both at once with `ExtensionGpu::upload_mesh_with(.., MeshOptions { ray_target: true })`.
 
 The scene is made while the frame's draws are gathered, before culling, so a target off screen or behind the camera is still met, and the player hands it to scripts after each update: a ray cast during a frame meets things where the last frame drew them. `RayScene::cast(origin, dir, max)` and `segment(from, to)` answer with a `RayHit`: the entity, the distance in world units, the point, the normal (turned to face the ray's origin) and the triangle's index in the mesh's `indices`. Triangles are two-sided, so a ray from inside a box meets its far wall. The scene tests each placed mesh's world box and casts into the mesh's own space, so a scale or a turn on the entity is honoured; it walks the placed meshes one by one, so make targets of what rays need to meet (the buildings, not the lamps on them), and merge many small meshes into a few.
 
@@ -108,7 +110,7 @@ Keep a model's levels as primitives of **one mesh on one node**. A GLB with seve
 
 An entity's `lod` component caps a whole model: `draw_distance = 300` stops drawing it (and its shadow) when the camera is 300 m from its bounds. It applies to a multi-node model's nodes too.
 
-Two runtime scales serve quality settings: the **LOD scale** multiplies every `near`/`far`, so 0.5 drops models to their simpler levels at half the distance, and the **draw-distance scale** multiplies every `draw_distance`. Scripts call `set_lod_scale(s)` and `set_draw_distance_scale(s)` (applied after the frame's scripts, kept across scenes) and read them with `get_lod_scale()` and `get_draw_distance_scale()`; Rust calls `SceneRenderer::set_lod_settings`. They start at 1, or at `FLINT_LOD_SCALE` and `FLINT_DRAW_DISTANCE_SCALE`, and are clamped to 0.05 and up. `FLINT_LOD_SCALE=1000` holds every model at its first level, for comparisons. `RenderStats::lod_culled_draws` counts the draws set aside by level or distance (they're also in `culled_draws`), and `--exit-after` prints it.
+Two runtime scales serve quality settings: the **LOD scale** multiplies every `near`/`far`, so 0.5 drops models to their simpler levels at half the distance, and the **draw-distance scale** multiplies every `draw_distance`. They are the [quality settings](quality-settings.md)' `lod_scale` and `draw_distance_scale`, so `--quality lod_scale=0.5,draw_distance_scale=2`, the web page's `?quality=` and a script's `set_quality(#{ lod_scale: 0.5 })` set them like any other key. Scripts also call `set_lod_scale(s)` and `set_draw_distance_scale(s)` (applied after the frame's scripts, kept across scenes) and read them with `get_lod_scale()` and `get_draw_distance_scale()`; Rust calls `SceneRenderer::set_lod_settings`. They start at 1, or at their aliases `FLINT_LOD_SCALE` and `FLINT_DRAW_DISTANCE_SCALE` when `--quality` doesn't give them, and are clamped to 0.05 and up. `FLINT_LOD_SCALE=1000` holds every model at its first level, for comparisons. `RenderStats::lod_culled_draws` counts the draws set aside by level or distance (they're also in `culled_draws`), and `--exit-after` prints it.
 
 ## Skinned Mesh Pipeline
 
@@ -188,7 +190,7 @@ The renderer includes an HDR post-processing pipeline that applies bloom, SSAO, 
 
 When post-processing is active, all scene pipelines render to an `Rgba16Float` HDR intermediate buffer. A composite fullscreen pass then applies exposure, ACES tonemapping and the rest of the chain to produce the final sRGB output.
 
-Configure post-processing per-scene via the `[post_process]` TOML block, override with `flint render` flags (`--no-postprocess`, `--bloom-intensity`, `--exposure`, `--dof`, `--grade-gain`, and the rest of the set listed on the post-processing page), or tune it live from the F4 menu.
+Configure post-processing per-scene via the `[post_process]` TOML block, override any key headlessly with `flint render --set post.<key>=<value>` (`--set post.exposure=1.5`; `flint render --list-effects` lists the keys) or `--no-postprocess`, or tune it live from the F4 menu.
 
 ## PBR Materials
 
@@ -202,7 +204,7 @@ A glTF material with `"doubleSided": true` is drawn from both sides (#623). That
 
 ![Two palms built alike, their fronds single cards seen from below: the left palm's material is doubleSided](../images/double-sided-palms.png)
 
-*`examples/double_sided.scene.toml`: the same palm twice, each frond one strip of cards wound with its face up, seen from under the crowns. The left palm's frond material is `doubleSided`, so every underside draws. The right palm's isn't, so only the fronds that face the camera are left.*
+*[`flint-examples/double_sided.scene.toml`](https://github.com/chrischaps/flint-examples/blob/main/double_sided.scene.toml): the same palm twice, each frond one strip of cards wound with its face up, seen from under the crowns. The left palm's frond material is `doubleSided`, so every underside draws. The right palm's isn't, so only the fronds that face the camera are left.*
 
 A double-sided material:
 
@@ -211,7 +213,7 @@ A double-sided material:
 - **casts shadows from both sides**, so a card shadows the ground whichever way it faces the sun;
 - **is outlined and styled on both faces**, since the style mask and veil already draw both.
 
-For a runtime mesh, set `ImportedMaterial::double_sided`. Single-sided is the cheaper choice for closed solids: culling saves the back half of their fragments. A card generator that writes every card twice, the second copy wound the other way, can write it once with `doubleSided` instead, at half the triangles. The palms' models come from `tools/test-models/double_sided_palm.py`, and the test fixture `testModels/DoubleSidedCard.glb` from `double_sided_card.py` beside it.
+For a runtime mesh, set `ImportedMaterial::double_sided`. Single-sided is the cheaper choice for closed solids: culling saves the back half of their fragments. A card generator that writes every card twice, the second copy wound the other way, can write it once with `doubleSided` instead, at half the triangles. The palms' models come from `tools/test-models/double_sided_palm.py`, and the test fixture `tests/fixtures/models/DoubleSidedCard.glb` from `double_sided_card.py` beside it.
 
 ### Emission
 
@@ -241,6 +243,16 @@ let lamp = ImportedMaterial {
 
 Vertex RGB may go past 1 for bright lights. In this mode vertex alpha is no longer opacity, but the entity's `material.opacity` still applies. A glowing face keeps its normal, so it can still take a faint specular highlight on top, like lit glass.
 
+#### A glowing box
+
+An entity drawn from its `bounds` has no mesh to carry emission, so it takes it from **`material.emissive`** (#797): `[r, g, b]`, linear, added after lighting. Above 1 is what bloom takes up, so a placeholder lamp or a sun marker glows before it has a model. `emissive_scale` multiplies it, and unset is no light. On a model the key is not read: its emission is the GLB's, recoloured with `material_overrides` (below).
+
+```toml
+[entities.lamp.material]
+color = [1.0, 0.8, 0.5, 1.0]
+emissive = [9.0, 6.0, 2.5]
+```
+
 #### Changing the glow after upload
 
 A mesh's emission is set when it's uploaded, but an entity can scale it every frame with **`material.emissive_scale`** ([ADR 0090](https://github.com/chrischaps/Flint/blob/main/docs/adr/0090-emission-scale-after-upload.md)). It multiplies all of the mesh's emission: the material's own `emissive` and the per-vertex kind. The default is 1, which is the mesh as uploaded. Nothing is re-uploaded, so a city's worth of windows can come on with the evening as one number per entity.
@@ -250,7 +262,7 @@ A mesh's emission is set when it's uploaded, but an entity can scale it every fr
 emissive_scale = 0.0   # off by day; a script or extension raises it at dusk
 ```
 
-- **Where it applies:** imported and runtime meshes, skinned or not. An entity with no scale of its own takes its parent's, so a GLB expanded into child nodes dims as one.
+- **Where it applies:** imported and runtime meshes, skinned or not, and boxes drawn from `bounds`, whose light is their own `material.emissive` (below). An entity with no scale of its own takes its parent's, so a GLB expanded into child nodes dims as one.
 - **Zero is dark.** At 0, a per-vertex light face goes black, like an unlit bulb. It doesn't turn back into a lit, see-through surface, and surface vertices are lit as usual. Negative values count as 0.
 - **Only the strength changes.** To slide a face from lit paint by day to light by night, use `glow_surface` as well (below). Glass that is lit like any surface and gives off light from its material's `emissive` is often enough: at 0 it's plain glass.
 - **Cost:** a new scale rebuilds that draw's small material uniform on the next frame, as a new `opacity` does. If hundreds of entities glow at once, change the value in steps rather than by a hair every frame.
@@ -303,7 +315,7 @@ fn on_update() {
 }
 ```
 
-`examples/emissive_recolor.scene.toml` is five figures of one skinned GLB, whose joints have no emission of their own, and two lanterns whose glass glows through a texture, all walking one palette a stage every 2.5 s under a moon that still lights them (`flint render examples/emissive_recolor.scene.toml --scripts --time 0..10 --fps 12 -o glow.gif`).
+[`flint-examples/emissive_recolor.scene.toml`](https://github.com/chrischaps/flint-examples/blob/main/emissive_recolor.scene.toml) is five figures of one skinned GLB, whose joints have no emission of their own, and two lanterns whose glass glows through a texture, all walking one palette a stage every 2.5 s under a moon that still lights them (`flint render flint-examples/emissive_recolor.scene.toml --scripts --time 0..10 --fps 12 -o glow.gif`).
 
 ![Five figures from one GLB, their joints glowing magenta to cyan along the row, under moonlight](../images/emissive-recolor.png)
 
@@ -389,7 +401,7 @@ flint render levels/tavern.scene.toml --output preview.png --width 1920 --height
 
 ## Technology
 
-The rendering stack uses winit 0.30's `ApplicationHandler` trait pattern (not the older event-loop closure style). wgpu 23 provides the GPU abstraction, selecting the best available backend (Vulkan, Metal, or DX12) at runtime.
+The rendering stack uses winit 0.30's `ApplicationHandler` trait pattern (not the older event-loop closure style). wgpu 30 provides the GPU abstraction, selecting the best available backend (Vulkan, Metal, or DX12) at runtime.
 
 ## Further Reading
 

@@ -7,6 +7,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use web_time::Instant;
 
+use crate::debug_keys::DebugKeysConfig;
 use crate::touch_controls::{TouchControls, TouchControlsConfig};
 use winit::keyboard::KeyCode;
 
@@ -77,6 +78,10 @@ pub struct InputConfig {
     /// has the block replaces the whole of an earlier one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub touch_controls: Option<TouchControlsConfig>,
+    /// The debug keys' rebinds and switch (#717): `[debug_keys]`. A later
+    /// layer's `enabled` and each action it names win.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub debug_keys: Option<DebugKeysConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -220,6 +225,69 @@ fn default_config_version() -> u32 {
     1
 }
 
+/// The actions a UI document's focus reads (#731, flint-script's
+/// `ui::focus`), in every game unless its config binds them otherwise: the
+/// arrows, a pad's d-pad and left stick move focus; Enter, Space and a pad's
+/// south button activate; Backspace and the east button go back. Escape is
+/// left out: a game that binds Escape keeps the window open on it (#639),
+/// so binding it here would change every game's Escape; a game that wants
+/// it binds `ui_back` to it itself.
+fn ui_actions() -> Vec<(&'static str, Vec<Binding>)> {
+    let key = |code: &str| Binding::Key {
+        code: code.into(),
+        scale: 1.0,
+    };
+    let pad = |button: &str| Binding::GamepadButton {
+        button: button.into(),
+        gamepad: GamepadSelector::Any,
+    };
+    let stick = |axis: &str, direction: AxisDirection| Binding::GamepadAxis {
+        axis: axis.into(),
+        gamepad: GamepadSelector::Any,
+        deadzone: default_deadzone(),
+        scale: 1.0,
+        invert: false,
+        threshold: Some(0.5),
+        direction: Some(direction),
+    };
+    use AxisDirection::{Negative, Positive};
+    vec![
+        (
+            "ui_up",
+            vec![key("ArrowUp"), pad("DPadUp"), stick("LeftStickY", Positive)],
+        ),
+        (
+            "ui_down",
+            vec![
+                key("ArrowDown"),
+                pad("DPadDown"),
+                stick("LeftStickY", Negative),
+            ],
+        ),
+        (
+            "ui_left",
+            vec![
+                key("ArrowLeft"),
+                pad("DPadLeft"),
+                stick("LeftStickX", Negative),
+            ],
+        ),
+        (
+            "ui_right",
+            vec![
+                key("ArrowRight"),
+                pad("DPadRight"),
+                stick("LeftStickX", Positive),
+            ],
+        ),
+        (
+            "ui_accept",
+            vec![key("Enter"), key("NumpadEnter"), key("Space"), pad("South")],
+        ),
+        ("ui_back", vec![key("Backspace"), pad("East")]),
+    ]
+}
+
 fn default_scale() -> f32 {
     1.0
 }
@@ -263,22 +331,41 @@ impl InputConfig {
                 }],
             },
         );
+        for (action, binding) in ui_actions() {
+            actions.insert(
+                action.into(),
+                ActionConfig {
+                    kind: ActionKind::Button,
+                    bindings: binding,
+                },
+            );
+        }
         Self {
             version: default_config_version(),
             game_id: "flint".into(),
             actions,
             touch_controls: None,
+            debug_keys: None,
         }
     }
 
     /// Whether any action binds `key`. The player asks this of Escape: a
     /// game that binds it gets it, and the window doesn't close (#639).
     pub fn binds_key(&self, key: KeyCode) -> bool {
-        self.actions.values().any(|action| {
-            action.bindings.iter().any(
-                |b| matches!(b, Binding::Key { code, .. } if parse_key_code(code) == Some(key)),
-            )
-        })
+        self.action_binding_key(key).is_some()
+    }
+
+    /// The first action (by name) that binds `key`, if any. A debug key
+    /// on it stands aside for the game (#717).
+    pub fn action_binding_key(&self, key: KeyCode) -> Option<&str> {
+        self.actions
+            .iter()
+            .find(|(_, action)| {
+                action.bindings.iter().any(
+                    |b| matches!(b, Binding::Key { code, .. } if parse_key_code(code) == Some(key)),
+                )
+            })
+            .map(|(name, _)| name.as_str())
     }
 
     pub fn from_toml_str(content: &str) -> Result<Self> {
@@ -319,6 +406,9 @@ impl InputConfig {
         if let Some(touch) = &self.touch_controls {
             touch.validate().map_err(FlintError::RuntimeError)?;
         }
+        if let Some(debug_keys) = &self.debug_keys {
+            debug_keys.validate().map_err(FlintError::RuntimeError)?;
+        }
         Ok(())
     }
 }
@@ -344,6 +434,8 @@ pub struct InputState {
     mouse_delta: (f64, f64),
     raw_mouse_delta: (f64, f64),
     mouse_wheel_delta: (f32, f32),
+    /// What was typed this frame, in order (#1229).
+    text_edits: Vec<crate::TextEdit>,
 
     touches: HashMap<u64, TouchPoint>,
     touches_just_started: HashSet<u64>,
@@ -395,6 +487,7 @@ impl InputState {
             mouse_delta: (0.0, 0.0),
             raw_mouse_delta: (0.0, 0.0),
             mouse_wheel_delta: (0.0, 0.0),
+            text_edits: Vec::new(),
             touches: HashMap::new(),
             touches_just_started: HashSet::new(),
             touches_just_ended: HashSet::new(),
@@ -474,6 +567,12 @@ impl InputState {
         if let Some(touch) = overlay.touch_controls {
             self.touch_controls.set_config(Some(touch.clone()));
             self.config.touch_controls = Some(touch);
+        }
+        if let Some(debug_keys) = overlay.debug_keys {
+            self.config
+                .debug_keys
+                .get_or_insert_with(Default::default)
+                .merge(debug_keys);
         }
         self.last_frame_pressed_actions
             .retain(|action| self.config.actions.contains_key(action));
@@ -574,6 +673,17 @@ impl InputState {
             self.keys_just_pressed.insert(key);
         }
         self.keys_down.insert(key);
+    }
+
+    /// Something typed this frame: a character, an IME's string or an
+    /// editing key, which a UI document's `text_input` reads (#1229).
+    pub fn process_text_edit(&mut self, edit: crate::TextEdit) {
+        self.text_edits.push(edit);
+    }
+
+    /// What was typed this frame, oldest first.
+    pub fn text_edits(&self) -> &[crate::TextEdit] {
+        &self.text_edits
     }
 
     pub fn process_key_up(&mut self, key: KeyCode) {
@@ -904,6 +1014,7 @@ impl InputState {
         self.mouse_delta = (0.0, 0.0);
         self.raw_mouse_delta = (0.0, 0.0);
         self.mouse_wheel_delta = (0.0, 0.0);
+        self.text_edits.clear();
         self.touches_just_started.clear();
         self.touches_just_ended.clear();
         self.touch_tap_just_fired.clear();
@@ -1435,7 +1546,10 @@ fn validate_binding(binding: &Binding, action_name: &str) -> Result<()> {
     Ok(())
 }
 
-fn binding_label(binding: &Binding) -> String {
+/// How a binding reads to a player: `W`, `LShift`, `Mouse1`, `Pad:South`,
+/// `Pad:LeftStickX-` (what `primary_binding_label` and the controls line
+/// say, #716)
+pub fn binding_label(binding: &Binding) -> String {
     match binding {
         Binding::Key { code, .. } => key_code_label(code),
         Binding::MouseButton { button } => match button.as_str() {
@@ -1561,6 +1675,28 @@ pub fn parse_key_code(code: &str) -> Option<KeyCode> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every game has the UI's actions (#731) from the keys, the d-pad,
+    /// the stick and the face buttons, and none of them takes Escape.
+    #[test]
+    fn the_ui_actions_come_from_keys_and_a_pad() {
+        let mut input = InputState::new();
+        input.process_gamepad_button_down(0, "DPadDown");
+        assert!(input.is_action_just_pressed("ui_down"));
+        input.process_gamepad_button_down(0, "South");
+        assert!(input.is_action_just_pressed("ui_accept"));
+        input.process_gamepad_button_down(0, "East");
+        assert!(input.is_action_just_pressed("ui_back"));
+        input.process_key_down(KeyCode::ArrowUp);
+        assert!(input.is_action_just_pressed("ui_up"));
+        input.process_key_down(KeyCode::Enter);
+        assert!(input.is_action_just_pressed("ui_accept"));
+        input.end_frame();
+        input.process_gamepad_axis(0, "LeftStickX", 0.9);
+        assert!(input.is_action_just_pressed("ui_right"));
+        assert!(!input.is_action_pressed("ui_left"));
+        assert!(!InputConfig::built_in_defaults().binds_key(KeyCode::Escape));
+    }
 
     #[test]
     fn binds_key_sees_a_games_escape() {

@@ -1,16 +1,50 @@
-//! Cascaded Shadow Mapping
+//! Cascaded Shadow Mapping, and one spot light's shadow
 //!
 //! Renders the scene from the primary directional light's perspective into
 //! a depth texture array (one layer per cascade). The main shader samples
 //! this texture to compute shadow factors.
+//!
+//! After the cascades, [`SPOT_SHADOW_LAYER`] is one spot light's
+//! perspective shadow map (#504, ADR 0124): the spot that `cast_shadows`
+//! chose, drawn when it is chosen, whether or not a sun casts. It is a layer
+//! of the same texture rather than a texture of its own so that every lit
+//! shader reads it through the binding it already has.
+//!
+//! The last, [`POINT_SHADOW_LAYER`], is one point light's cube shadow map
+//! (#1112, ADR 0132): its six faces side by side in one layer, three across
+//! and two down, each a third of the layer wide ([`point_face_size`]).
 
+use crate::gpu_counts::{CountedDevice, CountedQueue};
 use crate::primitives::{SkinnedVertex, Vertex};
 use crate::wooze_pipeline::ShallowWoozeUniforms;
+use crate::TrustedShader;
 use bytemuck::{Pod, Zeroable};
-use wgpu::util::DeviceExt;
 
 /// Number of shadow cascades
 pub const CASCADE_COUNT: usize = 3;
+
+/// The layer of the shadow map array a spot light's shadow is drawn into,
+/// after the cascades (#504). The WGSL says `3` where it reads it.
+pub const SPOT_SHADOW_LAYER: usize = CASCADE_COUNT;
+
+/// The layer of the shadow map array a point light's six cube faces are
+/// drawn into, after the spot's (#1112). The WGSL says `4` where it reads it.
+pub const POINT_SHADOW_LAYER: usize = CASCADE_COUNT + 1;
+
+/// Layers of the shadow map array: the cascades, the spot's, the point's.
+pub const SHADOW_LAYERS: usize = CASCADE_COUNT + 2;
+
+/// How far past 45 degrees each cube face's map reaches, as the tan of its
+/// half-angle (about 47.2 degrees). The lookup picks a face by the dominant
+/// axis, so the edge of a face is at tan 1; the band past it holds the
+/// texels a soft shadow's kernel reaches for near a seam, so a tap never
+/// leaves the face it started on.
+pub const POINT_FACE_TAN_HALF: f32 = 1.08;
+
+/// The widest cone a spot's shadow map covers, as a half-angle (80 degrees).
+/// A perspective map wider than that spends its texels on the rim; a spot
+/// whose `outer_angle` is wider is shadowed out to here and lit past it.
+pub const SPOT_SHADOW_MAX_HALF_ANGLE: f32 = 80.0 * std::f32::consts::PI / 180.0;
 
 /// Default shadow map resolution per cascade
 pub const DEFAULT_SHADOW_RESOLUTION: u32 = 2048;
@@ -49,6 +83,25 @@ pub struct ShadowUniforms {
     /// w = 0.0 means "PCSS off" and shaders take the legacy 3×3 PCF path
     /// verbatim, so stale/default uniforms keep pre-lever behavior.
     pub pcss: [f32; 4],
+    /// The spot's shadow (#504): world to the spot map's clip space
+    /// ([`SPOT_SHADOW_LAYER`]). The struct is declared once in WGSL,
+    /// `lights.wgsl` (#738), and every lit shader takes all of it.
+    pub spot_view_proj: [[f32; 4]; 4],
+    /// x = near plane, y = far plane (the light's `range`), z = tan of the
+    /// map's half-angle, w = 1.0 when the spot map was drawn this frame.
+    /// w = 0 lights every spot as before.
+    pub spot: [f32; 4],
+    /// The point light's cube (#1112): world to each face's clip space, in
+    /// the order +X, -X, +Y, -Y, +Z, -Z. Face `f` is drawn at column `f % 3`,
+    /// row `f / 3` of [`POINT_SHADOW_LAYER`].
+    pub point_view_proj: [[[f32; 4]; 4]; 6],
+    /// x = near plane, y = far plane (the light's `range`), z = tan of each
+    /// face's half-angle ([`POINT_FACE_TAN_HALF`]), w = 1.0 when the cube was
+    /// drawn this frame. w = 0 lights every point light as before.
+    pub point: [f32; 4],
+    /// x = one face's width as a share of the layer, y = one face's width in
+    /// texels; zw unused.
+    pub point_atlas: [f32; 4],
 }
 
 impl Default for ShadowUniforms {
@@ -63,6 +116,11 @@ impl Default for ShadowUniforms {
             cascade_view_proj: [identity; CASCADE_COUNT],
             cascade_splits: [0.0; 4],
             pcss: [0.0; 4],
+            spot_view_proj: identity,
+            spot: [0.0; 4],
+            point_view_proj: [identity; 6],
+            point: [0.0; 4],
+            point_atlas: [0.0; 4],
         }
     }
 }
@@ -77,9 +135,12 @@ pub struct ShadowPass {
     /// `skinned_shadow_pipeline` culling nothing (#623).
     pub skinned_shadow_pipeline_double_sided: wgpu::RenderPipeline,
     pub skinned_shadow_bone_layout: wgpu::BindGroupLayout,
+    /// Held while its views draw and sample it.
+    #[allow(dead_code)]
     pub shadow_texture: wgpu::Texture,
     pub shadow_view: wgpu::TextureView,
-    pub cascade_views: Vec<wgpu::TextureView>,
+    /// One view a layer, to draw into: the cascades, the spot's, the point's.
+    pub layer_views: Vec<wgpu::TextureView>,
     pub shadow_sampler: wgpu::Sampler,
     pub shadow_uniforms_buffer: wgpu::Buffer,
     /// One uniform buffer for every shadow draw of the frame (all cascades),
@@ -101,9 +162,6 @@ pub struct ShadowPass {
     /// The uniforms on the GPU say "no shadows" (see `write_off_uniforms`).
     pub(crate) shadows_written_off: bool,
     shadow_uniforms: ShadowUniforms,
-    /// Its [`gpu_id`](crate::bind_cache::gpu_id): bind groups kept over its
-    /// views and buffers name it (#139). A new resolution is a new pass.
-    pub id: u64,
     /// The pipelines for shallow wooze's casters (#215), once a scene has some.
     pub(crate) wooze: Option<ShadowWooze>,
 }
@@ -127,9 +185,9 @@ const WOOZY_SHADOW_BINDING: u64 = (std::mem::size_of::<ShadowDrawUniforms>()
 
 impl ShadowPass {
     pub fn new(device: &wgpu::Device, resolution: u32) -> Self {
-        let shadow_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        let shadow_shader = device.create_trusted_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Shadow Shader"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("shadow_shader.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(crate::wgsl_sources::SHADOW.into()),
         });
 
         // Bind group layout for shadow draw uniforms
@@ -153,18 +211,18 @@ impl ShadowPass {
         let shadow_pipeline_layout =
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("Shadow Pipeline Layout"),
-                bind_group_layouts: &[&shadow_bind_group_layout],
-                push_constant_ranges: &[],
+                bind_group_layouts: &[Some(&shadow_bind_group_layout)],
+                immediate_size: 0,
             });
 
         let make_shadow = |label: &str, cull_mode: Option<wgpu::Face>| {
-            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            device.create_render_pipeline_counted(&wgpu::RenderPipelineDescriptor {
                 label: Some(label),
                 layout: Some(&shadow_pipeline_layout),
                 vertex: wgpu::VertexState {
                     module: &shadow_shader,
                     entry_point: Some("vs_shadow"),
-                    buffers: &[Vertex::desc()],
+                    buffers: &[Some(Vertex::desc())],
                     compilation_options: Default::default(),
                 },
                 fragment: None, // Depth only, no fragment shader
@@ -179,8 +237,8 @@ impl ShadowPass {
                 },
                 depth_stencil: Some(wgpu::DepthStencilState {
                     format: wgpu::TextureFormat::Depth32Float,
-                    depth_write_enabled: true,
-                    depth_compare: wgpu::CompareFunction::Less,
+                    depth_write_enabled: Some(true),
+                    depth_compare: Some(wgpu::CompareFunction::Less),
                     stencil: wgpu::StencilState::default(),
                     bias: wgpu::DepthBiasState {
                         constant: 2,
@@ -189,7 +247,7 @@ impl ShadowPass {
                     },
                 }),
                 multisample: wgpu::MultisampleState::default(),
-                multiview: None,
+                multiview_mask: None,
                 cache: None,
             })
         };
@@ -217,18 +275,21 @@ impl ShadowPass {
         let skinned_shadow_pipeline_layout =
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("Skinned Shadow Pipeline Layout"),
-                bind_group_layouts: &[&shadow_bind_group_layout, &skinned_shadow_bone_layout],
-                push_constant_ranges: &[],
+                bind_group_layouts: &[
+                    Some(&shadow_bind_group_layout),
+                    Some(&skinned_shadow_bone_layout),
+                ],
+                immediate_size: 0,
             });
 
         let make_skinned_shadow = |label: &str, cull_mode: Option<wgpu::Face>| {
-            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            device.create_render_pipeline_counted(&wgpu::RenderPipelineDescriptor {
                 label: Some(label),
                 layout: Some(&skinned_shadow_pipeline_layout),
                 vertex: wgpu::VertexState {
                     module: &shadow_shader,
                     entry_point: Some("vs_skinned_shadow"),
-                    buffers: &[SkinnedVertex::desc()],
+                    buffers: &[Some(SkinnedVertex::desc())],
                     compilation_options: Default::default(),
                 },
                 fragment: None,
@@ -243,8 +304,8 @@ impl ShadowPass {
                 },
                 depth_stencil: Some(wgpu::DepthStencilState {
                     format: wgpu::TextureFormat::Depth32Float,
-                    depth_write_enabled: true,
-                    depth_compare: wgpu::CompareFunction::Less,
+                    depth_write_enabled: Some(true),
+                    depth_compare: Some(wgpu::CompareFunction::Less),
                     stencil: wgpu::StencilState::default(),
                     bias: wgpu::DepthBiasState {
                         constant: 2,
@@ -253,7 +314,7 @@ impl ShadowPass {
                     },
                 }),
                 multisample: wgpu::MultisampleState::default(),
-                multiview: None,
+                multiview_mask: None,
                 cache: None,
             })
         };
@@ -262,19 +323,23 @@ impl ShadowPass {
         let skinned_shadow_pipeline_double_sided =
             make_skinned_shadow("Skinned Shadow Depth Pipeline (double-sided)", None);
 
-        // Create shadow depth texture array (one layer per cascade)
-        let shadow_texture = device.create_texture(&wgpu::TextureDescriptor {
+        // Create shadow depth texture array (one layer per cascade, then the
+        // spot's, then the point's six faces in one)
+        let shadow_texture = device.create_texture_counted(&wgpu::TextureDescriptor {
             label: Some("Shadow Map Array"),
             size: wgpu::Extent3d {
                 width: resolution,
                 height: resolution,
-                depth_or_array_layers: CASCADE_COUNT as u32,
+                depth_or_array_layers: SHADOW_LAYERS as u32,
             },
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format: wgpu::TextureFormat::Depth32Float,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::TEXTURE_BINDING
+                // Copied out by a frame capture (#1085)
+                | wgpu::TextureUsages::COPY_SRC,
             view_formats: &[],
         });
 
@@ -285,11 +350,11 @@ impl ShadowPass {
             ..Default::default()
         });
 
-        // Per-cascade views for rendering
-        let cascade_views: Vec<wgpu::TextureView> = (0..CASCADE_COUNT as u32)
+        // Per-layer views for rendering
+        let layer_views: Vec<wgpu::TextureView> = (0..SHADOW_LAYERS as u32)
             .map(|i| {
                 shadow_texture.create_view(&wgpu::TextureViewDescriptor {
-                    label: Some(&format!("Shadow Cascade {} View", i)),
+                    label: Some(&format!("Shadow Layer {} View", i)),
                     dimension: Some(wgpu::TextureViewDimension::D2),
                     base_array_layer: i,
                     array_layer_count: Some(1),
@@ -309,11 +374,12 @@ impl ShadowPass {
 
         // Shadow uniforms for the main shader (cascade matrices + splits)
         let shadow_uniforms = ShadowUniforms::default();
-        let shadow_uniforms_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Shadow Uniforms Buffer"),
-            contents: bytemuck::cast_slice(&[shadow_uniforms]),
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-        });
+        let shadow_uniforms_buffer =
+            device.create_buffer_init_counted(&wgpu::util::BufferInitDescriptor {
+                label: Some("Shadow Uniforms Buffer"),
+                contents: bytemuck::cast_slice(&[shadow_uniforms]),
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            });
 
         let (draw_buffer, draw_bind_group) = Self::create_draw_buffer(
             device,
@@ -330,7 +396,7 @@ impl ShadowPass {
             skinned_shadow_bone_layout,
             shadow_texture,
             shadow_view,
-            cascade_views,
+            layer_views,
             shadow_sampler,
             shadow_uniforms_buffer,
             draw_buffer,
@@ -342,7 +408,6 @@ impl ShadowPass {
             distance: flint_core::quality::DEFAULT_SHADOW_DISTANCE,
             shadows_written_off: false,
             shadow_uniforms,
-            id: crate::bind_cache::gpu_id(),
             wooze: None,
         }
     }
@@ -352,13 +417,13 @@ impl ShadowPass {
         layout: &wgpu::BindGroupLayout,
         capacity: u32,
     ) -> (wgpu::Buffer, wgpu::BindGroup) {
-        let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        let buffer = device.create_buffer_counted(&wgpu::BufferDescriptor {
             label: Some("Shadow Draw Uniforms (all draws)"),
             size: SHADOW_DRAW_STRIDE * capacity as u64,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        let bind_group = device.create_bind_group_counted(&wgpu::BindGroupDescriptor {
             layout,
             entries: &[wgpu::BindGroupEntry {
                 binding: 0,
@@ -398,7 +463,7 @@ impl ShadowPass {
         if self.wooze.is_some() {
             return;
         }
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        let shader = device.create_trusted_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Shallow Wooze Shadow Shader"),
             source: wgpu::ShaderSource::Wgsl(crate::wooze_pipeline::SHADOW_SOURCE.into()),
         });
@@ -422,16 +487,16 @@ impl ShadowPass {
                             cull_mode: Option<wgpu::Face>| {
             let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some(label),
-                bind_group_layouts: groups,
-                push_constant_ranges: &[],
+                bind_group_layouts: &groups.iter().copied().map(Some).collect::<Vec<_>>(),
+                immediate_size: 0,
             });
-            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            device.create_render_pipeline_counted(&wgpu::RenderPipelineDescriptor {
                 label: Some(label),
                 layout: Some(&pipeline_layout),
                 vertex: wgpu::VertexState {
                     module: &shader,
                     entry_point: Some(entry),
-                    buffers: &[buffer],
+                    buffers: &[Some(buffer)],
                     compilation_options: Default::default(),
                 },
                 fragment: None,
@@ -446,8 +511,8 @@ impl ShadowPass {
                 },
                 depth_stencil: Some(wgpu::DepthStencilState {
                     format: wgpu::TextureFormat::Depth32Float,
-                    depth_write_enabled: true,
-                    depth_compare: wgpu::CompareFunction::Less,
+                    depth_write_enabled: Some(true),
+                    depth_compare: Some(wgpu::CompareFunction::Less),
                     stencil: wgpu::StencilState::default(),
                     bias: wgpu::DepthBiasState {
                         constant: 2,
@@ -456,7 +521,7 @@ impl ShadowPass {
                     },
                 }),
                 multisample: wgpu::MultisampleState::default(),
-                multiview: None,
+                multiview_mask: None,
                 cache: None,
             })
         };
@@ -504,7 +569,7 @@ impl ShadowPass {
         layout: &wgpu::BindGroupLayout,
         buffer: &wgpu::Buffer,
     ) -> wgpu::BindGroup {
-        device.create_bind_group(&wgpu::BindGroupDescriptor {
+        device.create_bind_group_counted(&wgpu::BindGroupDescriptor {
             layout,
             entries: &[wgpu::BindGroupEntry {
                 binding: 0,
@@ -543,7 +608,7 @@ impl ShadowPass {
             let at = *slot as usize * stride + past;
             bytes[at..at + src.len()].copy_from_slice(src);
         }
-        queue.write_buffer(&self.draw_buffer, 0, &bytes);
+        queue.write_buffer_counted(&self.draw_buffer, 0, &bytes);
     }
 
     /// Upload uniforms that turn shadows off in every shader that samples
@@ -554,7 +619,7 @@ impl ShadowPass {
             return;
         }
         let off = ShadowUniforms::default();
-        queue.write_buffer(
+        queue.write_buffer_counted(
             &self.shadow_uniforms_buffer,
             0,
             bytemuck::cast_slice(&[off]),
@@ -660,9 +725,175 @@ impl ShadowPass {
         self.shadow_uniforms.pcss[3] = sun_tan_angular;
     }
 
+    /// Leave the cascades out of this frame's uniforms (no sun casts, but a
+    /// spot does): a far plane of 0 reads as "no sun shadow" in every shader.
+    pub fn clear_cascades(&mut self) {
+        let off = ShadowUniforms::default();
+        self.shadow_uniforms.cascade_view_proj = off.cascade_view_proj;
+        self.shadow_uniforms.cascade_splits = [0.0, 0.0, 0.0, 1.0 / self.resolution as f32];
+        self.shadow_uniforms.pcss = off.pcss;
+    }
+
+    /// Aim the spot layer at `spot`, or turn it off with `None` (#504). The
+    /// texel size the shaders read rides `cascade_splits.w` either way.
+    pub fn update_spot(&mut self, spot: Option<&crate::pipeline::SpotLight>) {
+        let u = &mut self.shadow_uniforms;
+        match spot.map(spot_shadow_frustum) {
+            Some(frustum) => {
+                u.cascade_splits[3] = 1.0 / self.resolution as f32;
+                u.spot_view_proj = frustum.view_proj;
+                u.spot = [frustum.near, frustum.far, frustum.tan_half, 1.0];
+            }
+            None => {
+                let off = ShadowUniforms::default();
+                u.spot_view_proj = off.spot_view_proj;
+                u.spot = off.spot;
+            }
+        }
+    }
+
+    /// Aim the point layer's six faces at `point`, or turn it off with
+    /// `None` (#1112), and return the faces to draw.
+    pub fn update_point(
+        &mut self,
+        point: Option<&crate::pipeline::PointLight>,
+    ) -> Option<PointShadowCube> {
+        let cube = point.map(|p| point_shadow_cube(p, self.resolution));
+        let u = &mut self.shadow_uniforms;
+        match &cube {
+            Some(cube) => {
+                u.cascade_splits[3] = 1.0 / self.resolution as f32;
+                for (slot, face) in u.point_view_proj.iter_mut().zip(&cube.faces) {
+                    *slot = face.view_proj;
+                }
+                u.point = [cube.near, cube.far, POINT_FACE_TAN_HALF, 1.0];
+                let size = cube.faces[0].viewport[2];
+                u.point_atlas = [size as f32 / self.resolution as f32, size as f32, 0.0, 0.0];
+            }
+            None => {
+                let off = ShadowUniforms::default();
+                u.point_view_proj = off.point_view_proj;
+                u.point = off.point;
+                u.point_atlas = off.point_atlas;
+            }
+        }
+        cube
+    }
+
     pub fn shadow_uniforms(&self) -> &ShadowUniforms {
         &self.shadow_uniforms
     }
+}
+
+/// The perspective a spot light's shadow map is drawn from (#504).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct SpotShadowFrustum {
+    pub view_proj: [[f32; 4]; 4],
+    pub near: f32,
+    pub far: f32,
+    pub tan_half: f32,
+}
+
+/// From the light's position down its axis, out to its `range`, wide enough
+/// to hold its outer cone (and the soft edge's filter past it), up to
+/// [`SPOT_SHADOW_MAX_HALF_ANGLE`].
+pub(crate) fn spot_shadow_frustum(spot: &crate::pipeline::SpotLight) -> SpotShadowFrustum {
+    let far = spot.radius.max(0.1);
+    // Near enough to catch a caster just under the lamp, far enough from 0
+    // that depth keeps its precision over the range
+    let near = (far * 0.004).clamp(0.02, 0.25);
+    let half = (spot.outer_angle.max(0.0) * 1.05 + 0.03).min(SPOT_SHADOW_MAX_HALF_ANGLE);
+    let tan_half = half.tan();
+    let dir = normalize_3(spot.direction);
+    let eye = spot.position;
+    let target = [eye[0] + dir[0], eye[1] + dir[1], eye[2] + dir[2]];
+    // Straight up or down, the world's up is the axis itself: take z instead
+    let up = if dir[1].abs() > 0.99 {
+        [0.0, 0.0, 1.0]
+    } else {
+        [0.0, 1.0, 0.0]
+    };
+    let view = look_at_up(&eye, &target, &up);
+    let proj = perspective(tan_half, near, far);
+    SpotShadowFrustum {
+        view_proj: mat4_mul(&proj, &view),
+        near,
+        far,
+        tan_half,
+    }
+}
+
+/// One face of a point light's cube shadow map (#1112): its view and where
+/// in [`POINT_SHADOW_LAYER`] it is drawn.
+#[derive(Debug, Clone, Copy)]
+pub struct PointShadowFace {
+    pub view_proj: [[f32; 4]; 4],
+    /// x, y, width (= height) in texels
+    pub viewport: [u32; 3],
+}
+
+/// A point light's six faces, +X, -X, +Y, -Y, +Z, -Z, and the planes they
+/// share.
+#[derive(Debug, Clone, Copy)]
+pub struct PointShadowCube {
+    pub faces: [PointShadowFace; 6],
+    pub near: f32,
+    pub far: f32,
+}
+
+/// A cube face's width in texels at a layer of `resolution`: three faces go
+/// across the layer, two down.
+pub fn point_face_size(resolution: u32) -> u32 {
+    (resolution / 3).max(1)
+}
+
+/// The axis each cube face looks down, in the shader's order, and the up its
+/// view takes (any not along the axis does: the shader reads each face
+/// through its own matrix).
+const POINT_FACES: [([f32; 3], [f32; 3]); 6] = [
+    ([1.0, 0.0, 0.0], [0.0, 1.0, 0.0]),
+    ([-1.0, 0.0, 0.0], [0.0, 1.0, 0.0]),
+    ([0.0, 1.0, 0.0], [0.0, 0.0, 1.0]),
+    ([0.0, -1.0, 0.0], [0.0, 0.0, 1.0]),
+    ([0.0, 0.0, 1.0], [0.0, 1.0, 0.0]),
+    ([0.0, 0.0, -1.0], [0.0, 1.0, 0.0]),
+];
+
+/// The six perspectives a point light's cube is drawn from: from the light
+/// down each axis out to its `range`, a little wider than a quarter turn
+/// ([`POINT_FACE_TAN_HALF`]), with the near plane the spot's takes.
+pub(crate) fn point_shadow_cube(
+    point: &crate::pipeline::PointLight,
+    resolution: u32,
+) -> PointShadowCube {
+    let far = point.radius.max(0.1);
+    let near = (far * 0.004).clamp(0.02, 0.25);
+    let proj = perspective(POINT_FACE_TAN_HALF, near, far);
+    let size = point_face_size(resolution);
+    let eye = point.position;
+    let faces = std::array::from_fn(|f| {
+        let (axis, up) = POINT_FACES[f];
+        let target = [eye[0] + axis[0], eye[1] + axis[1], eye[2] + axis[2]];
+        let view = look_at_up(&eye, &target, &up);
+        PointShadowFace {
+            view_proj: mat4_mul(&proj, &view),
+            viewport: [(f as u32 % 3) * size, (f as u32 / 3) * size, size],
+        }
+    });
+    PointShadowCube { faces, near, far }
+}
+
+/// A square perspective projection, wgpu's depth: `near` to 0, `far` to 1
+/// (as `Camera`'s, ADR 0055).
+fn perspective(tan_half: f32, near: f32, far: f32) -> [[f32; 4]; 4] {
+    let f = 1.0 / tan_half.max(1e-4);
+    let depth = far - near;
+    [
+        [f, 0.0, 0.0, 0.0],
+        [0.0, f, 0.0, 0.0],
+        [0.0, 0.0, -far / depth, -1.0],
+        [0.0, 0.0, -(far * near) / depth, 0.0],
+    ]
 }
 
 /// Splits for all `CASCADE_COUNT` slots from `count` cascades' splits: the
@@ -824,9 +1055,13 @@ fn dot(a: &[f32; 3], b: &[f32; 3]) -> f32 {
 
 /// Look-at view matrix (column-major for wgpu)
 fn look_at(eye: &[f32; 3], target: &[f32; 3]) -> [[f32; 4]; 4] {
+    look_at_up(eye, target, &[0.0, 1.0, 0.0])
+}
+
+/// [`look_at`] with an up of the caller's: one not along the view.
+fn look_at_up(eye: &[f32; 3], target: &[f32; 3], up: &[f32; 3]) -> [[f32; 4]; 4] {
     let f = normalize_3([target[0] - eye[0], target[1] - eye[1], target[2] - eye[2]]);
-    let up = [0.0, 1.0, 0.0];
-    let s = normalize_3(cross(&f, &up));
+    let s = normalize_3(cross(&f, up));
     let u = cross(&s, &f);
 
     [
@@ -881,6 +1116,206 @@ fn mat4_mul_point(m: &[[f32; 4]; 4], p: &[f32; 3]) -> [f32; 3] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pipeline::SpotLight;
+
+    /// A world point through the spot map: (u, v, depth).
+    fn spot_uv(frustum: &SpotShadowFrustum, p: [f32; 3]) -> (f32, f32, f32) {
+        let m = &frustum.view_proj;
+        let clip: Vec<f32> = (0..4)
+            .map(|row| m[0][row] * p[0] + m[1][row] * p[1] + m[2][row] * p[2] + m[3][row])
+            .collect();
+        let (x, y, z) = (clip[0] / clip[3], clip[1] / clip[3], clip[2] / clip[3]);
+        (x * 0.5 + 0.5, -y * 0.5 + 0.5, z)
+    }
+
+    fn spot(direction: [f32; 3]) -> SpotLight {
+        SpotLight {
+            position: [1.0, 4.0, -2.0],
+            radius: 9.0,
+            direction,
+            outer_angle: 30f32.to_radians(),
+            intensity: 10.0,
+            shadow: 1.0,
+            ..SpotLight::default()
+        }
+    }
+
+    #[test]
+    fn a_spot_map_looks_down_the_light_to_its_range() {
+        // Straight down is the common case, and the one where the world's up
+        // is the axis itself
+        for direction in [[0.0, -1.0, 0.0], [0.3, -1.0, 0.2], [1.0, 0.0, 0.0]] {
+            let light = spot(direction);
+            let frustum = spot_shadow_frustum(&light);
+            let axis = normalize_3(direction);
+            let at = |d: f32| {
+                [
+                    light.position[0] + axis[0] * d,
+                    light.position[1] + axis[1] * d,
+                    light.position[2] + axis[2] * d,
+                ]
+            };
+            let (u, v, near) = spot_uv(&frustum, at(frustum.near));
+            assert!(
+                (u - 0.5).abs() < 1e-4 && (v - 0.5).abs() < 1e-4,
+                "{direction:?}"
+            );
+            assert!(near.abs() < 1e-4, "{direction:?}: near plane at {near}");
+            let (_, _, far) = spot_uv(&frustum, at(light.radius));
+            assert!((far - 1.0).abs() < 1e-4, "{direction:?}: range at {far}");
+            let (_, _, mid) = spot_uv(&frustum, at(3.0));
+            assert!(mid > 0.0 && mid < 1.0, "{direction:?}");
+        }
+    }
+
+    #[test]
+    fn a_spot_map_holds_its_outer_cone() {
+        let light = spot([0.0, -1.0, 0.0]);
+        let frustum = spot_shadow_frustum(&light);
+        // A point on the cone's edge, 3 m down
+        let r = 3.0 * light.outer_angle.tan();
+        let (u, v, _) = spot_uv(&frustum, [light.position[0] + r, 1.0, light.position[2]]);
+        assert!(u > 0.0 && u < 1.0 && (v - 0.5).abs() < 1e-3, "{u} {v}");
+        assert!((u - 0.5).abs() > 0.4, "the cone fills the map: {u}");
+        // A cone past the cap is held to it
+        let wide = SpotLight {
+            outer_angle: 89f32.to_radians(),
+            ..light
+        };
+        let tan_cap = SPOT_SHADOW_MAX_HALF_ANGLE.tan();
+        assert!((spot_shadow_frustum(&wide).tan_half - tan_cap).abs() < 1e-4);
+    }
+
+    /// The face the shader picks for a direction from the light: the
+    /// dominant axis, x before y before z on a tie (`point_face` in
+    /// `shadows.wgsl`).
+    fn shader_face(d: [f32; 3]) -> usize {
+        let a = [d[0].abs(), d[1].abs(), d[2].abs()];
+        if a[0] >= a[1] && a[0] >= a[2] {
+            if d[0] > 0.0 {
+                0
+            } else {
+                1
+            }
+        } else if a[1] >= a[2] {
+            if d[1] > 0.0 {
+                2
+            } else {
+                3
+            }
+        } else if d[2] > 0.0 {
+            4
+        } else {
+            5
+        }
+    }
+
+    fn face_uv(m: &[[f32; 4]; 4], p: [f32; 3]) -> (f32, f32, f32, f32) {
+        let clip: Vec<f32> = (0..4)
+            .map(|row| m[0][row] * p[0] + m[1][row] * p[1] + m[2][row] * p[2] + m[3][row])
+            .collect();
+        let (x, y, z) = (clip[0] / clip[3], clip[1] / clip[3], clip[2] / clip[3]);
+        (x * 0.5 + 0.5, -y * 0.5 + 0.5, z, clip[3])
+    }
+
+    #[test]
+    fn every_direction_lands_inside_the_face_the_shader_picks() {
+        let light = crate::pipeline::PointLight {
+            position: [0.5, 1.2, -0.7],
+            radius: 8.0,
+            intensity: 3.0,
+            shadow: 1.0,
+            ..crate::pipeline::PointLight::default()
+        };
+        let cube = point_shadow_cube(&light, 2048);
+        // The edge of a face (tan 1) sits this far in from the map's edge,
+        // the band a soft kernel may reach into
+        let band = 0.5 * (1.0 - 1.0 / POINT_FACE_TAN_HALF);
+        let mut seen = [false; 6];
+        // A spiral of directions over the sphere, and the axes and the
+        // cube's corners, where three faces meet
+        let mut dirs: Vec<[f32; 3]> = (0..400)
+            .map(|i| {
+                let t = (i as f32 + 0.5) / 400.0;
+                let z = 1.0 - 2.0 * t;
+                let r = (1.0 - z * z).sqrt();
+                let a = i as f32 * 2.39996;
+                [r * a.cos(), z, r * a.sin()]
+            })
+            .collect();
+        for (axis, _) in POINT_FACES {
+            dirs.push(axis);
+        }
+        for x in [-1.0, 1.0] {
+            for y in [-1.0, 1.0] {
+                for z in [-1.0, 1.0] {
+                    dirs.push([x, y, z]);
+                }
+            }
+        }
+        for d in dirs {
+            let f = shader_face(d);
+            seen[f] = true;
+            let dist = 3.0;
+            let len = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
+            let p = [
+                light.position[0] + d[0] / len * dist,
+                light.position[1] + d[1] / len * dist,
+                light.position[2] + d[2] / len * dist,
+            ];
+            let (u, v, depth, w) = face_uv(&cube.faces[f].view_proj, p);
+            assert!(w > 0.0, "{d:?} is in front of face {f}");
+            assert!(
+                (band - 1e-4..=1.0 - band + 1e-4).contains(&u)
+                    && (band - 1e-4..=1.0 - band + 1e-4).contains(&v),
+                "{d:?} on face {f} at ({u}, {v}), outside its quarter turn"
+            );
+            assert!(depth > 0.0 && depth < 1.0, "{d:?}: depth {depth}");
+        }
+        assert!(seen.iter().all(|s| *s), "every face is picked: {seen:?}");
+    }
+
+    #[test]
+    fn a_point_cube_reaches_the_lights_range_and_tiles_one_layer() {
+        let light = crate::pipeline::PointLight {
+            position: [0.0, 2.0, 0.0],
+            radius: 6.0,
+            intensity: 3.0,
+            ..crate::pipeline::PointLight::default()
+        };
+        let cube = point_shadow_cube(&light, 2048);
+        for (f, (axis, _)) in POINT_FACES.iter().enumerate() {
+            let at = |d: f32| {
+                [
+                    light.position[0] + axis[0] * d,
+                    light.position[1] + axis[1] * d,
+                    light.position[2] + axis[2] * d,
+                ]
+            };
+            let (u, v, near, _) = face_uv(&cube.faces[f].view_proj, at(cube.near));
+            assert!((u - 0.5).abs() < 1e-4 && (v - 0.5).abs() < 1e-4, "face {f}");
+            assert!(near.abs() < 1e-4, "face {f}: near at {near}");
+            let (_, _, far, _) = face_uv(&cube.faces[f].view_proj, at(light.radius));
+            assert!((far - 1.0).abs() < 1e-4, "face {f}: range at {far}");
+        }
+        // Six tiles, three across and two down, none overlapping, all inside
+        let size = point_face_size(2048);
+        assert_eq!(size, 682);
+        let tiles: Vec<[u32; 3]> = cube.faces.iter().map(|f| f.viewport).collect();
+        for (i, a) in tiles.iter().enumerate() {
+            assert_eq!(a[2], size);
+            assert!(a[0] + size <= 2048 && a[1] + size <= 2048);
+            for b in &tiles[i + 1..] {
+                assert!(
+                    a[0] + size <= b[0]
+                        || b[0] + size <= a[0]
+                        || a[1] + size <= b[1]
+                        || b[1] + size <= a[1],
+                    "{a:?} overlaps {b:?}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn fewer_cascades_cover_the_same_reach() {

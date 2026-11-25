@@ -10,9 +10,10 @@
 //! strokes a little on each drawing of the field (the flat
 //! `[post_process] kuwahara_boil` before #599, folded in the same way).
 
+use crate::gpu_counts::CountedQueue;
 use super::kit;
 use super::{
-    StyleDescriptor, StyleDevice, StyleFrame, StyleHint, StyleInput, StyleParam, StylePass,
+    StyleDescriptor, StyleDevice, StyleFrame, StyleInput, StyleParam, StylePass,
     StyleStage,
 };
 use crate::postprocess::HDR_FORMAT;
@@ -25,39 +26,22 @@ pub(super) static STYLE: StyleDescriptor = StyleDescriptor::new(
     create,
 )
 .params(&[
-    StyleParam::new("radius", 4.0, 1.0..=8.0),
-    StyleParam::new("sharpness", 8.0, 1.0..=16.0),
-    StyleParam::new("hardness", 8.0, 1.0..=16.0),
-    StyleParam::new("anisotropy", 1.0, 0.0..=2.0),
-    StyleParam::new("boil", 0.0, 0.0..=1.0),
-])
-.hints(&[
-    StyleHint::new(
-        "radius",
-        "Radius (px)",
-        "The brush: each sector's reach in scene pixels; bigger is more painterly and costs more",
-    )
-    .integer(),
-    StyleHint::new(
-        "sharpness",
-        "Sharpness",
-        "How strongly the least varied sector wins; lower blends sectors more softly",
-    ),
-    StyleHint::new(
-        "hardness",
-        "Hardness",
-        "How sharply sectors fall off; lower gives broader, smoother strokes",
-    ),
-    StyleHint::new(
-        "anisotropy",
-        "Anisotropy",
-        "How far strokes stretch along the image's edges; 0 is round",
-    ),
-    StyleHint::new(
-        "boil",
-        "Boil",
-        "How far each drawing of the wooze field moves the paint, as a share of the radius; needs a [wooze] table",
-    ),
+    StyleParam::new("radius", 4.0, 1.0..=8.0)
+        .label("Radius (px)")
+        .help("The brush: each sector's reach in scene pixels; bigger is more painterly and costs more")
+        .integer(),
+    StyleParam::new("sharpness", 8.0, 1.0..=16.0)
+        .label("Sharpness")
+        .help("How strongly the least varied sector wins; lower blends sectors more softly"),
+    StyleParam::new("hardness", 8.0, 1.0..=16.0)
+        .label("Hardness")
+        .help("How sharply sectors fall off; lower gives broader, smoother strokes"),
+    StyleParam::new("anisotropy", 1.0, 0.0..=2.0)
+        .label("Anisotropy")
+        .help("How far strokes stretch along the image's edges; 0 is round"),
+    StyleParam::new("boil", 0.0, 0.0..=1.0)
+        .label("Boil")
+        .help("How far each drawing of the wooze field moves the paint, as a share of the radius; needs a [wooze] table"),
 ]);
 
 fn create(d: &StyleDevice) -> Box<dyn StylePass> {
@@ -71,6 +55,13 @@ struct TexelUniforms {
     texel_size: [f32; 2],
     _pad: [f32; 2],
 }
+
+/// The largest radius the filter takes, in pixels (#945). A scene's radius
+/// is kept as written past its tuned 1..8, but the shader's sector loops run
+/// `-radius..=radius` with loop bounding off (built-in WGSL is trusted), so
+/// it is capped here: a radius near `i32::MAX` would wrap and never end. At
+/// 32 a pixel already reads 65 x 65 x 8 taps.
+const MAX_RADIUS: f32 = 32.0;
 
 /// The filter pass's uniforms.
 #[repr(C)]
@@ -100,11 +91,11 @@ mod tests {
 struct Kuwahara {
     uniform_bgl: wgpu::BindGroupLayout,
     sampled_bgl: wgpu::BindGroupLayout,
-    tensor_pipeline: wgpu::RenderPipeline,
+    tensor_pipeline: std::sync::Arc<wgpu::RenderPipeline>,
     tensor_uniforms: wgpu::Buffer,
-    blur_pipeline: wgpu::RenderPipeline,
+    blur_pipeline: std::sync::Arc<wgpu::RenderPipeline>,
     blur_uniforms: wgpu::Buffer,
-    pipeline: wgpu::RenderPipeline,
+    pipeline: std::sync::Arc<wgpu::RenderPipeline>,
     uniforms: wgpu::Buffer,
 }
 
@@ -121,7 +112,7 @@ impl Kuwahara {
             &kit::shader(
                 device,
                 "Kuwahara Tensor Shader",
-                kit::wgsl!("kuwahara_tensor.wgsl"),
+                kit::wgsl!("prelude_core.wgsl", "kuwahara_tensor.wgsl"),
             ),
             &layouts,
             HDR_FORMAT,
@@ -140,7 +131,7 @@ impl Kuwahara {
         let pipeline = kit::fullscreen_pipeline(
             device,
             "Kuwahara Pipeline",
-            &kit::shader(device, "Kuwahara Shader", kit::wgsl!("kuwahara.wgsl")),
+            &kit::shader(device, "Kuwahara Shader", kit::wgsl!("noise.wgsl", "kuwahara.wgsl")),
             &[&uniform_bgl, &sampled_bgl, &sampled_bgl],
             d.format,
         );
@@ -178,8 +169,8 @@ impl StylePass for Kuwahara {
                 _pad: [0.0; 2],
             };
             let bytes = bytemuck::cast_slice(std::slice::from_ref(&texel));
-            frame.queue.write_buffer(&self.tensor_uniforms, 0, bytes);
-            frame.queue.write_buffer(&self.blur_uniforms, 0, bytes);
+            frame.queue.write_buffer_counted(&self.tensor_uniforms, 0, bytes);
+            frame.queue.write_buffer_counted(&self.blur_uniforms, 0, bytes);
         }
         let tensor = frame.target("kuwahara tensor", HDR_FORMAT);
         let tensor_blur = frame.target("kuwahara tensor blur", HDR_FORMAT);
@@ -223,8 +214,9 @@ impl StylePass for Kuwahara {
         // Pass 3: the filter, oriented by the blurred tensor
         let uniforms = KuwaharaUniforms {
             texel_size,
-            // Whole pixels, as the old `kuwahara_radius: u32` was
-            radius: frame.param("radius").round().max(1.0),
+            // Whole pixels, as the old `kuwahara_radius: u32` was, and at
+            // most MAX_RADIUS so the shader's `y <= radius` loops end
+            radius: frame.param("radius").round().max(1.0).min(MAX_RADIUS),
             sharpness: frame.param("sharpness"),
             hardness: frame.param("hardness"),
             anisotropy: frame.param("anisotropy"),
@@ -235,7 +227,7 @@ impl StylePass for Kuwahara {
         };
         frame
             .queue
-            .write_buffer(&self.uniforms, 0, bytemuck::cast_slice(&[uniforms]));
+            .write_buffer_counted(&self.uniforms, 0, bytemuck::cast_slice(&[uniforms]));
         kit::fullscreen_pass(
             encoder,
             "Kuwahara Pass",

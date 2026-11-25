@@ -1,0 +1,28 @@
+# AI asset generation and every paid call's meter (Phase 5's pipeline,
+# #721). A feature: a game that never generates links none of it. Its spec
+# writer builds on procgen's generators, so procgen comes with it.
+#
+# Its flags on the procgen and kernel commands (`gen --ai-*`, `--max-cost`,
+# `--cost-report`, `--style-guide`, `render --ai-refine`, `asset resolve
+# --strategy ai_*`) are its too: flint-cli's `ai` feature (#1333) gates
+# them, and without it each exits 2 naming this package.
+
+[package]
+name = "ai"
+version = "0.1.0"
+tier = "feature"
+summary = "AI asset generation, AI-written procgen specs and the cost ledger"
+engine = "^0.1"
+
+[requires]
+procgen = "*"
+
+[build]
+features = ["ai"]
+
+[provides]
+crates = ["flint-asset-gen", "flint-procgen-ai", "flint-ai-core"]
+commands = [
+    "asset generate", "asset regenerate", "asset validate", "asset manifest",
+    "asset costs", "asset job",
+]

@@ -84,9 +84,24 @@ pub fn json(report: &Report) -> serde_json::Value {
         "summary": summary(report),
         "errors": diagnostic::count(&report.diagnostics, diagnostic::Severity::Error),
         "warnings": diagnostic::count(&report.diagnostics, diagnostic::Severity::Warning),
+        "allowed": report.allowed,
         "scenes": report.scenes,
         "files": report.files,
         "scripts": report.scripts,
         "diagnostics": report.diagnostics,
     })
+}
+
+/// `flint check` and `flint script check` answer with it; an error fails
+/// the run (#710).
+impl crate::output::Report for Report {
+    fn text(&self) -> String {
+        text(self)
+    }
+    fn json(&self) -> serde_json::Value {
+        json(self)
+    }
+    fn failed(&self) -> bool {
+        self.has_errors()
+    }
 }

@@ -8,6 +8,8 @@
 //! [`DepthUpscale`] copies it into the caller's surface-sized depth view,
 //! nearest texel, so the overlays drawn against it still are.
 
+use crate::gpu_counts::CountedDevice;
+use crate::TrustedShader;
 /// The smallest scale [`SceneRenderer::set_render_scale`] accepts.
 ///
 /// [`SceneRenderer::set_render_scale`]: crate::SceneRenderer::set_render_scale
@@ -36,14 +38,15 @@ pub fn scaled_size(width: u32, height: u32, scale: f32) -> (u32, u32) {
 
 /// The scene's own depth buffer while it is drawn below the surface's size.
 pub(crate) struct ScaledDepth {
-    // Held so the view's texture lives as long as it
-    _texture: wgpu::Texture,
+    // Held so the view's texture lives as long as it, and described with
+    // the frame (#1084)
+    pub texture: wgpu::Texture,
     pub view: wgpu::TextureView,
 }
 
 impl ScaledDepth {
     pub fn new(device: &wgpu::Device, width: u32, height: u32) -> Self {
-        let texture = device.create_texture(&wgpu::TextureDescriptor {
+        let texture = device.create_texture_counted(&wgpu::TextureDescriptor {
             label: Some("Scaled Scene Depth"),
             size: wgpu::Extent3d {
                 width,
@@ -54,14 +57,14 @@ impl ScaledDepth {
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format: wgpu::TextureFormat::Depth32Float,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::TEXTURE_BINDING
+                // Copied out by a frame capture (#1085)
+                | wgpu::TextureUsages::COPY_SRC,
             view_formats: &[],
         });
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-        Self {
-            _texture: texture,
-            view,
-        }
+        Self { texture, view }
     }
 }
 
@@ -75,7 +78,7 @@ pub(crate) struct DepthUpscale {
 
 impl DepthUpscale {
     pub fn new(device: &wgpu::Device, source: &ScaledDepth) -> Self {
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        let shader = device.create_trusted_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Depth Upscale Shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("depth_upscale.wgsl").into()),
         });
@@ -94,10 +97,10 @@ impl DepthUpscale {
         });
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("Depth Upscale Pipeline Layout"),
-            bind_group_layouts: &[&layout],
-            push_constant_ranges: &[],
+            bind_group_layouts: &[Some(&layout)],
+            immediate_size: 0,
         });
-        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        let pipeline = device.create_render_pipeline_counted(&wgpu::RenderPipelineDescriptor {
             label: Some("Depth Upscale Pipeline"),
             layout: Some(&pipeline_layout),
             vertex: wgpu::VertexState {
@@ -115,16 +118,16 @@ impl DepthUpscale {
             primitive: wgpu::PrimitiveState::default(),
             depth_stencil: Some(wgpu::DepthStencilState {
                 format: wgpu::TextureFormat::Depth32Float,
-                depth_write_enabled: true,
-                depth_compare: wgpu::CompareFunction::Always,
+                depth_write_enabled: Some(true),
+                depth_compare: Some(wgpu::CompareFunction::Always),
                 stencil: wgpu::StencilState::default(),
                 bias: wgpu::DepthBiasState::default(),
             }),
             multisample: wgpu::MultisampleState::default(),
-            multiview: None,
+            multiview_mask: None,
             cache: None,
         });
-        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        let bind_group = device.create_bind_group_counted(&wgpu::BindGroupDescriptor {
             label: Some("Depth Upscale Bind Group"),
             layout: &layout,
             entries: &[wgpu::BindGroupEntry {
@@ -153,6 +156,7 @@ impl DepthUpscale {
             }),
             timestamp_writes: None,
             occlusion_query_set: None,
+            multiview_mask: None,
         });
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, &self.bind_group, &[]);

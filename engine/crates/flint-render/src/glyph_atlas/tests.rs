@@ -1,4 +1,5 @@
 use super::*;
+use crate::gpu_counts::CountedDevice;
 use flint_core::bundle::{Bundle, BundleManifest};
 use flint_core::project::AssetScope;
 use flint_core::vfs::{self, MemorySource};
@@ -350,7 +351,7 @@ fn corners_are_picked_by_the_arms_that_meet() {
         "─│╱╲┌┐└┘├┤┬┴┼",
         "lines, then corners, tees and the cross: the shader's slot order"
     );
-    // (right, left, down, up), as ascii_edge_thin.wgsl's ARM_GLYPHS
+    // (right, left, down, up), as ascii_edge_corners.wgsl's ARM_GLYPHS
     assert_eq!(e.for_arms(true, false, true, false), Some('┌'));
     assert_eq!(e.for_arms(false, true, true, false), Some('┐'));
     assert_eq!(e.for_arms(true, false, false, true), Some('└'));
@@ -628,6 +629,31 @@ fn a_grid_png_loads_from_toml() {
 }
 
 #[test]
+fn a_ttf_with_no_letters_loads_with_the_ascii_it_has() {
+    // Noto Emoji has digits and a few signs but no letters (#935): the set
+    // takes the ASCII it has, and its own ramps and edges must be there.
+    let emoji = epaint_default_fonts::NOTO_EMOJI_REGULAR;
+    let font = ab_glyph::FontRef::try_from_slice(emoji).unwrap();
+    assert_eq!(ab_glyph::Font::glyph_id(&font, 'A').0, 0, "no letters");
+    let mut src = MemorySource::new();
+    src.insert("fonts/emoji.ttf", emoji.to_vec());
+    let toml = "[font]\nfile = \"emoji.ttf\"\n[ramps.moon]\nglyphs = \" 🌕🌓🌑\"\nsort = \"coverage\"\n\
+                [edges]\nhorizontal = \"↔\"\nvertical = \"↕\"\ndiagonal = \"↗\"\nantidiagonal = \"↘\"\n";
+    let set = vfs::scoped(Arc::new(src.clone()), || {
+        GlyphSet::from_toml("emoji", toml, Path::new("fonts"))
+    })
+    .unwrap();
+    assert!(!set.atlas().contains('A'));
+    assert!(set.atlas().contains('1'), "the digits it has are kept");
+    assert_eq!(set.ramp("moon").unwrap().len(), 4);
+    // A glyph a ramp names still has to be in the font
+    let lacking = vfs::scoped(Arc::new(src), || {
+        GlyphSet::from_toml("emoji", &toml.replace("🌑", "A"), Path::new("fonts"))
+    });
+    assert_eq!(lacking.unwrap_err(), GlyphError::Missing(vec!['A']));
+}
+
+#[test]
 fn a_set_can_be_drawn_by_hand_in_pixel_text() {
     let mut src = MemorySource::new();
     src.insert(
@@ -745,16 +771,18 @@ fn a_set_loads_from_a_game_bundle() {
 
 #[test]
 fn the_atlas_uploads_and_reads_back() {
-    let Ok(ctx) = pollster::block_on(crate::HeadlessContext::new(4, 4)) else {
+    // The binary's shared device (#1275)
+    let Some(gpu) = crate::shared_gpu::lease() else {
         crate::gpu_select::skip_without_gpu("no GPU adapter");
         return;
     };
+    let ctx = gpu.gpu;
     let atlas = GlyphAtlas::builtin();
     let gpu = GpuGlyphAtlas::upload(&ctx.device, &ctx.queue, &atlas, "glyph atlas test");
     assert_eq!(gpu.size, atlas.size());
     let [w, h] = gpu.size;
     let padded = w.div_ceil(256) * 256;
-    let buffer = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+    let buffer = ctx.device.create_buffer_counted(&wgpu::BufferDescriptor {
         label: Some("glyph readback"),
         size: (padded * h) as u64,
         usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
@@ -765,9 +793,9 @@ fn the_atlas_uploads_and_reads_back() {
         .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
     encoder.copy_texture_to_buffer(
         gpu.texture.as_image_copy(),
-        wgpu::ImageCopyBuffer {
+        wgpu::TexelCopyBufferInfo {
             buffer: &buffer,
-            layout: wgpu::ImageDataLayout {
+            layout: wgpu::TexelCopyBufferLayout {
                 offset: 0,
                 bytes_per_row: Some(padded),
                 rows_per_image: Some(h),
@@ -782,8 +810,8 @@ fn the_atlas_uploads_and_reads_back() {
     ctx.queue.submit(Some(encoder.finish()));
     let slice = buffer.slice(..);
     slice.map_async(wgpu::MapMode::Read, |_| {});
-    ctx.device.poll(wgpu::Maintain::Wait);
-    let data = slice.get_mapped_range();
+    let _ = crate::wait_for_gpu(&ctx.device);
+    let data = slice.get_mapped_range().expect("mapped buffer range");
     for y in 0..h {
         let row = &data[(y * padded) as usize..(y * padded + w) as usize];
         assert_eq!(
@@ -841,8 +869,17 @@ fn the_cache_reloads_what_changes_on_disk() {
         Some(255)
     );
 
-    // The font file itself redrawn (same size: the stamp's time must see it)
+    // The font file itself redrawn (same size: the stamp's time must see it).
+    // Two writes inside one tick of the file system's clock share a modified
+    // time (Windows: one test in about fifteen, #489), so the redraw is dated
+    // later, as an edit by hand would be
     png(2);
+    std::fs::File::options()
+        .write(true)
+        .open(dir.join("fonts/grid.png"))
+        .unwrap()
+        .set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(5))
+        .unwrap();
     assert!(cache.poll());
     let grid = cache.get("grid").unwrap();
     assert_eq!(grid.atlas().sample('-', 3, 4), Some(0));

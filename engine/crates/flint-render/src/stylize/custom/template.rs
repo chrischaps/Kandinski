@@ -58,7 +58,11 @@ fn toml(name: &str, stage: StyleStage, inputs: Inputs) -> String {
              #   style = \"{name}\"\n\
              # or the component `{name}_style`, whose fields are the params below\n\
              # (each entity its own `amount`) plus `enabled` and `blend`.\n\
-             # flint_style_blend(uv) says how much of it each pixel asks for.\n"
+             # flint_style_blend(uv) says how much of it each pixel asks for.\n\
+             # If the style returns p.color unchanged further than some distance\n\
+             # from its entities, say how far in points (#538), and it is drawn\n\
+             # only near them:\n\
+             #   reach = 0\n"
         )
     } else {
         String::new()
@@ -130,6 +134,7 @@ fn wgsl(name: &str, stage: StyleStage, inputs: Inputs) -> String {
          //                                 in the same space as p.color\n\
          //   flint_luma(rgb) -> f32        perceived brightness\n\
          //   flint_hash(v: vec2) -> f32    a stable 0..1 noise\n\
+         //   flint_vnoise(p, seed) -> f32  smooth value noise, the built-ins' boil\n\
          //   flint_to_display(rgb), flint_to_linear(rgb)   sRGB encode / decode\n",
     );
     let mut tries = String::new();
@@ -198,8 +203,11 @@ fn wgsl(name: &str, stage: StyleStage, inputs: Inputs) -> String {
 // in the corner of the window, with its line in this file. Check it first
 // with `flint style check {name}.shader.toml`.
 //
-// Loops are allowed, but keep their bounds constant or a clamped param: a
-// loop that never ends hangs the GPU until the driver resets it.
+// Loops are allowed. A `for` with a constant start, bound and step (octaves,
+// kernel taps) builds as written; Flint guards any other loop natively, so
+// one that never ends stops after 4096 turns and draws a wrong pixel
+// instead of hanging the GPU. Keep bounds constant or a clamped param
+// anyway: the web doesn't guard them yet.
 
 fn style(p: StylePixel) -> vec4<f32> {{
     let c = p.color;

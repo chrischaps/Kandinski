@@ -237,9 +237,33 @@ pub trait PlayerExtension {
     /// field rather than quitting), and clicks and the wheel over an egui
     /// area. Clicks on empty space still reach the game.
     ///
-    /// Use windows and areas, or side and top panels. A `CentralPanel`
-    /// covers the whole window, so it takes every click from the game.
-    fn ui(&mut self, _ctx: &egui::Context) {}
+    /// `ui` is the frame's root `egui::Ui`, the one `Context::run_ui` hands
+    /// out (ADR 0121): the shape of eframe's `App::ui` and egui's
+    /// `Plugin::on_begin_pass`. It covers the whole window with no margin
+    /// or background. Show panels on it
+    /// (`egui::Panel::left("inventory").show(ui, |ui| ..)`; a panel on the
+    /// root takes its room from the whole window) and windows and areas
+    /// from it (`egui::Window::new("Quests").show(ui, |ui| ..)`: a `Ui`
+    /// derefs to its `Context`). `ui.ctx()` is the `Context`, to clone or
+    /// keep. A `CentralPanel` covers the whole window, so it takes every
+    /// click from the game.
+    ///
+    /// Before ADR 0121 this took `&egui::Context`. A game's
+    /// `fn ui(&mut self, ctx: &egui::Context)` becomes
+    /// `fn ui(&mut self, ctx: &mut egui::Ui)`, and the body compiles as it
+    /// was: `show(ctx, ..)`, `ctx.input(..)`, `ctx.clone()` and passing
+    /// `ctx` on as a `&Context` all go through the `Deref`.
+    fn ui(&mut self, _ui: &mut egui::Ui) {}
+
+    /// The name `ui` had for one release (#946), when `ui` still took a
+    /// `Context`. The player still calls it, and it calls [`ui`](Self::ui),
+    /// so a game that overrode it draws as before.
+    #[deprecated(
+        note = "`ui` now takes the root `&mut egui::Ui`: rename `fn root_ui` to `fn ui` (ADR 0121)"
+    )]
+    fn root_ui(&mut self, ui: &mut egui::Ui) {
+        self.ui(ui);
+    }
 
     /// Add to or change egui's fonts before the player installs them
     /// (ADR 0081). `defs` already holds the project's `fonts/` (each file
@@ -274,6 +298,16 @@ pub trait PlayerExtension {
     /// state as `ui` left it. The heading and the scrolling are the
     /// player's.
     fn debug_panel_ui(&mut self, _name: &str, _ui: &mut egui::Ui) {}
+}
+
+/// Each extension's egui on the frame's root `Ui`, in the order they were
+/// added (ADR 0121). The call goes through the deprecated `root_ui`, whose
+/// default calls `ui`, so a game that still overrides `root_ui` draws too.
+#[expect(deprecated)]
+pub(crate) fn draw_ui(extensions: &mut [Box<dyn PlayerExtension>], ui: &mut egui::Ui) {
+    for ext in extensions.iter_mut() {
+        ext.root_ui(ui);
+    }
 }
 
 /// What an extension can reach in `pre_update`, at a [`Stage`], as a scene
@@ -421,7 +455,11 @@ impl ExtensionCtx<'_> {
 /// ctx.audio.play("audio/door.ogg", &SoundOptions::new().at(pos).distances(2.0, 60.0))?;
 /// // Heard from far off, fading like a sound in the open:
 /// ctx.audio.play("bell", &SoundOptions::new().at(pos).distances(10.0, 400.0).rolloff(0.7))?;
-/// ctx.audio.set_bus_volume(Bus::Music, 0.4);
+/// ctx.audio.set_bus_volume(Bus::MUSIC, 0.4);
+/// // A bus the game's flint.toml declares ([audio.buses.voice]):
+/// if let Some(voice) = ctx.audio.bus("voice") {
+///     ctx.audio.play("line_04", &SoundOptions::new().bus(voice))?;
+/// }
 /// ```
 pub struct ExtensionAudio<'a> {
     pub(crate) system: &'a mut AudioSystem,
@@ -502,6 +540,26 @@ impl<'a> ExtensionAudio<'a> {
     pub fn set_bus_volume(&mut self, bus: Bus, volume: f64) {
         self.system.set_bus_volume(bus, volume);
     }
+
+    /// Set a mixer bus's own low-pass cutoff, Hz (20000 is open, as low as
+    /// 10; #1218): it muffles the bus and the buses under it, nothing else.
+    pub fn set_bus_lowpass(&mut self, bus: Bus, hz: f64) {
+        self.system.set_bus_lowpass(bus, hz);
+    }
+
+    /// A bus by name: `sfx`, `music`, or one the game's `flint.toml`
+    /// declares under `[audio.buses]` (#730), for [`SoundOptions::bus`] and
+    /// [`set_bus_volume`](Self::set_bus_volume).
+    pub fn bus(&self, name: &str) -> Option<Bus> {
+        self.system.engine.bus(name)
+    }
+
+    /// Declare buses in code, as a manifest's `[audio.buses]` would: a game
+    /// that builds its mix at run time. Buses already there keep their
+    /// numbers; see `AudioEngine::set_buses`.
+    pub fn set_buses(&mut self, buses: &flint_audio::Buses) {
+        self.system.engine.set_buses(buses);
+    }
 }
 
 /// How [`ExtensionAudio::play`] plays a sound.
@@ -529,7 +587,7 @@ impl Default for SoundOptions {
         Self {
             volume: 1.0,
             pitch: 1.0,
-            bus: Bus::Sfx,
+            bus: Bus::SFX,
             at: None,
             distances: flint_audio::engine::DEFAULT_DISTANCES,
             rolloff: flint_audio::engine::DEFAULT_ROLLOFF,
@@ -855,13 +913,15 @@ mod tests {
             .at(Vec3::new(4.0, 0.0, 2.0))
             .distances(2.0, 80.0)
             .rolloff(0.7)
-            .bus(Bus::Music);
+            .bus(Bus::MUSIC);
         assert_eq!(placed.distances, (2.0, 80.0));
         assert_eq!(placed.rolloff, 0.7);
         assert_eq!(SoundOptions::new().rolloff, 2.0);
         audio.play("click", &placed).unwrap();
         assert!(audio.play("missing", &SoundOptions::new()).is_err());
-        audio.set_bus_volume(Bus::Sfx, 0.25);
+        audio.set_bus_volume(Bus::SFX, 0.25);
+        audio.set_bus_lowpass(Bus::SFX, 800.0);
+        assert_eq!(system.engine.bus_lowpass(Bus::SFX), Some(800.0));
         // Scripts and audio_sources read the same cache.
         assert!(system.engine.has_sound("click"));
     }

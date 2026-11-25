@@ -13,9 +13,10 @@
 //! example for one that does: `uses_mask: MaskUse::Always`, and
 //! [`StyleFrame::mask_bind`] for the bind group.
 
+use crate::gpu_counts::CountedQueue;
 use super::kit;
 use super::{
-    StyleDescriptor, StyleDevice, StyleFrame, StyleHint, StyleInput, StyleParam, StylePass,
+    StyleDescriptor, StyleDevice, StyleFrame, StyleInput, StyleParam, StylePass,
     StyleStage,
 };
 use bytemuck::{Pod, Zeroable};
@@ -23,30 +24,19 @@ use bytemuck::{Pod, Zeroable};
 pub(super) static STYLE: StyleDescriptor =
     StyleDescriptor::new("mask_view", "Mask view", StyleStage::Display, create)
         .params(&[
-            StyleParam::new("shading", 0.8, 0.0..=1.0),
-            StyleParam::new("dim", 0.35, 0.0..=1.0),
-            StyleParam::new("outline", 1.0, 0.0..=4.0),
+            StyleParam::new("shading", 0.8, 0.0..=1.0)
+                .label("Shading")
+                .help("How much of the scene's light shows under each style's hue"),
+            StyleParam::new("dim", 0.35, 0.0..=1.0)
+                .label("Unstyled dim")
+                .help("Brightness of the grey unstyled pixels fade to"),
+            StyleParam::new("outline", 1.0, 0.0..=4.0)
+                .label("Outline (px)")
+                .help("Width of the white line where two style ids meet"),
         ])
         .uses_mask(super::MaskUse::Always)
         // It shows every id; nothing is passed through (#384)
-        .draws_over_entities()
-        .hints(&[
-            StyleHint::new(
-                "shading",
-                "Shading",
-                "How much of the scene's light shows under each style's hue",
-            ),
-            StyleHint::new(
-                "dim",
-                "Unstyled dim",
-                "Brightness of the grey unstyled pixels fade to",
-            ),
-            StyleHint::new(
-                "outline",
-                "Outline (px)",
-                "Width of the white line where two style ids meet",
-            ),
-        ]);
+        .draws_over_entities();
 
 fn create(d: &StyleDevice) -> Box<dyn StylePass> {
     let device = d.device;
@@ -57,7 +47,7 @@ fn create(d: &StyleDevice) -> Box<dyn StylePass> {
         pipeline: kit::fullscreen_pipeline(
             device,
             "Mask View Pipeline",
-            &kit::shader(device, "Mask View Shader", kit::wgsl!("mask_view.wgsl")),
+            &kit::shader(device, "Mask View Shader", kit::wgsl!("prelude_core.wgsl", "mask_read.wgsl", "mask_view.wgsl")),
             &[&uniform_bgl, &input_bgl, &mask_bgl],
             d.format,
         ),
@@ -78,7 +68,7 @@ struct MaskViewUniforms {
 }
 
 struct MaskView {
-    pipeline: wgpu::RenderPipeline,
+    pipeline: std::sync::Arc<wgpu::RenderPipeline>,
     uniforms: wgpu::Buffer,
     uniform_bgl: wgpu::BindGroupLayout,
     input_bgl: wgpu::BindGroupLayout,
@@ -105,7 +95,7 @@ impl StylePass for MaskView {
         };
         frame
             .queue
-            .write_buffer(&self.uniforms, 0, bytemuck::cast_slice(&[uniforms]));
+            .write_buffer_counted(&self.uniforms, 0, bytemuck::cast_slice(&[uniforms]));
         kit::fullscreen_pass(
             encoder,
             "Mask View Pass",

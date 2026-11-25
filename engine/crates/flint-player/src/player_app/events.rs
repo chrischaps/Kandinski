@@ -428,6 +428,15 @@ impl Escape {
     }
 }
 
+/// Whether a left click catches the cursor for mouse look: in a scene with
+/// a first-person player, while the cursor is free and the game state runs
+/// physics. A pause menu's state stops physics (`menu::toggle_pause` pushes
+/// `paused`), and then a click is the menu's: catching the cursor there
+/// would hide the pointer over the buttons it was meant for (#1228).
+pub(crate) fn click_captures(cursor_captured: bool, has_player: bool, physics_runs: bool) -> bool {
+    !cursor_captured && has_player && physics_runs
+}
+
 /// The axes read again when the window regains focus.
 const STICKS: [Axis; 8] = [
     Axis::LeftStickX,
@@ -449,6 +458,7 @@ impl ApplicationHandler for PlayerApp {
             // on, so none of them waits on the disk in a frame (#633); a
             // no-op after `--no-hot-reload` (`file_watch::disable`)
             flint_core::file_watch::start();
+            self.window_resumed();
             // First launch — full initialization
             if let Err(e) = self.initialize(event_loop) {
                 tracing::error!("Failed to initialize player: {e:#}");
@@ -558,6 +568,14 @@ impl ApplicationHandler for PlayerApp {
                 self.input.process_mouse_move(position.x, position.y);
             }
 
+            // An input method's finished text, for a UI document's
+            // text_input (#1229)
+            WindowEvent::Ime(winit::event::Ime::Commit(text)) => {
+                if let Some(edit) = flint_runtime::TextEdit::typed(&text) {
+                    self.input.process_text_edit(edit);
+                }
+            }
+
             WindowEvent::MouseWheel { delta, .. } => {
                 let (dx, dy) = wheel_lines(delta);
                 self.input.process_mouse_wheel(dx, dy);
@@ -577,8 +595,11 @@ impl ApplicationHandler for PlayerApp {
                 self.render();
                 #[cfg(target_arch = "wasm32")]
                 self.web_frame_end();
-                // The frame's end, for the profiler (ADR 0109).
-                profiling::finish_frame!();
+                // The frame's end, for both profilers (ADRs 0109, 0128).
+                flint_core::profile::finish_frame();
+                // The recorder's saves due by now (#1097): the frame just
+                // ended is whole, with no scope open on this thread
+                self.trace_frame_end();
                 if self.outcome.exit_requested {
                     event_loop.exit();
                 }
@@ -632,6 +653,16 @@ impl ApplicationHandler for PlayerApp {
     /// Every exit path (close button, Escape, --exit-after, script-requested,
     /// init failure) funnels through here: last chance to write the store.
     fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
+        // A frame capture still on its way is written before the run ends
+        #[cfg(not(target_arch = "wasm32"))]
+        self.finish_frame_captures();
+        // A recording's last frames and its ffconcat, a capture line's reply (#583)
+        #[cfg(not(target_arch = "wasm32"))]
+        self.finish_frame_grabs();
+        // `--trace FILE`, and any trace still on its way (#1097)
+        self.finish_traces();
+        // A load that never reached a frame says how far it got (#1092)
+        self.finish_load_reports();
         self.flush_persistent_store(true, "exit");
     }
 }
@@ -661,7 +692,8 @@ impl PlayerApp {
 
     /// Pace the clock to the window's monitor when frames wait for vblank
     /// (#406 in The Capitol). On start, and again when the window moves, since
-    /// another monitor can have another refresh. `FLINT_PACING=0` turns it off.
+    /// another monitor can have another refresh. `--no-pacing` (or its alias
+    /// `FLINT_PACING=0`) turns it off (#1149).
     pub(super) fn update_vsync_pacing(&mut self) {
         // On the web the frame-rate pacer sets the period (#140).
         if self.frame_pacer.is_some() {
@@ -671,7 +703,7 @@ impl PlayerApp {
             .render_context
             .as_ref()
             .is_some_and(|c| c.presents_on_vblank());
-        let disabled = std::env::var("FLINT_PACING").is_ok_and(|v| v == "0");
+        let disabled = !crate::present_args::pacing(&self.launch);
         let period = (on_vblank && !disabled)
             .then(|| {
                 self.window
@@ -731,9 +763,22 @@ impl PlayerApp {
                         }
                     }
 
-                    // Debug keys, shared with `--input-script` (H9)
-                    self.handle_debug_key(key_code);
+                    // Debug keys, shared with `--input-script` (H9): one the
+                    // table takes is its alone, repeats and release too (#717)
+                    if self.focus.debug_keys_held.contains(&key_code) {
+                        return;
+                    }
+                    if self.handle_debug_key(key_code) {
+                        self.focus.debug_keys_held.insert(key_code);
+                        return;
+                    }
 
+                    // What it typed, repeats too, for a UI document's
+                    // text_input (#1229); the web's keys come this way too
+                    let typed = flint_runtime::TextEdit::of_key(key_code, event.text.as_deref());
+                    if let Some(edit) = typed {
+                        self.input.process_text_edit(edit);
+                    }
                     self.input.process_key_down(key_code);
 
                     // On Android, DPad maps to ArrowKeys — also fire gamepad
@@ -754,6 +799,9 @@ impl PlayerApp {
                     }
                 }
                 ElementState::Released => {
+                    if self.focus.debug_keys_held.remove(&key_code) {
+                        return;
+                    }
                     self.input.process_key_up(key_code);
 
                     #[cfg(target_os = "android")]
@@ -789,111 +837,6 @@ impl PlayerApp {
                     }
                 }
             }
-        }
-    }
-
-    /// The player's debug keys: F2 stats overlay, F3/F4 panels, F11
-    /// fullscreen; a subsystem's own first (the rhythm session's guide, map
-    /// and F9 force-fail, the living props' F5-F8). Called for a real
-    /// key press and for one the input script presses, so a capture can
-    /// open the overlay (H9). A real Escape exits only when no action binds
-    /// it (`Escape::decide`, #639); a scripted one never does.
-    pub(super) fn handle_debug_key(&mut self, key_code: KeyCode) {
-        // A subsystem's own debug keys come first (ADR 0117)
-        let key = super::subsystem::KeyPress {
-            code: key_code,
-            shift: self.focus.key_modifiers.shift_key(),
-        };
-        #[cfg(feature = "debug-hud")]
-        let open_before = self.debug_panels.iter().filter(|p| p.is_open()).count();
-        if self.subsystems_take_key(key) {
-            // A subsystem's panel opened or closed: the cursor follows the
-            // panels, as F3's do
-            #[cfg(feature = "debug-hud")]
-            {
-                let open = self.debug_panels.iter().filter(|p| p.is_open()).count();
-                if open != open_before {
-                    if open > 0 {
-                        self.release_cursor();
-                    } else if self.core.physics.has_player_entity() {
-                        self.capture_cursor();
-                    }
-                }
-            }
-            return;
-        }
-        match key_code {
-            KeyCode::F2 => {
-                self.stats.show = !self.stats.show;
-            }
-            #[cfg(feature = "debug-hud")]
-            KeyCode::F3 => {
-                // Toggle the scene-component debug panels
-                // (grass, ocean, ...). The Rendering &
-                // Effects panel is excluded — it has its
-                // own key (F4) and would otherwise flip
-                // out of phase with it.
-                let scene_panels: Vec<usize> = self
-                    .debug_panels
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, p)| p.name() != flint_debug_ui::RENDER_DEBUG_PANEL)
-                    .map(|(i, _)| i)
-                    .collect();
-                if scene_panels.is_empty() {
-                    self.hud.key_note.say("F3", "no debug panels in this scene");
-                } else {
-                    // Toggle the panels, then adjust cursor outside the borrow
-                    for i in scene_panels {
-                        self.debug_panels[i].toggle();
-                    }
-                    // Cursor follows ALL panels (incl. the
-                    // render panel, which F3 leaves alone).
-                    let any_open = self.debug_panels.iter().any(|p| p.is_open());
-                    if any_open {
-                        self.release_cursor();
-                    } else if self.core.physics.has_player_entity() {
-                        self.capture_cursor();
-                    }
-                }
-            }
-            // Backquote, Backslash and F9 are the rhythm subsystem's (its
-            // guide, map and forced fail); with no chart playing they say so
-            #[cfg(feature = "debug-hud")]
-            KeyCode::Backquote | KeyCode::Backslash | KeyCode::F9 => {
-                let key = match key_code {
-                    KeyCode::Backquote => "`",
-                    KeyCode::Backslash => "\\",
-                    _ => "F9",
-                };
-                self.hud
-                    .key_note
-                    .say(key, "no chart is playing in this scene — nothing to show");
-            }
-            // Rendering & Effects menu (ADR 0053): the
-            // one home for every render/post debug
-            // control the old F1/F4-F10/F12 keys used to
-            // flip blindly, plus their non-binary params.
-            #[cfg(feature = "debug-hud")]
-            KeyCode::F4 => {
-                self.toggle_named_panel(
-                    flint_debug_ui::RENDER_DEBUG_PANEL,
-                    "F4",
-                    "no renderer active — nothing to tune",
-                );
-            }
-            // F5-F8 and a scripted Escape are the living subsystem's
-            // (`LivingSubsystem::on_key`)
-            KeyCode::F11 => {
-                if let Some(window) = &self.window {
-                    if window.fullscreen().is_some() {
-                        window.set_fullscreen(None);
-                    } else {
-                        window.set_fullscreen(Some(winit::window::Fullscreen::Borderless(None)));
-                    }
-                }
-            }
-            _ => {}
         }
     }
 
@@ -990,7 +933,19 @@ impl PlayerApp {
                     self.input.process_mouse_raw_delta(dx, dy);
                 }
             }
+            ScriptEvent::Capture(at) => {
+                self.ask_frame_capture(super::frame_capture::Trigger::Script(at), "capture");
+            }
+            // Written from the next frame drawn (#1191)
+            ScriptEvent::Screenshot(path, at) => self.capture.scripted.push((path, at)),
             ScriptEvent::Text(text) => {
+                // A UI document's text_input types it too, unless an egui
+                // field has the keyboard (#1229)
+                if !self.text_has_focus() {
+                    if let Some(edit) = flint_runtime::TextEdit::typed(&text) {
+                        self.input.process_text_edit(edit);
+                    }
+                }
                 if self.egui_sees_input() {
                     if let Some(egui_winit) = &mut self.hud.egui_winit {
                         egui_winit
@@ -1012,9 +967,12 @@ impl PlayerApp {
     fn scripted_key(&mut self, key: KeyCode, state: ElementState) {
         let pressed = state == ElementState::Pressed;
         if self.egui_sees_input() {
+            // RawInput lost its modifiers in egui 0.36; egui's own copy is
+            // last frame's, which is what the old field held too
+            let modifiers = self.hud.egui_ctx.input(|i| i.modifiers);
             if let Some(egui_winit) = &mut self.hud.egui_winit {
                 let raw = egui_winit.egui_input_mut();
-                let events = super::egui_input::scripted_key_events(key, pressed, raw.modifiers);
+                let events = super::egui_input::scripted_key_events(key, pressed, modifiers);
                 raw.events.extend(events);
             }
             let held = Held::Key(PhysicalKey::Code(key));
@@ -1042,11 +1000,27 @@ impl PlayerApp {
         if crate::extension::dispatch_key(&mut self.extensions, &input) {
             return;
         }
-        // As a real key, through the debug keys (H9), but Esc doesn't quit.
+        // As a real key, through the debug keys (H9), but Esc doesn't quit:
+        // it lets go of a picked prop first, as a real one does (#248), and
+        // a debug key's press and release stay from the game (#717).
         if pressed {
-            self.handle_debug_key(key);
+            if key == KeyCode::Escape
+                && self.subsystems_take_input(super::subsystem::PlayerInput::Escape)
+            {
+                return;
+            }
+            if self.focus.debug_keys_held.contains(&key) {
+                return;
+            }
+            if self.handle_debug_key(key) {
+                self.focus.debug_keys_held.insert(key);
+                return;
+            }
+            if let Some(edit) = flint_runtime::TextEdit::of_key(key, character) {
+                self.input.process_text_edit(edit);
+            }
             self.input.process_key_down(key);
-        } else {
+        } else if !self.focus.debug_keys_held.remove(&key) {
             self.input.process_key_up(key);
         }
     }
@@ -1077,7 +1051,7 @@ impl PlayerApp {
         }
     }
 
-    fn handle_mouse_input(&mut self, state: ElementState, button: MouseButton) {
+    pub(super) fn handle_mouse_input(&mut self, state: ElementState, button: MouseButton) {
         // Mouse button state always reaches InputState so scripts can
         // read it (`is_mouse_pressed`, menus, screen-space UI) and the
         // mouse-as-touch emulation keeps working. FPS scenes (a player
@@ -1095,9 +1069,16 @@ impl PlayerApp {
             }
         }
 
-        if !self.focus.cursor_captured
-            && self.core.physics.has_player_entity()
-            && state == ElementState::Pressed
+        let physics_runs = self
+            .core
+            .state_machine
+            .active_config()
+            .runs(flint_runtime::state::PHYSICS);
+        if click_captures(
+            self.focus.cursor_captured,
+            self.core.physics.has_player_entity(),
+            physics_runs,
+        ) && state == ElementState::Pressed
             && button == MouseButton::Left
         {
             #[cfg(feature = "debug-hud")]

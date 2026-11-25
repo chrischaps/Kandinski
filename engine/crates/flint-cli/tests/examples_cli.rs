@@ -1,6 +1,9 @@
-//! `flint examples` (#763): every scene under examples/ is in
-//! examples/index.toml with a topic and a purpose, and every one passes
-//! what `flint validate` checks. No GPU: validation loads scenes only.
+//! `flint examples` (#763): every scene beside an index.toml is in it with a
+//! topic and a purpose, and every one passes what `flint validate` checks.
+//! Since #984 the examples are their own repository (flint-examples: the
+//! scenes and the index at its root, the engine at `engine/`), whose CI runs
+//! `flint examples --check`; these tests build a project of that shape. No
+//! GPU: validation loads scenes only.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -25,33 +28,90 @@ fn flint(args: &[&str], dir: &Path) -> (bool, String) {
     (out.status.success(), text)
 }
 
+/// A project shaped like flint-examples: `flint.toml` naming the engine's
+/// schemas, the index and two scenes at the root (one in a folder), and an
+/// engine checkout at `engine/` with a scene of its own nobody indexes.
+fn examples_project(name: &str) -> PathBuf {
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join(name);
+    let _ = std::fs::remove_dir_all(&dir);
+    let schemas = std::fs::canonicalize(repo().join("schemas"))
+        .unwrap()
+        .to_string_lossy()
+        .replace('\\', "/");
+    let schemas = schemas.trim_start_matches("//?/");
+    let scene = "[scene]\nname = \"x\"\nversion = \"1.0\"\n";
+    for (file, text) in [
+        (
+            "flint.toml",
+            format!("[project]\nschemas = [\"{schemas}\"]\n"),
+        ),
+        (
+            "index.toml",
+            "[[example]]\nscene = \"pbr_test.scene.toml\"\ntopic = \"rendering\"\npurpose = \"p\"\n\
+             [[example]]\nscene = \"film/beat.scene.toml\"\ntopic = \"stylize\"\npurpose = \"q\"\n"
+                .to_string(),
+        ),
+        ("pbr_test.scene.toml", scene.to_string()),
+        ("film/beat.scene.toml", scene.to_string()),
+        ("engine/crates/flint-core/Cargo.toml", String::new()),
+        ("engine/tests/fixture.scene.toml", scene.to_string()),
+    ] {
+        let path = dir.join(file);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, text).unwrap();
+    }
+    dir
+}
+
+/// In a flint-examples checkout no flag is needed: the index is the
+/// project root's, and the engine's own scenes under `engine/` are not
+/// examples.
 #[test]
 fn every_example_is_indexed_and_valid() {
-    let (ok, out) = flint(&["examples", "--check"], &repo());
+    let dir = examples_project("examples-root");
+    let (ok, out) = flint(&["examples", "--check"], &dir);
     assert!(ok, "flint examples --check failed:\n{out}");
-    assert!(out.contains("every one indexed and valid"), "{out}");
+    assert!(
+        out.contains("2 examples in .: every one indexed and valid"),
+        "{out}"
+    );
 }
 
 #[test]
 fn the_list_has_each_topic_and_the_json_parses() {
-    let (ok, out) = flint(&["examples"], &repo());
+    let dir = examples_project("examples-list");
+    let (ok, out) = flint(&["examples"], &dir);
     assert!(ok, "{out}");
-    for topic in ["showcase", "rendering", "stylize", "living", "film"] {
+    for topic in ["rendering", "stylize"] {
         assert!(
             out.lines().any(|l| l == topic),
             "no {topic} heading:\n{out}"
         );
     }
-    assert!(out.contains("examples/pbr_test.scene.toml"), "{out}");
+    assert!(
+        out.lines()
+            .any(|l| l.trim_start().starts_with("pbr_test.scene.toml")),
+        "{out}"
+    );
 
-    let (ok, json) = flint(&["examples", "--topic", "stylize", "--json"], &repo());
+    let (ok, json) = flint(&["examples", "--topic", "stylize", "--json"], &dir);
     assert!(ok, "{json}");
     let list: Vec<serde_json::Value> = serde_json::from_str(&json).unwrap();
-    assert!(!list.is_empty());
-    assert!(list.iter().all(|e| e["topic"] == "stylize"), "{json}");
+    assert_eq!(list.len(), 1, "{json}");
+    assert_eq!(list[0]["scene"], "film/beat.scene.toml", "{json}");
 
-    let (ok, err) = flint(&["examples", "--topic", "nope"], &repo());
-    assert!(!ok && err.contains("topics: showcase"), "{err}");
+    let (ok, err) = flint(&["examples", "--topic", "nope"], &dir);
+    assert!(!ok && err.contains("topics: rendering, stylize"), "{err}");
+}
+
+/// The engine's checkout has no examples of its own any more: the command
+/// says where they are.
+#[test]
+fn the_engine_checkout_points_at_flint_examples() {
+    let (ok, err) = flint(&["examples"], &repo());
+    assert!(!ok, "{err}");
+    assert!(err.contains("no index.toml at the project root"), "{err}");
+    assert!(err.contains("flint-examples"), "{err}");
 }
 
 #[test]
@@ -137,4 +197,87 @@ fn check_fails_on_an_error_diagnostic_and_not_on_a_warning() {
         "{out}"
     );
     assert!(!out.contains("extra_field.scene.toml:"), "{out}");
+}
+
+/// An entry's `packages` (#1336): an example needing a package this flint
+/// was built without is passed over by name, one needing a package it has
+/// is checked as ever, and a name no manifest has fails. Which of the first
+/// two applies is asked of the binary (`flint package list --built`), so
+/// the test holds in a build with any package set.
+#[test]
+fn check_passes_over_an_example_whose_package_this_flint_lacks() {
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("examples-packages");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    // Broken on purpose: checked, it fails; passed over, it says nothing
+    let broken =
+        "[scene]\nname = \"x\"\nversion = \"1.0\"\n\n[entities.lamp.lihgt]\nintensity = 1.0\n";
+    for scene in ["grove.scene.toml", "typo.scene.toml"] {
+        std::fs::write(dir.join(scene), broken).unwrap();
+    }
+    std::fs::write(
+        dir.join("index.toml"),
+        "[[example]]\nscene = \"grove.scene.toml\"\ntopic = \"t\"\npurpose = \"p\"\n\
+         packages = [\"living\"]\n\
+         [[example]]\nscene = \"typo.scene.toml\"\ntopic = \"t\"\npurpose = \"p\"\n\
+         packages = [\"livng\"]\n",
+    )
+    .unwrap();
+    let schemas = repo().join("schemas");
+    let args = [
+        "examples",
+        "--check",
+        "--dir",
+        dir.to_str().unwrap(),
+        "--schemas",
+        schemas.to_str().unwrap(),
+    ];
+    let (ok, out) = flint(&args, &dir);
+    assert!(!ok, "{out}");
+    assert!(
+        out.contains(
+            "FAIL typo.scene.toml: names the package `livng`, which no package manifest is \
+             (did you mean `living`?)"
+        ),
+        "{out}"
+    );
+
+    let (_, built) = flint(&["--json", "package", "list", "--built"], &repo());
+    let built: serde_json::Value = serde_json::from_str(&built).unwrap();
+    let has_living = built["packages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|p| p["name"] == "living");
+    let grove_failed = out.contains("grove.scene.toml: error[unknown-component]");
+    let grove_skipped = out.contains(
+        "SKIP grove.scene.toml: needs the living package, which this flint was built without",
+    );
+    assert_eq!(
+        (grove_failed, grove_skipped),
+        (has_living, !has_living),
+        "living built in: {has_living}\n{out}"
+    );
+
+    let mut json_args = vec!["--json"];
+    json_args.extend(args);
+    let (_, json) = flint(&json_args, &dir);
+    let doc: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(
+        doc["skipped"].as_array().unwrap().len(),
+        usize::from(!has_living),
+        "{json}"
+    );
+
+    let (ok, list) = flint(
+        &["--json", "examples", "--dir", dir.to_str().unwrap()],
+        &dir,
+    );
+    assert!(ok, "{list}");
+    let list: Vec<serde_json::Value> = serde_json::from_str(&list).unwrap();
+    assert_eq!(
+        list[0]["packages"],
+        serde_json::json!(["living"]),
+        "{list:?}"
+    );
 }

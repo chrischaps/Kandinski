@@ -71,6 +71,7 @@ fn started_in(path: &str) -> PlayerApp {
             dirs: Vec::new(),
             source: SchemaSource::Flags,
             dropped: Vec::new(),
+            packages: None,
         },
     );
     app.enter_scene(SceneEntry::Start)
@@ -110,6 +111,24 @@ fn a_bare_load_scene_reaches_the_next_scene() {
         app.advance_transition();
         assert!(is_in(&app, "a.scene.toml"), "{}", app.core.scene_path);
         assert!(app.transition_phase.is_idle());
+    });
+}
+
+#[test]
+fn the_next_scene_takes_ids_past_the_last_ones() {
+    // #688: each world counts its own ids, so a transition's world starts
+    // past the scene it replaces; an id a script kept names nothing new
+    vfs::scoped(Arc::new(game()), || {
+        let mut app = started_in("game/scenes/a.scene.toml");
+        let old: Vec<_> = app.core.world.all_entities().iter().map(|e| e.id).collect();
+        let high = old.iter().max().copied().unwrap();
+
+        ScriptHost::load_scene(&mut app, "b.scene.toml".into());
+        app.advance_transition();
+        assert!(is_in(&app, "b.scene.toml"), "{}", app.core.scene_path);
+        let marker = app.core.world.get_id("marker_b").unwrap();
+        assert!(marker > high, "{marker:?} should follow {high:?}");
+        assert!(old.iter().all(|id| !app.core.world.contains(*id)));
     });
 }
 
@@ -185,6 +204,7 @@ fn a_fade_that_never_finishes_is_ended_after_the_timeout() {
         // A HUD that never ends its fade-in
         app.transition_phase = TransitionPhase::Loading {
             target_scene: "hud.scene.toml".into(),
+            covered: false,
         };
         app.advance_transition();
         assert!(matches!(

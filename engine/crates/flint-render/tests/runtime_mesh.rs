@@ -9,6 +9,8 @@
 //!
 //! These need a GPU adapter. Without one each test prints a note and passes.
 
+#![allow(clippy::disallowed_methods)] // the test's own targets and read-backs, not the renderer's, so uncounted (#1091)
+
 mod shared_gpu;
 
 use flint_ecs::FlintWorld;
@@ -28,14 +30,13 @@ struct Gpu {
     _lease: shared_gpu::Lease,
 }
 
-/// The shared device (#598), alongside the other tests.
+/// The shared device (#598), alongside the other tests holding it.
 fn gpu() -> Option<Gpu> {
     shared_gpu::lease().map(frame_for)
 }
 
 /// The shared device with no other test on it: for a test that counts
-/// the device's objects or catches its errors in a scope (wgpu 23 keeps
-/// those per device, not per thread).
+/// the whole device's objects (`generate_report`).
 fn gpu_alone() -> Option<Gpu> {
     shared_gpu::lease_alone().map(frame_for)
 }
@@ -110,7 +111,12 @@ impl Gpu {
 
     /// Extract and render one frame, then wait for the GPU.
     fn frame(&self, renderer: &mut SceneRenderer, world: &FlintWorld, camera: &Camera) {
-        renderer.update_from_world(world, self.device);
+        renderer.prepare(
+            self.device,
+            self.queue,
+            world,
+            &flint_render::FrameInputs::default(),
+        );
         renderer.render_to(
             self.device,
             self.queue,
@@ -118,7 +124,7 @@ impl Gpu {
             camera,
             &self.color_view,
         );
-        self.device.poll(wgpu::Maintain::Wait);
+        let _ = flint_render::wait_for_gpu(&self.device);
     }
 
     /// Buffers the application holds, and bytes the allocator holds where
@@ -138,6 +144,16 @@ impl Gpu {
 
     /// The RGBA8 pixel at the centre of the last frame.
     fn centre_pixel(&self) -> [u8; 4] {
+        self.pixel(SIZE / 2, SIZE / 2)
+    }
+
+    /// The RGBA8 pixel at (`x`, `y`) of the last frame, from the top left.
+    fn pixel(&self, x: u32, y: u32) -> [u8; 4] {
+        self.column(x)[y as usize]
+    }
+
+    /// Column `x` of the last frame, top to bottom.
+    fn column(&self, x: u32) -> Vec<[u8; 4]> {
         let row = (SIZE * 4).div_ceil(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT)
             * wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
         let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
@@ -149,9 +165,9 @@ impl Gpu {
         let mut encoder = self.device.create_command_encoder(&Default::default());
         encoder.copy_texture_to_buffer(
             self.color.as_image_copy(),
-            wgpu::ImageCopyBuffer {
+            wgpu::TexelCopyBufferInfo {
                 buffer: &buffer,
-                layout: wgpu::ImageDataLayout {
+                layout: wgpu::TexelCopyBufferLayout {
                     offset: 0,
                     bytes_per_row: Some(row),
                     rows_per_image: None,
@@ -167,10 +183,17 @@ impl Gpu {
         buffer
             .slice(..)
             .map_async(wgpu::MapMode::Read, |r| r.unwrap());
-        self.device.poll(wgpu::Maintain::Wait);
-        let data = buffer.slice(..).get_mapped_range();
-        let at = (row * (SIZE / 2) + (SIZE / 2) * 4) as usize;
-        [data[at], data[at + 1], data[at + 2], data[at + 3]]
+        let _ = flint_render::wait_for_gpu(&self.device);
+        let data = buffer
+            .slice(..)
+            .get_mapped_range()
+            .expect("mapped buffer range");
+        (0..SIZE)
+            .map(|y| {
+                let at = (row * y + x * 4) as usize;
+                [data[at], data[at + 1], data[at + 2], data[at + 3]]
+            })
+            .collect()
     }
 }
 
@@ -1421,7 +1444,7 @@ fn set_sun(world: &mut FlintWorld, direction: [f64; 3], intensity: f64) {
     world.set_component(sun, "light", light.into()).unwrap();
 }
 
-/// glTF `doubleSided` (#623): `testModels/DoubleSidedCard.glb` holds two
+/// glTF `doubleSided` (#623): `tests/fixtures/models/DoubleSidedCard.glb` holds two
 /// cards wound once with their normals up, one `doubleSided`. From above
 /// both draw; from below only the double-sided one does, where before the
 /// fix both were culled.
@@ -1432,7 +1455,7 @@ fn a_double_sided_glb_card_draws_from_behind() {
     renderer.set_debug_mode(DebugMode::Unlit);
     let path = concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/../../testModels/DoubleSidedCard.glb"
+        "/../../tests/fixtures/models/DoubleSidedCard.glb"
     );
     let model = flint_import::import_gltf(path).unwrap();
     renderer.load_model(gpu.device, gpu.queue, "cards", &model);
@@ -1700,6 +1723,108 @@ fn a_ground_fog_lies_on_its_floors() {
     assert!(close(clear, gpu.centre_pixel()), "a clear map clears it");
 }
 
+/// A translucent pane in front of a horizon, in fog (#513). The composite
+/// fogs by the depth buffer and the pane writes no depth, so it used to be
+/// fogged as whatever lay behind it: as far ground (gone into the fog)
+/// below the ground's far edge, as sky (which isn't fogged) above it, with
+/// a hard line across the pane between. Here the sky is the fog's own
+/// colour, so what's behind looks nearly alike on both sides of the edge,
+/// and the pane, nearer than the fog starts, must look alike too.
+#[test]
+fn a_translucent_draw_is_fogged_at_its_own_depth() {
+    let gpu = gpu_or_skip!();
+    const FOG: [f32; 3] = [0.30, 0.34, 0.42];
+    let level = |a: [u8; 4], b: [u8; 4]| (0..3).map(|i| a[i].abs_diff(b[i])).max().unwrap();
+    // 4 m over the ground, looking straight ahead at its far edge 46 m off
+    let camera = Camera {
+        position: flint_core::Vec3::new(0.0, 4.0, 6.0),
+        target: flint_core::Vec3::new(0.0, 4.0, 0.0),
+        aspect: 1.0,
+        ..Camera::default()
+    };
+    // A pane 3 m off, standing across the whole column, two metres wide
+    let pane = |color: [f32; 4]| {
+        let v = |x: f32, y: f32| Vertex {
+            position: [x, y, 0.0],
+            normal: [0.0, 0.0, 1.0],
+            color,
+            uv: [0.0, 0.0],
+        };
+        let vertices = vec![v(-1.0, 0.5), v(1.0, 0.5), v(1.0, 8.0), v(-1.0, 8.0)];
+        (vertices, vec![0, 1, 2, 0, 2, 3, 0, 2, 1, 0, 3, 2])
+    };
+    let (inside, outside) = (SIZE / 2, 2);
+    for samples in [1, 4] {
+        let mut renderer = SceneRenderer::new_headless(
+            gpu.device,
+            gpu.queue,
+            FORMAT,
+            SIZE,
+            SIZE,
+            RendererConfig {
+                sample_count: samples,
+                ..Default::default()
+            },
+        );
+        renderer.set_clear_color([FOG[0], FOG[1], FOG[2], 1.0]);
+        let mut world = FlintWorld::new();
+        let (ground, indices) = square(40.0, [0.05, 0.05, 0.05, 1.0]);
+        let material = ImportedMaterial::vertex_colored("ground");
+        renderer.load_procedural_mesh(gpu.device, "ground", &ground, &indices, material);
+        spawn(&mut world, "ground", "ground", [0.0; 3]);
+
+        // With no fog: the first row of ground under the sky
+        gpu.frame(&mut renderer, &world, &camera);
+        let column = gpu.column(inside);
+        let horizon = column
+            .iter()
+            .position(|p| level(*p, column[0]) > 8)
+            .expect("ground under the sky");
+        assert!(
+            (8..SIZE as usize - 8).contains(&horizon),
+            "{samples}x: the horizon at row {horizon}"
+        );
+        let (above, below) = (horizon as u32 - 2, horizon as u32 + 1);
+
+        let (vertices, indices) = pane([1.0, 0.45, 0.1, 1.0]);
+        let material = ImportedMaterial::vertex_colored("pane");
+        renderer.load_procedural_mesh(gpu.device, "pane", &vertices, &indices, material);
+        spawn(&mut world, "pane", "pane", [0.0, 0.0, 3.0]);
+        let id = world.get_id("pane").unwrap();
+        let mut glass = toml::Table::new();
+        glass.insert("opacity".into(), 0.4.into());
+        world.set_component(id, "material", glass.into()).unwrap();
+
+        let mut config = renderer.post_process_config().clone();
+        config.fog_enabled = true;
+        config.fog_color = FOG;
+        config.fog_density = 0.09;
+        config.fog_start = 4.0;
+        renderer.set_post_process_config(config);
+        gpu.frame(&mut renderer, &world, &camera);
+        let (pane_above, pane_below) = (gpu.pixel(inside, above), gpu.pixel(inside, below));
+        let (sky, ground) = (gpu.pixel(outside, above), gpu.pixel(outside, below));
+
+        // The fog took the far ground: behind the pane is near enough alike
+        assert!(
+            level(sky, ground) <= 6,
+            "{samples}x: sky {sky:?}, fogged ground {ground:?}"
+        );
+        // The pane shows, on both sides of the edge
+        assert!(
+            level(pane_above, sky) > 20 && level(pane_below, ground) > 20,
+            "{samples}x: the pane {pane_above:?} / {pane_below:?} over {sky:?} / {ground:?}"
+        );
+        // And reads as one pane across it, no seam: it was the sky's colour
+        // under the edge, unfogged over it
+        assert!(
+            level(pane_above, pane_below) <= level(sky, ground) + 3,
+            "{samples}x: a seam across the pane at row {horizon}: \
+             {pane_above:?} over it, {pane_below:?} under it"
+        );
+    }
+}
+
 /// Thousands of distinct material looks draw on every backend. wgpu 23's
 /// DX12 backend copies each bind group's samplers into one 2048-slot
 /// shader-visible heap, with no sharing; when a material bind group held
@@ -1709,8 +1834,8 @@ fn a_ground_fog_lies_on_its_floors() {
 #[test]
 fn thousands_of_distinct_looks_draw() {
     const LOOKS: usize = 3000;
-    // Alone: its error scopes are the device's, not this thread's
-    let gpu = gpu_or_skip!(alone);
+    // Its error scopes are this thread's (wgpu 28+), so it shares the device
+    let gpu = gpu_or_skip!();
     let mut renderer = gpu.renderer();
     renderer.set_tonemapping(false);
     let mut world = FlintWorld::new();
@@ -1737,11 +1862,11 @@ fn thousands_of_distinct_looks_draw() {
             .unwrap();
     }
 
-    gpu.device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
-    gpu.device.push_error_scope(wgpu::ErrorFilter::Validation);
+    let oom_scope = gpu.device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
+    let validation_scope = gpu.device.push_error_scope(wgpu::ErrorFilter::Validation);
     gpu.frame(&mut renderer, &world, &camera);
-    let validation = pollster::block_on(gpu.device.pop_error_scope());
-    let out_of_memory = pollster::block_on(gpu.device.pop_error_scope());
+    let validation = pollster::block_on(validation_scope.pop());
+    let out_of_memory = pollster::block_on(oom_scope.pop());
     assert!(validation.is_none(), "{LOOKS} looks: {validation:?}");
     assert!(out_of_memory.is_none(), "{LOOKS} looks: {out_of_memory:?}");
     let stats = renderer.collect_stats();
@@ -1978,7 +2103,10 @@ fn every_instance_of_a_skinned_model_stays_skinned() {
             id
         })
         .collect();
-    let demo = concat!(env!("CARGO_MANIFEST_DIR"), "/../../examples/x.scene.toml");
+    let demo = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../tests/fixtures/scenes/x.scene.toml"
+    );
     let config = flint_render::model_loader::ModelLoadConfig::from_scene_path(demo);
     let loaded = flint_render::model_loader::load_models_from_world(
         &mut world,
@@ -2091,7 +2219,10 @@ fn a_scenes_grass_ground_loads_from_beside_the_scene() {
 fn a_skinned_model_still_draws_after_a_reload() {
     let gpu = gpu_or_skip!();
     let mut renderer = gpu.renderer();
-    let demo = concat!(env!("CARGO_MANIFEST_DIR"), "/../../examples/x.scene.toml");
+    let demo = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../tests/fixtures/scenes/x.scene.toml"
+    );
     let config = flint_render::model_loader::ModelLoadConfig::from_scene_path(demo);
     let camera = Camera::default();
     let mut skinned_draws = Vec::new();
@@ -2121,4 +2252,219 @@ fn a_skinned_model_still_draws_after_a_reload() {
         skinned_draws[1], skinned_draws[0],
         "the reload drew it as the first load did"
     );
+}
+
+/// The terrain editor's two uploads (`flint terrain-edit`): a full load
+/// from data, then a brush stroke that reloads only the chunks and keeps
+/// the material. The stroke reshapes what's drawn, and the reloaded
+/// terrain draws as a full load of the sculpted heights does.
+#[test]
+fn a_sculpted_terrain_reloads_its_chunks() {
+    use flint_terrain::{apply_height_brush, BrushParams, HeightBrushMode, Heightmap, Terrain};
+    let gpu = gpu_or_skip!();
+    const RES: u32 = 33;
+    let config = flint_terrain::TerrainConfig {
+        heightmap_path: String::new(),
+        width: 20.0,
+        depth: 20.0,
+        height_scale: 6.0,
+        chunk_resolution: 16,
+        texture_tile: 1.0,
+        splat_map_path: String::new(),
+        layer_textures: Default::default(),
+        metallic: 0.0,
+        roughness: 0.8,
+        grass: None,
+    };
+    let chunks = |heights: &[f32]| {
+        Terrain::generate(&Heightmap::from_raw(heights.to_vec(), RES, RES), &config).chunks
+    };
+    let flat = vec![0.0f32; (RES * RES) as usize];
+    let mut sculpted = flat.clone();
+    let brush = BrushParams {
+        radius: 0.3,
+        strength: 1.0,
+        falloff: 1.0,
+    };
+    apply_height_brush(
+        &mut sculpted,
+        RES,
+        0.35,
+        0.5,
+        HeightBrushMode::Raise,
+        &brush,
+        1.0,
+        0,
+    );
+    assert_ne!(flat, sculpted, "the brush raised nothing");
+
+    let world = FlintWorld::new();
+    // The terrain spans 0..20 on x and z; the view's centre is on the
+    // bump's flank, where the stroke tilts the ground.
+    let camera = looking_at([10.0, 0.0, 10.0], true);
+    let transform = flint_core::Transform::default();
+    let full_load = |renderer: &mut SceneRenderer, heights: &[f32]| {
+        renderer.load_terrain_from_data(
+            gpu.device,
+            gpu.queue,
+            &chunks(heights),
+            &transform,
+            config.texture_tile,
+            config.metallic,
+            config.roughness,
+            &[255, 0, 0, 255],
+            1,
+            &config.layer_textures,
+            std::path::Path::new("."),
+        );
+    };
+
+    let mut renderer = gpu.renderer();
+    full_load(&mut renderer, &flat);
+    gpu.frame(&mut renderer, &world, &camera);
+    let before = gpu.centre_pixel();
+    renderer.reload_terrain_geometry(gpu.device, &chunks(&sculpted), &transform);
+    gpu.frame(&mut renderer, &world, &camera);
+    let after = gpu.centre_pixel();
+    assert_ne!(before, after, "the stroke left the terrain as it was");
+
+    let mut fresh = gpu.renderer();
+    full_load(&mut fresh, &sculpted);
+    gpu.frame(&mut fresh, &world, &camera);
+    assert_eq!(
+        after,
+        gpu.centre_pixel(),
+        "a reloaded terrain draws as a full load of the same heights"
+    );
+}
+
+#[test]
+fn a_spawned_entity_creates_gpu_objects_that_frame_and_none_after() {
+    // #1091. Alone: the counts are the process's, and a test beside this
+    // one would make objects in its frames
+    let gpu = gpu_or_skip!(alone);
+    let mut renderer = gpu.renderer();
+    let mut world = FlintWorld::new();
+    let (vertices, indices) = square(1.0, [0.6, 0.6, 0.6, 1.0]);
+    renderer.load_procedural_mesh(
+        gpu.device,
+        "tile",
+        &vertices,
+        &indices,
+        ImportedMaterial::vertex_colored("tile"),
+    );
+    spawn(&mut world, "first", "tile", [0.0; 3]);
+    let camera = Camera::default();
+    // Every frame's objects, printed at the end: the series #1091's
+    // presentation charts
+    let mut series: Vec<u64> = Vec::new();
+    fn step(gpu: &Gpu, r: &mut SceneRenderer, w: &FlintWorld, c: &Camera, s: &mut Vec<u64>) {
+        gpu.frame(r, w, c);
+        s.push(r.frame_gpu_calls().created());
+    }
+
+    // The first frames build what the frame draws with: targets, pipelines,
+    // the transform arena's page and the first entity's binds
+    step(&gpu, &mut renderer, &world, &camera, &mut series);
+    let first = renderer.frame_gpu_calls();
+    eprintln!("first frame: {}", first.created_line());
+    assert!(
+        first.created() > 0,
+        "the first frame makes what it draws with"
+    );
+    for _ in 0..4 {
+        step(&gpu, &mut renderer, &world, &camera, &mut series);
+    }
+
+    // Steady: nothing made, every frame, though each still writes
+    for n in 0..30 {
+        step(&gpu, &mut renderer, &world, &camera, &mut series);
+        let calls = renderer.frame_gpu_calls();
+        assert_eq!(
+            calls.created(),
+            0,
+            "steady frame {n} made {}",
+            calls.created_line()
+        );
+        assert!(calls.writes > 0, "a frame writes its uniforms");
+    }
+
+    // An entity spawned mid-run: its binds are made the frame it first draws
+    spawn(&mut world, "second", "tile", [1.5, 0.0, 0.0]);
+    step(&gpu, &mut renderer, &world, &camera, &mut series);
+    let spawned = renderer.frame_gpu_calls();
+    eprintln!("spawn frame: {}", spawned.created_line());
+    assert!(
+        spawned.created() > 0,
+        "the spawned entity's frame made nothing: the count missed it"
+    );
+    assert_eq!(renderer.collect_stats().entity_draws, 2);
+    // RenderStats carries the same frame's count
+    assert_eq!(renderer.collect_stats().gpu_calls, spawned);
+
+    // And back to zero the frame after
+    for n in 0..5 {
+        step(&gpu, &mut renderer, &world, &camera, &mut series);
+        let calls = renderer.frame_gpu_calls();
+        assert_eq!(
+            calls.created(),
+            0,
+            "frame {n} after the spawn made {}",
+            calls.created_line()
+        );
+    }
+
+    // A new mesh is buffers too: one vertex and one index buffer
+    let (vertices, indices) = square(0.5, [0.2, 0.8, 0.2, 1.0]);
+    renderer.load_procedural_mesh(
+        gpu.device,
+        "small",
+        &vertices,
+        &indices,
+        ImportedMaterial::vertex_colored("small"),
+    );
+    spawn(&mut world, "third", "small", [-1.5, 0.0, 0.0]);
+    step(&gpu, &mut renderer, &world, &camera, &mut series);
+    let loaded = renderer.frame_gpu_calls();
+    eprintln!("load frame: {}", loaded.created_line());
+    assert!(
+        loaded.buffers >= 2,
+        "the mesh's vertex and index buffers: {loaded:?}"
+    );
+    step(&gpu, &mut renderer, &world, &camera, &mut series);
+    assert_eq!(renderer.frame_gpu_calls().created(), 0);
+    eprintln!("objects a frame: {series:?}");
+}
+
+#[test]
+fn the_renderer_knows_the_memory_it_holds_by_class() {
+    // #1091: the walk over the renderer's own fields
+    let gpu = gpu_or_skip!();
+    let mut renderer = gpu.renderer();
+    let mut world = FlintWorld::new();
+    let (vertices, indices) = square(1.0, [0.6, 0.6, 0.6, 1.0]);
+    renderer.load_procedural_mesh(
+        gpu.device,
+        "tile",
+        &vertices,
+        &indices,
+        ImportedMaterial::vertex_colored("tile"),
+    );
+    spawn(&mut world, "tile", "tile", [0.0; 3]);
+    gpu.frame(&mut renderer, &world, &Camera::default());
+    let m = renderer.gpu_memory();
+    eprintln!(
+        "{m:?}, device {:?}",
+        flint_render::gpu_counts::device_memory(gpu.device)
+    );
+    // The HDR buffer alone at 64x64 in Rgba16Float
+    assert!(m.scene_targets >= 64 * 64 * 8, "scene targets: {m:?}");
+    assert!(m.shadow_maps > 0, "the shadow cascades: {m:?}");
+    // The texture cache's three 1x1 defaults at least
+    assert!(m.model_textures >= 12, "model textures: {m:?}");
+    // The tile's 4 vertices and 12 indices
+    let vertex = std::mem::size_of::<Vertex>() as u64;
+    assert!(m.mesh_buffers >= 4 * vertex + 12 * 4, "mesh buffers: {m:?}");
+    assert_eq!(m.glyph_atlases, 0, "no glyph style is on");
+    assert_eq!(renderer.collect_stats().gpu_memory, m);
 }

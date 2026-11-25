@@ -31,6 +31,10 @@ pub struct GameClock {
     /// Vsync pacing: the display's refresh period, when frames are
     /// presented one a vblank (Fifo). See [`GameClock::set_vsync_period`].
     vsync_period: Option<f64>,
+    /// What pacing made of the last tick's wall time, before the clamp and
+    /// `time_scale`; `None` when the clock didn't pace it. See
+    /// [`GameClock::paced_delta_time`].
+    paced: Option<f64>,
     /// Wall time not yet handed out as `delta_time` (negative: handed out
     /// ahead of the wall clock).
     pace_debt: f64,
@@ -54,6 +58,7 @@ impl Default for GameClock {
             raw_delta_time: 0.0,
             time_scale: 1.0,
             vsync_period: None,
+            paced: None,
             pace_debt: 0.0,
             raw_mean: 0.0,
             accumulator: 0.0,
@@ -94,6 +99,7 @@ impl GameClock {
             self.first_tick = false;
             self.last_instant = now;
             self.delta_time = 0.0;
+            self.paced = None;
             return;
         }
 
@@ -108,10 +114,20 @@ impl GameClock {
     /// as a tick's do.
     pub fn advance_by(&mut self, dt: f64) {
         self.first_tick = false;
+        self.paced = None;
         self.raw_delta_time = dt;
         self.delta_time = dt * self.time_scale;
         self.total_time += self.delta_time;
         self.accumulator += self.delta_time;
+    }
+
+    /// One frame of `raw` wall seconds the caller measured itself, paced,
+    /// clamped and accumulated as [`tick`](Self::tick) would: for a host
+    /// that times its frames on its own clock and wants them judged by how
+    /// long they stood on screen (the scene viewer's F2 graph, #1110).
+    pub fn advance_wall(&mut self, raw: f64) {
+        self.first_tick = false;
+        self.advance(raw);
     }
 
     /// One frame of `raw` wall seconds: pace it, clamp it, accumulate it.
@@ -121,6 +137,7 @@ impl GameClock {
             Some(step) => step,
             None => self.pace(raw),
         };
+        self.paced = (self.frame_step.is_none() && self.vsync_period.is_some()).then_some(elapsed);
 
         // Clamp to avoid spiral of death (max 250ms frame time)
         self.delta_time = elapsed.min(MAX_DELTA) * self.time_scale;
@@ -149,6 +166,17 @@ impl GameClock {
         if let Some(period) = self.vsync_period {
             self.raw_mean = period;
         }
+    }
+
+    /// The last tick's wall time as pacing handed it out, in seconds:
+    /// whole refresh periods, before the 250 ms clamp and `time_scale`.
+    /// How long the frame stood on screen, which is what a hitch is judged
+    /// by (#1076): Fifo's 6, 6, 6, 45 ms bursts read 16.7 ms each here.
+    /// `None` when the clock isn't pacing (no vsync period, `frame_step`,
+    /// [`advance_by`](Self::advance_by)) or the tick stepped nothing (the
+    /// first, or the first after a [`resync`](Self::resync)).
+    pub fn paced_delta_time(&self) -> Option<f64> {
+        self.paced
     }
 
     /// The refresh period frames are paced to, if any.
@@ -280,6 +308,36 @@ mod tests {
                 0.006
             }
         })
+    }
+
+    /// Bursts paced read one refresh each; unpaced, and stepped by
+    /// `frame_step`, there's no paced time to read.
+    #[test]
+    fn the_paced_time_is_the_refreshes_a_frame_stood_for() {
+        let mut clock = paced(Some(HZ60));
+        for raw in bursts(40) {
+            clock.advance(raw);
+            let paced = clock.paced_delta_time().unwrap();
+            assert!((paced - HZ60).abs() < 1e-9, "{paced}");
+        }
+        clock.frame_step = Some(0.5);
+        clock.advance(0.006);
+        assert_eq!(clock.paced_delta_time(), None);
+        let mut unpaced = paced(None);
+        unpaced.advance(0.006);
+        assert_eq!(unpaced.paced_delta_time(), None);
+    }
+
+    /// A host's own wall times are paced from the first: no tick skipped.
+    #[test]
+    fn a_callers_wall_times_are_paced_as_ticks_are() {
+        let mut clock = paced(Some(HZ60));
+        for raw in bursts(40) {
+            clock.advance_wall(raw);
+            let paced = clock.paced_delta_time().unwrap();
+            assert!((paced - HZ60).abs() < 1e-9, "{paced}");
+        }
+        assert!((clock.total_time - 40.0 * HZ60).abs() < 0.1);
     }
 
     /// A page drawing one 120 Hz refresh in four (#140) steps 33.3 ms,

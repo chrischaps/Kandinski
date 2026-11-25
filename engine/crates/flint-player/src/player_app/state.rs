@@ -8,12 +8,14 @@
 //! did, and every read and write is the same one through the group.
 
 use super::input_config::{InputConfigPaths, PendingRebind};
-use super::{camera_cut, expression_feed, fonts, perf};
+use super::{camera_cut, expression_feed, fonts, hitch, hitch_watch, perf};
 use super::{egui_input, render_scale, text_halo, world_text};
-use flint_asset::{AssetCatalog, ContentStore};
+use flint_asset::HeldAssets;
+use flint_core::project::Project;
 use flint_runtime::{InputConfig, SaveDebounce};
 use flint_script::context::DrawItem;
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 /// When the player generates a scene's procgen assets (`LaunchOptions::procgen_mode`).
@@ -44,6 +46,20 @@ pub struct LaunchOptions {
     /// MSAA sample count for the scene renderer (1 = off, 4 = on; ADR 0058).
     /// Set from the --msaa CLI flag before the window/renderer exist.
     pub msaa_sample_count: u32,
+    /// Parts of the frame skipped or drawn N times, by label (#1317:
+    /// `--skip-pass`, `--repeat-pass`, the page's `?skip_pass=` and
+    /// `?repeat_pass=`), handed to the renderer when it is made. `None`
+    /// draws every part once.
+    pub pass_knobs: Option<flint_render::PassKnobs>,
+    /// The present mode (`--vsync`, #1149); `None` is `FLINT_VSYNC`'s,
+    /// else vsync. Read when the window opens.
+    pub vsync: Option<flint_render::Vsync>,
+    /// Frames the CPU may queue ahead of the display, 1 to 3
+    /// (`--frame-latency`); `None` is `FLINT_FRAME_LATENCY`'s, else 2.
+    pub frame_latency: Option<u32>,
+    /// Pace the game clock to the monitor's refresh under vsync
+    /// (`--no-pacing` is `Some(false)`); `None` is `FLINT_PACING`'s, else on.
+    pub pacing: Option<bool>,
     /// When scene procgen assets are made (#32): during load, or behind
     /// placeholders on the frame-budgeted queue (`--procgen-defer`).
     pub procgen_mode: ProcGenMode,
@@ -110,6 +126,41 @@ pub struct LaunchOptions {
     /// comparing (split or not) once a scene has props to compare.
     pub compare: Option<(String, String)>,
     pub compare_at_start: Option<bool>,
+    /// `--strict-scripts` (#693): a run with any script error, at load or
+    /// run time, fails (`PlayerApp::run_failure`), so a headless run of a
+    /// broken game can't exit 0.
+    pub strict_scripts: bool,
+    /// Keep the `persist_*` store in memory only: read no save and write
+    /// none (#714: a playtest starts from no save, and leaves none). Its
+    /// slots are kept in memory too (`persist::MemorySaves`), so a script
+    /// can switch slots and `persist_save()` in a playtest.
+    pub saves_in_memory: bool,
+    /// With `saves_in_memory`, the default slot begins as this text, read
+    /// from a file once before the run (#1193: `flint playtest
+    /// --save-from`), and goes through the same load as a real save:
+    /// versions, migration, a corrupt file. The file is never written.
+    pub save_seed: Option<flint_runtime::SaveText>,
+    /// `--load-report` or `--perf` (#1092): record each transition's and
+    /// chunk's load and say its table (the start-up's is begun before the
+    /// app exists, by whoever builds it).
+    pub load_report: bool,
+    /// The screen scripts see, in points, when there is no window (#714:
+    /// a playtest's `screen_width()` is its `--width`, not egui's
+    /// placeholder). `None` keeps egui's.
+    pub headless_screen: Option<(f32, f32)>,
+    /// `flint playtest --test-script` (#1192): Rhai files, each attached
+    /// to an entity the player spawns in every scene it enters (`playtest`,
+    /// then `playtest_2` ...), loaded beside the scene's own scripts.
+    pub test_scripts: Vec<std::path::PathBuf>,
+    /// `--inspect-listen` (#713): the loopback socket that answers queries
+    /// about the live world, handed to its subsystem at the start.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub inspect: Option<super::inspect::InspectListener>,
+    /// `--dump-world` (#713): the world written to a file at game times,
+    /// handed to its subsystem at the start; `run_failure` asks it whether
+    /// every time came.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub world_dump: Option<super::world_dump::WorldDump>,
 }
 
 impl Default for LaunchOptions {
@@ -119,6 +170,10 @@ impl Default for LaunchOptions {
             window_size: (1280, 720),
             window_options: crate::WindowArgs::default(),
             msaa_sample_count: 1,
+            pass_knobs: None,
+            vsync: None,
+            frame_latency: None,
+            pacing: None,
             procgen_mode: ProcGenMode::Immediate,
             render_scale: Default::default(),
             procgen_disk_cache: cfg!(not(target_arch = "wasm32")),
@@ -136,7 +191,99 @@ impl Default for LaunchOptions {
             expression_feed: None,
             compare: None,
             compare_at_start: None,
+            strict_scripts: false,
+            saves_in_memory: false,
+            save_seed: None,
+            load_report: false,
+            headless_screen: None,
+            test_scripts: Vec::new(),
+            #[cfg(not(target_arch = "wasm32"))]
+            inspect: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            world_dump: None,
         }
+    }
+}
+
+/// Every field, so two launches can be compared whole (#1142's test: a
+/// page's query and the desktop's flags launch the same). The sockets and
+/// feeds say only whether one was given. The pattern names every field, so
+/// a new one doesn't compile until it is listed here too.
+impl std::fmt::Debug for LaunchOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self {
+            fullscreen,
+            window_size,
+            window_options,
+            msaa_sample_count,
+            pass_knobs,
+            vsync,
+            frame_latency,
+            pacing,
+            procgen_mode,
+            render_scale,
+            procgen_disk_cache,
+            scene_file_writable,
+            quality_overrides,
+            pixels_per_point,
+            safe_area,
+            touch_device,
+            hold_at,
+            look,
+            style_specs,
+            style_time,
+            motion_hold,
+            save_dir,
+            expression_feed,
+            compare,
+            compare_at_start,
+            strict_scripts,
+            saves_in_memory,
+            save_seed,
+            load_report,
+            headless_screen,
+            test_scripts,
+            #[cfg(not(target_arch = "wasm32"))]
+            inspect,
+            #[cfg(not(target_arch = "wasm32"))]
+            world_dump,
+        } = self;
+        let mut s = f.debug_struct("LaunchOptions");
+        s.field("fullscreen", fullscreen)
+            .field("window_size", window_size)
+            .field("window_options", window_options)
+            .field("msaa_sample_count", msaa_sample_count)
+            .field("pass_knobs", pass_knobs)
+            .field("vsync", vsync)
+            .field("frame_latency", frame_latency)
+            .field("pacing", pacing)
+            .field("procgen_mode", procgen_mode)
+            .field("render_scale", render_scale)
+            .field("procgen_disk_cache", procgen_disk_cache)
+            .field("scene_file_writable", scene_file_writable)
+            .field("quality_overrides", quality_overrides)
+            .field("pixels_per_point", pixels_per_point)
+            .field("safe_area", safe_area)
+            .field("touch_device", touch_device)
+            .field("hold_at", hold_at)
+            .field("look", look)
+            .field("style_specs", style_specs)
+            .field("style_time", style_time)
+            .field("motion_hold", motion_hold)
+            .field("save_dir", save_dir)
+            .field("expression_feed", &expression_feed.is_some())
+            .field("compare", compare)
+            .field("compare_at_start", compare_at_start)
+            .field("strict_scripts", strict_scripts)
+            .field("saves_in_memory", saves_in_memory)
+            .field("save_seed", save_seed)
+            .field("load_report", load_report)
+            .field("headless_screen", headless_screen)
+            .field("test_scripts", test_scripts);
+        #[cfg(not(target_arch = "wasm32"))]
+        s.field("inspect", &inspect.is_some())
+            .field("world_dump", &world_dump.is_some());
+        s.finish()
     }
 }
 
@@ -207,20 +354,20 @@ impl Default for SceneSettings {
 
 /// What scripts asked of this frame's post-processing, drained from their
 /// requests each frame and stamped over the renderer's config before it
-/// draws (`set_bloom`, `set_render_mode`, ...).
+/// draws (`set_post`, `set_render_mode`).
 #[derive(Default)]
 pub(super) struct PostOverrides {
-    /// The plain values: vignette, bloom, exposure, chromatic aberration,
-    /// radial blur, SSAO, fog density, desaturation and depth of field.
+    /// The `[post_process]` keys scripts set (`set_post`, #853).
     pub(super) script: flint_script::PostProcessOverrides,
-    pub(super) fog_color: Option<[f32; 3]>,
+    /// The deprecated `set_render_mode` (#746): this frame's mode and mix,
+    /// and the params, held from the last `set_render_mode_params`.
     pub(super) render_mode: Option<(u32, f32)>,
     pub(super) mode_params: Option<[f32; 4]>,
-    /// True while a script-driven reality tear is on screen. Unlike the
-    /// other (sticky) overrides, the mode is zeroed the frame the script
-    /// stops calling set_render_mode — a dead or hot-reloaded script must
-    /// never freeze a tear over the world.
-    pub(super) mode_was_active: bool,
+    pub(super) held_mode_params: [f32; 4],
+    /// What the mode overwrote, put back the frame the script stops asking
+    /// (a dead or hot-reloaded script must never freeze a tear over the
+    /// world), and the ocean tint it draws (`flint_render::render_mode`).
+    pub(super) mode_shim: flint_render::render_mode::RenderModeShim,
     /// Rendering & Effects panel's "freeze script post overrides" switch
     /// (ADR 0053): while true the per-frame script/ladder override stamp is
     /// skipped so panel edits to contended post fields stick. Cached from
@@ -234,91 +381,43 @@ impl PostOverrides {
     /// in by now), replacing last frame's whole.
     pub(super) fn take_from(&mut self, requests: &mut flint_script::FrameRequests) {
         self.script = std::mem::take(&mut requests.post);
-        self.fog_color = requests.fog_color.take();
         self.render_mode = requests.render_mode.take();
         self.mode_params = requests.mode_params.take();
+        if let Some(params) = self.mode_params {
+            self.held_mode_params = params;
+        }
     }
 
     /// Whether anything is to be stamped this frame: a value asked for, or
     /// a tear to end.
     pub(super) fn any(&self) -> bool {
-        let s = &self.script;
-        s.vignette.is_some()
-            || s.bloom.is_some()
-            || s.exposure.is_some()
-            || s.chromatic_aberration.is_some()
-            || s.radial_blur.is_some()
-            || s.ssao_intensity.is_some()
-            || s.fog_density.is_some()
-            || s.desaturation.is_some()
-            || s.dof_strength.is_some()
-            || s.dof_focus_distance.is_some()
-            || s.dof_focus_range.is_some()
-            || self.fog_color.is_some()
+        !self.script.is_empty()
             || self.render_mode.is_some()
             || self.mode_params.is_some()
-            || self.mode_was_active
+            || self.mode_shim.active()
     }
 
     /// Write what was asked over `config`. A render mode is transient,
     /// unlike the sticky values: when no script asks for one this frame, a
     /// tear that was on is switched off.
     pub(super) fn stamp(&mut self, config: &mut flint_render::PostProcessConfig) {
-        let s = &self.script;
-        if let Some(v) = s.vignette {
-            config.vignette_enabled = v > 0.001;
-            config.vignette_intensity = v;
-        }
-        if let Some(b) = s.bloom {
-            config.bloom_intensity = b;
-        }
-        if let Some(e) = s.exposure {
-            config.exposure = e;
-        }
-        if let Some(ca) = s.chromatic_aberration {
-            config.chromatic_aberration = ca;
-        }
-        if let Some(rb) = s.radial_blur {
-            config.radial_blur = rb;
-        }
-        if let Some(si) = s.ssao_intensity {
-            config.ssao_intensity = si;
-        }
-        if let Some(fd) = s.fog_density {
-            config.fog_density = fd;
-        }
-        if let Some(d) = s.desaturation {
-            config.desaturate = d;
-        }
-        if let Some(strength) = s.dof_strength {
-            config.dof_strength = strength;
-        }
-        if let Some(fd) = s.dof_focus_distance {
-            config.dof_focus_distance = fd;
-        }
-        if let Some(fr) = s.dof_focus_range {
-            config.dof_focus_range = fr;
-        }
-        if let Some(fc) = self.fog_color {
-            config.fog_color = fc;
-        }
-        // Reality tear: transient, unlike the sticky overrides above.
-        match self.render_mode {
-            Some((mode, mix)) => {
-                config.render_mode = mode;
-                config.mode_mix = mix;
-                self.mode_was_active = mode != 0 && mix > 0.0;
-            }
-            None if self.mode_was_active => {
-                config.render_mode = 0;
-                config.mode_mix = 0.0;
-                self.mode_was_active = false;
-            }
-            None => {}
-        }
-        if let Some(mp) = self.mode_params {
-            config.mode_params = mp;
-        }
+        super::headless_game::stamp_post(config, &self.script);
+        // The deprecated render mode (#746): transient, unlike the sticky
+        // overrides above
+        let mode = self
+            .render_mode
+            .map(|(mode, mix)| flint_render::render_mode::RenderMode {
+                mode,
+                mix,
+                params: self.held_mode_params,
+            });
+        self.mode_shim.stamp(config, mode);
+    }
+
+    /// The ocean tint the render mode draws (blood, the underside), for the
+    /// frame's inputs.
+    pub(super) fn ocean_tint(&self) -> Option<flint_render::OceanTint> {
+        self.mode_shim.ocean_tint()
     }
 }
 
@@ -339,6 +438,13 @@ pub(super) struct Hud {
     /// Depth-tested world text queued this frame (ADR 0104), laid out in
     /// the egui pass and drawn before the HUD.
     pub(super) world_texts: Vec<flint_core::world_text::WorldText>,
+    /// Depth-tested world lines the scripts drew this frame (ADR 0083),
+    /// handed to the renderer with the frame's inputs (#739).
+    pub(super) world_lines: Vec<flint_core::world_line::WorldLine>,
+    /// The screen field the scripts filled this frame (#859), handed to
+    /// the renderer with the frame's inputs: what a style with
+    /// `blend_source = "field"` follows.
+    pub(super) style_field: flint_core::style_field::StyleField,
     pub(super) world_text_pipeline: Option<world_text::WorldTextPipeline>,
     pub(super) textures: HashMap<String, egui::TextureHandle>,
     /// Family names registered from `<project>/fonts/` (file stems + manifest
@@ -361,6 +467,8 @@ pub(super) struct Hud {
     /// What a debug key with nothing to act on said (#367), shown for a
     /// moment at the top of the window.
     pub(super) key_note: super::key_note::KeyNote,
+    /// The F1 card of the run's debug keys is showing (#717).
+    pub(super) key_table_open: bool,
 }
 
 impl Default for Hud {
@@ -373,6 +481,8 @@ impl Default for Hud {
             egui_fonts_ready: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             draw_commands: Vec::new(),
             world_texts: Vec::new(),
+            world_lines: Vec::new(),
+            style_field: Default::default(),
             world_text_pipeline: None,
             textures: HashMap::new(),
             fonts: HashSet::new(),
@@ -382,22 +492,74 @@ impl Default for Hud {
             fonts_root: Default::default(),
             fonts_installed: false,
             key_note: Default::default(),
+            key_table_open: false,
         }
     }
 }
 
-/// The F2 stats overlay and the perf readout.
-#[derive(Default)]
+/// The F2 stats overlay, the frame history and the perf readout.
 pub(super) struct Stats {
-    /// The F2 overlay is open
-    pub(super) show: bool,
+    /// What the F2 overlay shows (#1078): nothing, all of it, or the
+    /// frame-time graph alone
+    pub(super) view: super::StatsView,
+    /// What the last HUD pass drew: a view drawn for the first frame since
+    /// it changed leaves a note of what it cost (#1129)
+    pub(super) drawn_view: super::StatsView,
+    /// The frame-time graph's buffers and ceiling, kept across frames
+    #[cfg(feature = "debug-hud")]
+    pub(super) graph: super::stats_view::StatsGraph,
     pub(super) frame_times: std::collections::VecDeque<f64>,
     /// The player turned the renderer's GPU timing on for the overlay
     /// (ADR 0108), so it turns it off again when the overlay closes
     pub(super) gpu_timing: bool,
-    /// The perf readout's recorder (`?perf=1` on the web, #120): frame and
-    /// phase times for the last ten seconds. `None` costs nothing.
-    pub(super) perf: Option<perf::PerfRecorder>,
+    /// The frame recorder: the frame history (#1076, the last
+    /// `HISTORY_FRAMES` frames, recorded always where the build has
+    /// `frame-history`), which the perf readout (`--perf`, `?perf=1`,
+    /// #120) sums up when it is on (`perf.readout`).
+    pub(super) perf: perf::PerfRecorder,
+    /// What counts as a hitch, and the hitches so far (#1076), judged as
+    /// each frame's clock comes in.
+    pub(super) hitches: hitch::HitchDetector,
+    /// What the run keeps of them (#1079): the hitch log, the exit
+    /// report's counts and the `--max-hitches` gate.
+    pub(super) watch: hitch_watch::HitchWatch,
+    /// The renderer's GPU-call reading at the last perf readout (#1091):
+    /// the next readout's window is the difference.
+    pub(super) gpu_calls_then: Option<perf::GpuCallsReading>,
+    /// The last frame F2 saw create GPU objects: its game time and what it
+    /// made, so a one-frame creation stays readable on the overlay.
+    pub(super) last_gpu_objects: Option<(f64, flint_render::gpu_counts::GpuCalls)>,
+    /// Every load's report so far, the start-up first (#1092)
+    pub(super) loads: Vec<flint_core::load_report::LoadReport>,
+    /// The start-up's wait from `run_app` to the first `resumed`, timed
+    /// as the window's (#1092)
+    pub(super) awaiting_window: Option<flint_core::load_report::Span>,
+    /// `--perf-report FILE` (#1093): where the exit report's JSON goes and
+    /// the run's phase and script totals it is built from.
+    pub(super) report: Option<super::perf_report::ReportTo>,
+}
+
+impl Default for Stats {
+    fn default() -> Self {
+        Self {
+            view: super::StatsView::Off,
+            drawn_view: super::StatsView::Off,
+            #[cfg(feature = "debug-hud")]
+            graph: Default::default(),
+            frame_times: Default::default(),
+            gpu_timing: false,
+            // `frame-history`, and `FLINT_FRAME_HISTORY` over it
+            perf: perf::PerfRecorder::recording_always(super::frame_history::always_on_from_env()),
+            // `FLINT_HITCH_FACTOR` / `FLINT_HITCH_FLOOR_MS`, read once.
+            hitches: hitch::HitchDetector::new(hitch::HitchThresholds::from_env()),
+            watch: Default::default(),
+            gpu_calls_then: None,
+            last_gpu_objects: None,
+            loads: Vec::new(),
+            awaiting_window: None,
+            report: None,
+        }
+    }
 }
 
 /// When the `persist_*` store (the game core's) is written (see
@@ -410,6 +572,10 @@ pub(super) struct Saves {
     /// The OS user directory saves and input rebinds go under
     /// (`user_files::config_dir`), a field so a test can name another.
     pub(crate) user_config_dir: Option<std::path::PathBuf>,
+    /// What the run's first load found (a playtest's report says it).
+    pub(super) loaded: Option<flint_runtime::Loaded>,
+    /// The player's own bus volumes' file and its write (#1217).
+    pub(super) audio: super::user_audio::UserAudio,
 }
 
 impl Default for Saves {
@@ -418,6 +584,8 @@ impl Default for Saves {
             debounce: SaveDebounce::default(),
             error: None,
             user_config_dir: crate::user_files::config_dir(),
+            loaded: None,
+            audio: Default::default(),
         }
     }
 }
@@ -440,9 +608,34 @@ pub(super) struct Outcome {
 pub(super) struct StyleState {
     /// Resets style history when the camera cuts (#343)
     pub(super) camera_cut: camera_cut::CameraCutDetector,
-    /// A look F4's picker chose this frame (#356; `Some(None)`: none),
-    /// laid under the scene's keys at the start of the next render.
-    pub(super) pending_look: Option<Option<String>>,
+    /// A look F4's picker chose this frame (#356; `Some(None)`: none) and
+    /// the seconds to fade to it over (#496; 0 cuts), laid under the
+    /// scene's keys at the start of the next render.
+    pub(super) pending_look: Option<(Option<String>, f64)>,
+    /// A cross-fade to a look in progress (#496), laid each render at the
+    /// game time since it was asked; dropped at its end, a cut, or a
+    /// scene's teardown.
+    pub(super) look_fade: Option<LookFadeState>,
+    /// The scene's `preload_looks` as read at its entry (#1159), by name,
+    /// so a cut to one reads no file. Replaced at each scene's entry.
+    pub(super) preloaded_looks: std::collections::HashMap<String, flint_render::look::Look>,
+}
+
+/// A look's cross-fade under way in the player (#496, #1157).
+pub(super) struct LookFadeState {
+    pub(super) fade: flint_render::look_fade::LookFade,
+    /// The look it ends on, for `look_faded`.
+    pub(super) look: Option<String>,
+    /// The game time it was asked at (`clock.total_time`): a render at game
+    /// time `t` lays it `t - at` seconds in, as a capture does.
+    pub(super) at: f64,
+}
+
+impl LookFadeState {
+    /// The fade `now - at` seconds in.
+    pub(super) fn at_time(&self, now: f64) -> flint_render::look_fade::LookFade {
+        self.fade.at((now - self.at) as f32)
+    }
 }
 
 /// The input config's layers (built-in, game, user overrides, CLI) and a
@@ -453,6 +646,13 @@ pub(super) struct InputLayers {
     pub(super) config_paths: Option<InputConfigPaths>,
     pub(super) user_override: InputConfig,
     pub(super) pending_rebind: Option<PendingRebind>,
+    /// The actions the game's layer and `--input-config` name: what the
+    /// controls line lists (#716), with the player's rebinds on them. Empty
+    /// when neither names any, and the built-ins are the game's controls.
+    pub(super) named_actions: std::collections::BTreeSet<String>,
+    /// The controls line last said, so a transition says it again only
+    /// when the bindings changed
+    pub(super) said_controls: Option<String>,
 }
 
 impl InputLayers {
@@ -465,8 +665,11 @@ impl InputLayers {
                 game_id: String::new(),
                 actions: Default::default(),
                 touch_controls: None,
+                debug_keys: None,
             },
             pending_rebind: None,
+            named_actions: Default::default(),
+            said_controls: None,
         }
     }
 }
@@ -482,6 +685,9 @@ pub(super) struct Focus {
     pub(super) real_pad_slots: HashSet<u32>,
     /// The modifiers held now, real or scripted, for `PlayerExtension::on_key`.
     pub(super) key_modifiers: winit::keyboard::ModifiersState,
+    /// Keys held whose press was a debug key (#717): their repeats and
+    /// release don't reach the game either.
+    pub(super) debug_keys_held: HashSet<winit::keyboard::KeyCode>,
 }
 
 impl Default for Focus {
@@ -491,6 +697,7 @@ impl Default for Focus {
             window_focused: true,
             real_pad_slots: Default::default(),
             key_modifiers: Default::default(),
+            debug_keys_held: Default::default(),
         }
     }
 }
@@ -507,19 +714,31 @@ pub(super) struct QualityState {
     pub(super) script_request: Option<flint_core::quality::QualitySettings>,
 }
 
-/// The asset catalog and content store, for content-addressed asset
-/// resolution (both optional).
+/// The project's asset catalog and content store, for content-addressed
+/// asset resolution (#1065): `<root>/assets` and `<root>/.flint/assets`,
+/// the ones `flint validate` and `flint check` ask
+/// ([`HeldAssets::of`]), wherever the player was started from. Read on
+/// first use and kept for that project root and file source, so a
+/// transition into another project, or the web's bundle installed after
+/// the app was made, reads again.
+#[derive(Default)]
 pub(super) struct AssetSources {
-    pub(super) catalog: Option<AssetCatalog>,
-    pub(super) content_store: Option<ContentStore>,
+    /// The root and `vfs::generation` read for, and what was found there
+    /// (`None`: that project has no catalog).
+    read: Option<(PathBuf, u64, Option<HeldAssets>)>,
 }
 
 impl AssetSources {
-    /// The working directory's `assets/` catalog and `.flint/assets` store.
-    pub(super) fn from_working_dir() -> Self {
-        Self {
-            catalog: AssetCatalog::load_from_directory("assets").ok(),
-            content_store: Some(ContentStore::new(".flint/assets")),
+    /// `project`'s catalog and store, read now unless they are held.
+    pub(super) fn of(&mut self, project: &Project) -> Option<&HeldAssets> {
+        let generation = flint_core::vfs::generation();
+        let held = matches!(&self.read,
+            Some((root, read_at, _)) if *root == project.root && *read_at == generation);
+        if !held {
+            self.read = Some((project.root.clone(), generation, HeldAssets::of(project)));
         }
+        self.read
+            .as_ref()
+            .and_then(|(_, _, assets)| assets.as_ref())
     }
 }
